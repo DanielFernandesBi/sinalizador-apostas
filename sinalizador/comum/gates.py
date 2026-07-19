@@ -36,9 +36,24 @@ class MetaGate:
     baseline_petreo: Optional[Decimal] = None  # só para pétreos (tripwire Doutrina §4)
 
 
+# ---------------------------------------------------------------------------
+# BASELINES PÉTREAS — tripwire de integridade, NÃO valores de operação.
+#
+# NÃO viola a regra 6 ("gates nunca hard-coded"): estes números NUNCA entram em
+# decisão de negócio. Todo valor operacional de gate vem exclusivamente da
+# tabela `gates` via get(). Estas baselines existem só para DETECTAR adulteração
+# (um pétreo afrouxado no banco) na inicialização — é validação, não cálculo.
+# NÃO "conserte" isto tratando estes números como fonte de verdade dos gates:
+# seria exatamente o bug que a regra 6 proíbe.
+#
+# MANUTENÇÃO (rito): quando um pétreo for endurecido pelo rito, a baseline
+# correspondente é atualizada AQUI, no MESMO ato do rito. Senão o tripwire fica
+# frouxo em relação ao vigente e o aviso "pétreo endurecido" vira ruído permanente.
+#
 # Espelho estrutural do seed do schema 0001 e da Doutrina §4 (com a Sugestão nº 1,
 # janela_sincronia_s). Para os gates "a calibrar" (não pétreos) NÃO há baseline:
 # seus valores mudam pelo backtest/rito e não podem ser fixados em código.
+# ---------------------------------------------------------------------------
 METADADOS_GATES: dict[str, MetaGate] = {
     "edge_min_pct":            MetaGate(petreo=False, direcao="maior"),
     "odd_teto":                MetaGate(petreo=False, direcao="menor"),

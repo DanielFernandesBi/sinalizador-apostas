@@ -40,6 +40,26 @@ Todo acionamento chega como JSON contendo, no mínimo:
 
 Campo obrigatório ausente ou malformado = ABORTA imediato com `V-A0`.
 
+### 1.1 Contratos de sub-schema (Sugestão nº 2 — governança, 19/07/2026)
+
+Dois campos do dossiê têm a forma interna fixada por rito:
+
+**`snapshots.historico_movimento_1h`** — série temporal de preços (consumida por V-C1):
+
+```
+{ "referencia": [ {"ts": "<iso8601>", "odd": <number>} ],
+  "venue":      [ {"ts": "<iso8601>", "odd": <number>} ] }
+```
+Regras: ordenado ascendente por `ts`; no máximo 30 pontos por série (amostragem uniforme se houver mais); janela = 60 minutos anteriores ao gatilho; apenas dados capturados — série sem dados é lista vazia, nunca interpolada (P6).
+
+**`liquidez.profundidade_book`** — book instantâneo (consumido por V-A5/V-C3; `null` quando o venue não é exchange):
+
+```
+{ "back": [ {"odd": <number>, "volume": <number>} ],
+  "lay":  [ {"odd": <number>, "volume": <number>} ] }
+```
+Regras: 3 melhores níveis de cada lado, ordenados do melhor para o pior preço; extraído do mesmo snapshot que originou o sinal, nunca de captura posterior.
+
 ## 2. Regime de análise
 
 - **Caminho rápido** (gatilhos perecíveis: `odds_drop`, `value_bet` com janela curta): SEM busca externa. Análise apenas sobre o dossiê. Blocos A, C e E. Orçamento: resposta única, imediata.
@@ -145,4 +165,4 @@ Regras da saída:
 Itens deste manual mudam pelo rito da Doutrina (Seção 7): proposta escrita, ancorada na auditoria de CLV contrafactual por ID de fator, amostra ≥ 200, revisão mensal. A auditoria pode aposentar fatores que nunca vetam, endurecer os que vetam bem e revisar os que vetam valor (CLV contrafactual positivo nos vetados).
 
 ---
-*v0.1 — 17/07/2026. Companheiro operacional da Doutrina v0.1.*
+*v0.1.1 — 19/07/2026. Alteração única: contratos de sub-schema do dossiê, PC1/PC2 (Sugestão nº 2). Companheiro operacional da Doutrina v0.1.*

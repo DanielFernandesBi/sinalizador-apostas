@@ -5,9 +5,9 @@ do Manual do Crivo L2; a saída do L2 (`CrivoSaida`), a Seção 8. Os documentos
 governança são o contrato. Se faltar um campo, registra-se pendência no
 PLANO_MVP — não se inventa campo novo aqui (CLAUDE.md regra 10).
 
-Campos cujo SUB-schema o Manual não detalha (`historico_movimento_1h`,
-`profundidade_book`) ficam com tipo flexível (`JsonValue`) e pendência
-registrada (PC1/PC2 no PLANO_MVP), em vez de estrutura inventada.
+Os sub-schemas de `historico_movimento_1h` (PC1) e `profundidade_book` (PC2)
+foram fixados pela Sugestão nº 2 (rito, 19/07/2026) — ver Manual §1.1 — e estão
+tipados abaixo (`HistoricoMovimento1h`, `ProfundidadeBook`).
 
 O dossiê é validado como "no mínimo" estes campos (Manual §1) → `extra="allow"`.
 A saída do L2 é exaustiva ("Nada além do JSON", Manual §8) → `extra="forbid"`,
@@ -18,7 +18,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict, JsonValue, field_validator
 
 # --- domínios fechados (espelham os CHECKs do schema 0001 e o Manual) ---
 Gatilho = Literal["value_bet", "odds_drop", "tipster", "line_shopping"]
@@ -34,6 +34,56 @@ ResultadoFator = Literal["ok", "veto", "nao_verificado"]
 class _BaseDossie(BaseModel):
     # Manual §1: o dossiê contém "no mínimo" estes campos — extras são aceitos.
     model_config = ConfigDict(extra="allow")
+
+
+# --- PC1: historico_movimento_1h (Sugestão nº 2 / Manual §1.1) ---
+class PontoMovimento(_BaseDossie):
+    ts: datetime
+    odd: float
+
+
+class HistoricoMovimento1h(_BaseDossie):
+    """Série temporal de preços na janela de 60 min anterior ao gatilho (V-C1).
+
+    Regras (Sugestão nº 2): ordenado ascendente por `ts`; no máximo 30 pontos por
+    série; apenas dados capturados — série sem dados é lista vazia, nunca
+    interpolada (P6).
+    """
+    referencia: list[PontoMovimento] = []
+    venue: list[PontoMovimento] = []
+
+    @field_validator("referencia", "venue")
+    @classmethod
+    def _limite_e_ordem(cls, v: list[PontoMovimento]) -> list[PontoMovimento]:
+        if len(v) > 30:
+            raise ValueError("máximo 30 pontos por série (Sugestão nº 2)")
+        for anterior, atual in zip(v, v[1:]):
+            if atual.ts < anterior.ts:
+                raise ValueError("série deve ser ordenada ascendente por ts (Sugestão nº 2)")
+        return v
+
+
+# --- PC2: profundidade_book (Sugestão nº 2 / Manual §1.1) ---
+class NivelBook(_BaseDossie):
+    odd: float
+    volume: float
+
+
+class ProfundidadeBook(_BaseDossie):
+    """Book instantâneo do venue (V-A5/V-C3). `null` quando o venue não é exchange.
+
+    Regras (Sugestão nº 2): 3 melhores níveis de cada lado, ordenados do melhor
+    para o pior preço; extraído do mesmo snapshot que originou o sinal.
+    """
+    back: list[NivelBook] = []
+    lay: list[NivelBook] = []
+
+    @field_validator("back", "lay")
+    @classmethod
+    def _max_tres_niveis(cls, v: list[NivelBook]) -> list[NivelBook]:
+        if len(v) > 3:
+            raise ValueError("3 melhores níveis por lado (Sugestão nº 2)")
+        return v
 
 
 class Evento(_BaseDossie):
@@ -59,14 +109,14 @@ class Snapshots(_BaseDossie):
     ts_fonte_venue: datetime
     janela_sincronia_ok: bool
     referencia_estavel_ok: bool
-    # PC1: sub-schema não definido no Manual (série de pontos? {ts, odd}[]?). Não inventar.
-    historico_movimento_1h: JsonValue = None
+    # PC1 (Sugestão nº 2). Série vazia quando não há dados — nunca interpolada.
+    historico_movimento_1h: Optional[HistoricoMovimento1h] = None
 
 
 class Liquidez(_BaseDossie):
     disponivel_no_preco: float
-    # PC2: sub-schema não definido no Manual (níveis back/lay do book?). Não inventar.
-    profundidade_book: JsonValue = None
+    # PC2 (Sugestão nº 2). null quando o venue não é exchange.
+    profundidade_book: Optional[ProfundidadeBook] = None
     gate_liquidez_ok: bool
 
 

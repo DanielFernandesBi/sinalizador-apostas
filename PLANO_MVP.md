@@ -125,15 +125,9 @@
 | D6 | Ligas-alvo iniciais (sugestão: Brasileirão A/B + 2–3 ligas europeias líquidas quando retomarem em agosto) | E1.1, E6 |
 | D7 | Conta/chave da API Anthropic para o L2 (separada do uso pessoal, para medir custo) | E3.1 |
 
-## PENDÊNCIAS DE CONTRATO (registradas na E0.3)
+## PENDÊNCIAS DE CONTRATO
 
-Campos citados no Manual do Crivo (§1) cujo **sub-schema os documentos de
-governança não detalham**. Os modelos pydantic os aceitam com tipo flexível
-(`JsonValue`), sem inventar estrutura (regra 10). Definir o formato pelo rito
-antes de o L1/L2 consumi-los:
-
-- **PC1 — `snapshots.historico_movimento_1h`:** forma do histórico de movimento de 1h (série de pontos `{ts, odd}[]`?). Usado por V-C1 (steam reverso).
-- **PC2 — `liquidez.profundidade_book`:** forma da profundidade do book do Exchange (níveis back/lay?). Usado por V-A5 e V-C3.
+- [x] **PC1 / PC2 — resolvidas pela Sugestão nº 2 (rito, 19/07/2026).** Contratos de `historico_movimento_1h` (série temporal, V-C1) e `profundidade_book` (book instantâneo, V-A5/V-C3) fixados no **Manual §1.1** e tipados em `comum/modelos.py` (`HistoricoMovimento1h`, `ProfundidadeBook`).
 
 Nota da E0.3: `comum/config.py` expõe uma única `Config` com todos os segredos
 obrigatórios — cada processo que chamar `carregar_config()` precisa do `.env`
