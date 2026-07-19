@@ -22,7 +22,7 @@
 ## E0 — FUNDAÇÃO (chat + Claude Code)
 
 - [ ] E0.1 *(chat, domingo)* Pausar BolaoMundial; criar projeto; aplicar migration 0001; gravar Doutrina e Manual em `config_sistema` (chaves `doutrina` e `manual_crivo_l2`, versão 1)
-- [ ] E0.2 Estrutura do repositório:
+- [x] E0.2 Estrutura do repositório:
   ```
   sinalizador/
   ├── CLAUDE.md            # instruções p/ Claude Code: ler este plano + doutrina antes de codar

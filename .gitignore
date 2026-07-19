@@ -1,0 +1,29 @@
+# Segredos — NUNCA versionar (CLAUDE.md regra 9 / Doutrina P6)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.Python
+
+# Ferramentas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editores / SO
+.idea/
+.vscode/
+.DS_Store
