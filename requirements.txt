@@ -1,0 +1,4 @@
+# Base comum (E0.3). Python 3.12.
+pydantic>=2.6,<3
+pydantic-settings>=2.2,<3
+supabase>=2.4,<3

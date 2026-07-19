@@ -39,7 +39,7 @@
   ├── backtest/
   └── tests/
   ```
-- [ ] E0.3 Base comum: Python 3.12, `pydantic` (dossiê e saída do L2 como modelos tipados), cliente Supabase (service role), carregador de gates (lê tabela `gates`, cacheia, invalida por TTL curto), logging estruturado
+- [x] E0.3 Base comum: Python 3.12, `pydantic` (dossiê e saída do L2 como modelos tipados), cliente Supabase (service role), carregador de gates (lê tabela `gates`, cacheia, invalida por TTL curto), logging estruturado
 - [ ] E0.4 Segredos via `.env` (nunca no repo): chaves Supabase, The Odds API, Anthropic, Telegram
 - [ ] E0.5 VPS: provisionar, systemd units por daemon, watchdog com restart, deploy simples (git pull + restart)
 
@@ -124,6 +124,20 @@
 | D5 | VPS (provedor e orçamento — R$ 30–60/mês resolve o MVP) | E0.5 |
 | D6 | Ligas-alvo iniciais (sugestão: Brasileirão A/B + 2–3 ligas europeias líquidas quando retomarem em agosto) | E1.1, E6 |
 | D7 | Conta/chave da API Anthropic para o L2 (separada do uso pessoal, para medir custo) | E3.1 |
+
+## PENDÊNCIAS DE CONTRATO (registradas na E0.3)
+
+Campos citados no Manual do Crivo (§1) cujo **sub-schema os documentos de
+governança não detalham**. Os modelos pydantic os aceitam com tipo flexível
+(`JsonValue`), sem inventar estrutura (regra 10). Definir o formato pelo rito
+antes de o L1/L2 consumi-los:
+
+- **PC1 — `snapshots.historico_movimento_1h`:** forma do histórico de movimento de 1h (série de pontos `{ts, odd}[]`?). Usado por V-C1 (steam reverso).
+- **PC2 — `liquidez.profundidade_book`:** forma da profundidade do book do Exchange (níveis back/lay?). Usado por V-A5 e V-C3.
+
+Nota da E0.3: `comum/config.py` expõe uma única `Config` com todos os segredos
+obrigatórios — cada processo que chamar `carregar_config()` precisa do `.env`
+completo. Se daemons isolados vierem a exigir só um subconjunto, segmentar pelo rito.
 
 ## ORDEM DE EXECUÇÃO
 
