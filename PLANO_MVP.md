@@ -98,8 +98,8 @@
 
 ## E6 — BACKTEST (paralelo, desde que E2.1 exista)
 
-- [ ] E6.1 Ingestão do histórico Football-Data.co.uk (ligas-alvo, com odds de abertura e fechamento)
-- [ ] E6.2 Replay do L1 sobre o histórico: o gatilho `value_bet` teria CLV positivo? Em quais ligas/mercados?
+- [x] E6.1 Ingestão do histórico Football-Data.co.uk (ligas-alvo, com odds de abertura e fechamento) — `backtest/football_data.py` (E0/SP1/I1/D1/F1/P1)
+- [ ] E6.2 Replay do L1 sobre o histórico: o gatilho `value_bet` teria CLV positivo? Em quais ligas/mercados? — **motor de replay + medição de CLV + relatório prontos e testados (`backtest/replay.py`, 14 testes); aguarda execução sobre dados reais (download bloqueado neste ambiente, roda no VPS/dev)**
 - [ ] E6.3 Calibração dos gates "a calibrar" (edge mínimo, teto de odd) com evidência → propostas formais pelo rito
 - [ ] E6.4 Homologação inicial de mercados → `mercados_homologados`
 
@@ -122,7 +122,7 @@
 | D3 | Quais casas .bet.br monitorar no line shopping (sugestão inicial: as de maior volume cobertas pela The Odds API) | E1.3 |
 | D4 | Lista inicial de canais de tipsters no Telegram (5–10 para começar o ranking) | E1.4 |
 | D5 | VPS (provedor e orçamento — R$ 30–60/mês resolve o MVP) | E0.5 |
-| D6 | Ligas-alvo iniciais (sugestão: Brasileirão A/B + 2–3 ligas europeias líquidas quando retomarem em agosto) | E1.1, E6 |
+| D6 | Ligas-alvo iniciais (sugestão: Brasileirão A/B + 2–3 ligas europeias líquidas quando retomarem em agosto). **Nota E6.1: o Football-Data NÃO cobre o Brasileirão — o backtest inicial roda nas 6 ligas europeias cobertas (E0/SP1/I1/D1/F1/P1); fonte para Brasileirão a definir.** | E1.1, E6 |
 | D7 | Conta/chave da API Anthropic para o L2 (separada do uso pessoal, para medir custo) | E3.1 |
 
 ## PENDÊNCIAS DE CONTRATO
