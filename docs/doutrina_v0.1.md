@@ -70,6 +70,7 @@ Nenhuma conclusão sobre desempenho com menos de **200 apostas/sinais**. ROI esp
 | Teto de odd | ≤ 3.30 | a calibrar |
 | Liquidez mínima disponível no venue (para o stake calculado sem mover preço) | ≥ 10× o stake | a calibrar |
 | Idade máxima do snapshot | ≤ 10 min | a calibrar |
+| Janela de sincronia entre snapshots (referência × venue) | ≤ 60 s | a calibrar |
 | Stake máximo | 2% da banca | **pétreo** |
 | Fração de Kelly | ¼ | **pétreo** (só reduz, nunca sobe) |
 | Drawdown de suspensão | 20% do pico | **pétreo** |
@@ -99,4 +100,4 @@ Mudanças seguem o rito de **sugestões numeradas** (padrão "Evolução do sist
 
 ---
 
-*v0.1 — 11/07/2026. Documento aguardando os valores definitivos dos gates (pós-backtest, Fase D.1).*
+*v0.1.1 — 18/07/2026. Alteração única: formalização do gate de sincronia (Sugestão nº 1).*
