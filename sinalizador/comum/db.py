@@ -14,7 +14,7 @@ Operações expostas:
   - transicionar_status_sinal(...)         única mutação de `sinais` (a partir de aguardando_crivo)
   - liquidar_aposta(...)                   única mutação de `apostas` (pendente -> final)
   - fechar_tip(...)                        único preenchimento de fechamento em `tips`
-  - gates_vigentes() / config_vigente()    leituras de governança
+  - gates_vigentes() / config_vigente() / casa_por_nome()    leituras
 """
 from __future__ import annotations
 
@@ -62,6 +62,19 @@ class Banco:
             .select("*")
             .eq("chave", chave)
             .eq("vigente", True)
+            .limit(1)
+            .execute()
+        )
+        dados = resp.data or []
+        return dados[0] if dados else None
+
+    def casa_por_nome(self, nome: str) -> Optional[dict[str, Any]]:
+        """Casa ativa por nome (fonte da `comissao_pct` para o edge — nunca constante)."""
+        resp = (
+            self._c.table("casas")
+            .select("*")
+            .eq("nome", nome)
+            .eq("ativa", True)
             .limit(1)
             .execute()
         )

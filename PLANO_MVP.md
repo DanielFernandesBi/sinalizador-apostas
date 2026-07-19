@@ -57,7 +57,7 @@
 
 ## E2 — L1: MOTOR MECÂNICO
 
-- [ ] E2.1 De-vig **Shin** (com testes contra casos conhecidos) + edge líquido conforme definição canônica da Doutrina (comissão + slippage estimado)
+- [x] E2.1 De-vig **Shin** (com testes contra casos conhecidos) + edge líquido conforme definição canônica da Doutrina (comissão + slippage estimado)
 - [ ] E2.2 Motor de gates: lê `gates` vigentes; avalia sincronia (`janela_sincronia_s`), estabilidade da referência, idade de snapshot, liquidez, teto de odd, edge mínimo, exposição (vw_exposicao_aberta + tetos por jogo/liga/dia)
 - [ ] E2.3 Gatilhos: `value_bet`, `odds_drop` (queda brusca na referência), `line_shopping` (melhor preço entre casas capturadas), `tipster` (tip interpretado → mesmos gates de todos)
 - [ ] E2.4 Detector de anomalia: venue moveu sem a referência mover → `gatilho_anomalo = true`, caminho profundo
