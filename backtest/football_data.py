@@ -46,9 +46,9 @@ class Mercado:
     selecoes: tuple[SelecaoMercado, ...]
 
 
-# Mercados candidatos à homologação (Doutrina P2). AH fica para uma iteração
-# seguinte (liquidação com linhas quarto e push exige tratamento próprio) —
-# registrado como próximo passo do backtest.
+# Mercados candidatos à homologação (Doutrina P2). 1X2 e OU 2.5 seguem a estrutura
+# genérica abaixo; o Asian Handicap tem tratamento próprio em replay._candidatos_ah
+# (linha de handicap com guarda abertura==fechamento e liquidação por decomposição).
 MERCADOS: tuple[Mercado, ...] = (
     Mercado("1x2", (
         SelecaoMercado("H", "PSH", "PSCH", ("B365H", "BWH", "IWH", "WHH", "VCH", "LBH", "BFH")),

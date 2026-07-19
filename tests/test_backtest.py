@@ -118,6 +118,40 @@ def test_agregacao_celulas_e_amostra_insuficiente():
     assert por_faixa["3.30-5.00"]["suficiente"] is False  # n < 200 (aqui < 2)
 
 
+# ---- Asian Handicap (E6.2, mercado ah) ----
+
+def _partida_ah(**over):
+    row = {
+        "Div": "E0", "_liga": "Inglaterra — Premier League", "Date": "10/08/2024",
+        "HomeTeam": "A", "AwayTeam": "B", "FTHG": "2", "FTAG": "0",
+        "AHh": "-0.5", "AHCh": "-0.5",            # linha de abertura == fechamento
+        "PAHH": "1.90", "PAHA": "2.00",           # Pinnacle AH abertura
+        "PAHCH": "1.85", "PAHCA": "2.05",         # Pinnacle AH fechamento
+        "B365AHH": "2.05", "B365AHA": "1.85",     # venue (varejo)
+    }
+    row.update(over)
+    return row
+
+
+def test_ah_gera_candidato_com_linha_e_resultado():
+    cands = [c for c in candidatos_da_partida(_partida_ah()) if c["mercado"] == "ah"]
+    mand = [c for c in cands if c["selecao"] == "mandante"]
+    assert len(mand) == 1
+    c = mand[0]
+    assert c["linha"] == -0.5
+    assert c["odd_venue"] == pytest.approx(2.05)
+    p_ab, _ = devig_shin([1.90, 2.00])
+    assert c["p_justa_abertura"] == pytest.approx(p_ab[0])
+    assert c["edge_liquido"] > 0
+    # mandante -0.5 vence por 2 (2x0) → +1 (informativo, não usado no CLV)
+    assert c["resultado_ah"] == 1.0
+
+
+def test_ah_pulado_quando_linha_muda_entre_abertura_e_fechamento():
+    cands = candidatos_da_partida(_partida_ah(AHCh="-0.75"))
+    assert [c for c in cands if c["mercado"] == "ah"] == []
+
+
 # ---- ingestão ----
 
 def test_carregar_partidas_ignora_linhas_vazias():

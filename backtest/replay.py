@@ -26,6 +26,7 @@ from collections import defaultdict
 from sinalizador.l1_gatilhos.devig import devig_shin
 from sinalizador.l1_gatilhos.edge import edge_liquido
 
+from .ah import liquidar_ah
 from .football_data import MERCADOS, num
 
 # Gates PROVISÓRIOS da Doutrina §4 usados como definição de value_bet no backtest.
@@ -94,6 +95,7 @@ def candidatos_da_partida(
                 "liga": liga,
                 "mercado": mercado.nome,
                 "selecao": sel.codigo,
+                "linha": None,
                 "data": data,
                 "faixa_odd": faixa_odd(venue),
                 "p_justa_abertura": p_justa,
@@ -102,8 +104,69 @@ def candidatos_da_partida(
                 "p_ref_fechamento": p_fechamento[i],
                 "clv_pct": clv,
                 "value_bet_provisional": bool(edge >= edge_min and venue <= odd_teto),
+                "resultado_ah": None,
             })
+
+    linhas.extend(_candidatos_ah(row, liga, data, edge_min=edge_min, odd_teto=odd_teto))
     return linhas
+
+
+# Colunas Football-Data do Asian Handicap (Pinnacle abertura/fechamento + linha).
+_AH_LADOS = (("mandante", "PAHH", "PAHCH", "B365AHH"),
+             ("visitante", "PAHA", "PAHCA", "B365AHA"))
+
+
+def _candidatos_ah(
+    row: dict, liga: str, data: str, *, edge_min: float, odd_teto: float
+) -> list[dict]:
+    """AH via Pinnacle (abertura PAH* / fechamento PAHC*), venue = B365 (única casa
+    de varejo consistente). CLV só é medido quando a LINHA de abertura == fechamento
+    (comparar handicaps diferentes seria a armadilha do V-A6). `resultado_ah` é
+    informativo (liquidação por decomposição) — não entra na decisão nem no CLV.
+    """
+    linha_ab = num(row.get("AHh"))
+    linha_fe = num(row.get("AHCh"))
+    if linha_ab is None or linha_fe is None or linha_ab != linha_fe:
+        return []
+
+    ref_ab = [num(row.get("PAHH")), num(row.get("PAHA"))]
+    ref_fe = [num(row.get("PAHCH")), num(row.get("PAHCA"))]
+    if any(o is None or o <= 1.0 for o in ref_ab + ref_fe):
+        return []
+    try:
+        p_ab, _z1 = devig_shin(ref_ab)
+        p_fe, _z2 = devig_shin(ref_fe)
+    except ValueError:
+        return []
+
+    gm, gv = num(row.get("FTHG")), num(row.get("FTAG"))
+    saidas: list[dict] = []
+    for i, (cod, _c_ab, _c_fe, col_venue) in enumerate(_AH_LADOS):
+        venue = _melhor_preco(row, (col_venue,))
+        if venue is None:
+            continue
+        edge = edge_liquido(p_ab[i], venue, 0.0, 0.0)
+        if edge <= 0.0:
+            continue
+        resultado = None
+        if gm is not None and gv is not None:
+            resultado = liquidar_ah(linha_ab, cod, int(round(gm)), int(round(gv)))
+        saidas.append({
+            "liga": liga,
+            "mercado": "ah",
+            "selecao": cod,
+            "linha": linha_ab,
+            "data": data,
+            "faixa_odd": faixa_odd(venue),
+            "p_justa_abertura": p_ab[i],
+            "odd_venue": venue,
+            "edge_liquido": edge,
+            "p_ref_fechamento": p_fe[i],
+            "clv_pct": venue * p_fe[i] - 1.0,
+            "value_bet_provisional": bool(edge >= edge_min and venue <= odd_teto),
+            "resultado_ah": resultado,
+        })
+    return saidas
 
 
 def replay(
@@ -145,9 +208,9 @@ def agregar_celulas(
 # ---------------- saídas (relatório legível + estruturado) ----------------
 
 _CAMPOS_CANDIDATO = [
-    "liga", "mercado", "selecao", "data", "faixa_odd",
+    "liga", "mercado", "selecao", "linha", "data", "faixa_odd",
     "p_justa_abertura", "odd_venue", "edge_liquido",
-    "p_ref_fechamento", "clv_pct", "value_bet_provisional",
+    "p_ref_fechamento", "clv_pct", "value_bet_provisional", "resultado_ah",
 ]
 _CAMPOS_CELULA = ["liga", "mercado", "faixa_odd", "n", "clv_medio", "clv_desvio", "suficiente"]
 
@@ -182,9 +245,13 @@ Parâmetros (provisórios, Doutrina §4 — a calibrar): edge_min={meta.get('edg
 - **Venue de varejo sem custo.** Como não há dado de exchange/liquidez no
   dataset, o edge do backtest usa comissão 0 e slippage 0. Custos de execução
   (comissão da Betfair, slippage) são do modo sombra, não deste backtest.
-- **OU 2.5 com cobertura fina.** A única casa de varejo consistente no dataset é
-  o Bet365, então "melhor preço entre as demais casas" degenera para o B365 nesse
-  mercado. O 1X2 tem cobertura ampla de casas.
+- **OU 2.5 e AH com cobertura fina.** A única casa de varejo consistente no
+  dataset é o Bet365, então "melhor preço entre as demais casas" degenera para o
+  B365 nesses mercados. O 1X2 tem cobertura ampla de casas.
+- **AH: CLV só na mesma linha.** O handicap AH é medido só quando a linha de
+  abertura == fechamento (comparar handicaps diferentes seria falso). A coluna
+  `resultado_ah` (liquidação por decomposição em meias-apostas) é INFORMATIVA —
+  não entra na decisão nem no CLV (o KPI é o CLV, P8).
 - **Amostra (P12).** Célula (liga × mercado × faixa de odd) com n < {meta.get('amostra_minima', AMOSTRA_MINIMA)}
   aparece como **amostra insuficiente**, sem conclusão.
 - **Brasileirão ausente.** O Football-Data não cobre o Brasileirão — lacuna
