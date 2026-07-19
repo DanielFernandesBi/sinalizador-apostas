@@ -14,6 +14,7 @@ Operações expostas:
   - transicionar_status_sinal(...)         única mutação de `sinais` (a partir de aguardando_crivo)
   - liquidar_aposta(...)                   única mutação de `apostas` (pendente -> final)
   - fechar_tip(...)                        único preenchimento de fechamento em `tips`
+  - publicar_config(chave, valor)          publica nova versão vigente de governança (rito)
   - gates_vigentes() / config_vigente() / casa_por_nome()    leituras
 """
 from __future__ import annotations
@@ -162,3 +163,30 @@ class Banco:
                 f"tip {tip_id} já tinha fechamento preenchido — o preenchimento é único"
             )
         return atualizados[0]
+
+    def publicar_config(self, chave: str, valor: str) -> dict[str, Any]:
+        """Publica nova versão VIGENTE de um documento de governança (repo → banco).
+
+        Usado SÓ pelo rito (scripts/sync_governanca.py), após aprovação. As versões
+        se acumulam (nunca se apaga); a próxima é max(versao)+1. Desvigora a atual
+        antes de inserir a nova por causa do índice único parcial `ux_config_vigente`.
+        A versão é derivada de max(versao) — não de `vigente` — para ser idempotente
+        mesmo após uma falha parcial (estado com 0 vigente).
+        """
+        resp = (
+            self._c.table("config_sistema")
+            .select("versao")
+            .eq("chave", chave)
+            .order("versao", desc=True)
+            .limit(1)
+            .execute()
+        )
+        linhas = resp.data or []
+        proxima = (linhas[0]["versao"] + 1) if linhas else 1
+        self._c.table("config_sistema").update({"vigente": False}).eq(
+            "chave", chave
+        ).eq("vigente", True).execute()
+        return self.inserir(
+            "config_sistema",
+            {"chave": chave, "versao": proxima, "valor": valor, "vigente": True},
+        )
