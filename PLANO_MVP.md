@@ -15,13 +15,13 @@
 - [x] Doutrina v0.1 redigida e confirmada
 - [x] Manual do Crivo L2 v0.1 redigido e confirmado
 - [x] Schema v0.1 pronto (16 tabelas, 6 views, triggers de imutabilidade)
-- [ ] **BLOQUEADO até domingo 19/07:** criação do projeto Supabase "Sinalizador Apostas" (pausar BolaoMundial após a final da Copa → vaga gratuita, org `wvckujkmkvtlhneitfpy`, região `sa-east-1`)
+- [x] **Projeto Supabase criado (jxveebxywadyxuhixcxt); migration 0001 aplicada; doutrina/manual em config_sistema (v1 condensada — será sincronizada verbatim pela E0.4)**
 
 ---
 
 ## E0 — FUNDAÇÃO (chat + Claude Code)
 
-- [ ] E0.1 *(chat, domingo)* Pausar BolaoMundial; criar projeto; aplicar migration 0001; gravar Doutrina e Manual em `config_sistema` (chaves `doutrina` e `manual_crivo_l2`, versão 1)
+- [x] E0.1 *(chat)* Projeto criado; migration 0001 aplicada; Doutrina e Manual gravados em `config_sistema`
 - [x] E0.2 Estrutura do repositório:
   ```
   sinalizador/
@@ -29,18 +29,19 @@
   ├── PLANO_MVP.md         # este arquivo
   ├── docs/                # doutrina, manual L2
   ├── db/migrations/
+  ├── scripts/             # sync_governanca (repo → config_sistema)
   ├── sinalizador/
   │   ├── l0_captura/      # daemons de ingestão
-  │   ├── l1_gatilhos/     # motor mecânico
+  │   ├── l1_gatilhos/     # motor mecânico (devig, edge, motor de gates)
   │   ├── l2_crivo/        # cliente Anthropic + validação
   │   ├── l3_notifica/     # bot Telegram
   │   ├── l4_fechamento/   # CLV e contabilidade
-  │   └── comum/           # config, supabase client, modelos pydantic, log
+  │   └── comum/           # config, supabase client, modelos pydantic, log, gates
   ├── backtest/
   └── tests/
   ```
 - [x] E0.3 Base comum: Python 3.12, `pydantic` (dossiê e saída do L2 como modelos tipados), cliente Supabase (service role), carregador de gates (lê tabela `gates`, cacheia, invalida por TTL curto), logging estruturado
-- [ ] E0.4 Segredos via `.env` (nunca no repo): chaves Supabase, The Odds API, Anthropic, Telegram
+- [ ] E0.4 Segredos via `.env` (nunca no repo): chaves Supabase, The Odds API, Anthropic, Telegram. **Ao ter o `.env`: rodar `python -m scripts.sync_governanca` (publica doutrina/manual v2 verbatim no banco).**
 - [ ] E0.5 VPS: provisionar, systemd units por daemon, watchdog com restart, deploy simples (git pull + restart)
 
 **Aceite:** migration aplicada sem erro; `select * from vw_saude_daemons` responde; teste de trigger confirma que UPDATE em `odds_snapshots` e afrouxamento de gate pétreo FALHAM.
@@ -58,7 +59,7 @@
 ## E2 — L1: MOTOR MECÂNICO
 
 - [x] E2.1 De-vig **Shin** (com testes contra casos conhecidos) + edge líquido conforme definição canônica da Doutrina (comissão + slippage estimado)
-- [ ] E2.2 Motor de gates: lê `gates` vigentes; avalia sincronia (`janela_sincronia_s`), estabilidade da referência, idade de snapshot, liquidez, teto de odd, edge mínimo, exposição (vw_exposicao_aberta + tetos por jogo/liga/dia)
+- [x] E2.2 Motor de gates: lê `gates` vigentes; avalia sincronia (`janela_sincronia_s`), estabilidade da referência, idade de snapshot, liquidez, teto de odd, edge mínimo, exposição (vw_exposicao_aberta + tetos por jogo/liga/dia). **Exposição: pendente dos gates de teto (PC-EXP).**
 - [ ] E2.3 Gatilhos: `value_bet`, `odds_drop` (queda brusca na referência), `line_shopping` (melhor preço entre casas capturadas), `tipster` (tip interpretado → mesmos gates de todos)
 - [ ] E2.4 Detector de anomalia: venue moveu sem a referência mover → `gatilho_anomalo = true`, caminho profundo
 - [ ] E2.5 Parser de tips (regex + heurística; SEM IA nesta camada): extrai evento/mercado/seleção/odd; não interpretável = registra e segue
@@ -128,6 +129,7 @@
 ## PENDÊNCIAS DE CONTRATO
 
 - [x] **PC1 / PC2 — resolvidas pela Sugestão nº 2 (rito, 19/07/2026).** Contratos de `historico_movimento_1h` (série temporal, V-C1) e `profundidade_book` (book instantâneo, V-A5/V-C3) fixados no **Manual §1.1** e tipados em `comum/modelos.py` (`HistoricoMovimento1h`, `ProfundidadeBook`).
+- [ ] **PC-EXP — gates de teto de exposição (jogo, liga-dia, dia) NÃO existem na tabela `gates`.** O motor (`avaliar_exposicao`) já sabe checar tetos, mas só quando definidos por rito — até lá não reprova por exposição (regra 6: nunca inventa número). Definir os valores e adicioná-los a `gates`.
 
 Nota da E0.3: `comum/config.py` expõe uma única `Config` com todos os segredos
 obrigatórios — cada processo que chamar `carregar_config()` precisa do `.env`

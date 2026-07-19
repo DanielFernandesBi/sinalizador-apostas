@@ -15,7 +15,7 @@ Operações expostas:
   - liquidar_aposta(...)                   única mutação de `apostas` (pendente -> final)
   - fechar_tip(...)                        único preenchimento de fechamento em `tips`
   - publicar_config(chave, valor)          publica nova versão vigente de governança (rito)
-  - gates_vigentes() / config_vigente() / casa_por_nome()    leituras
+  - gates_vigentes() / config_vigente() / casa_por_nome() / exposicao_aberta()    leituras
 """
 from __future__ import annotations
 
@@ -81,6 +81,11 @@ class Banco:
         )
         dados = resp.data or []
         return dados[0] if dados else None
+
+    def exposicao_aberta(self) -> list[dict[str, Any]]:
+        """Linhas de `vw_exposicao_aberta` (exposto por jogo/liga-dia/dia)."""
+        resp = self._c.table("vw_exposicao_aberta").select("*").execute()
+        return resp.data or []
 
     # ---------------- ESCRITA: apenas o permitido ----------------
 
