@@ -1,14 +1,17 @@
-"""Testes do registro de abortos near-miss + rastreio de CLV amostral (E2.6)."""
-from sinalizador.l1_gatilhos.abortos import (
-    PISO_RASTREIO_EDGE_PCT,
-    deve_rastrear_clv,
-    registrar_aborto,
-)
+"""Testes do registro de abortos near-miss + rastreio de CLV amostral (E2.6).
+
+O piso de rastreio é o gate `rastreio_edge_min_pct` (Sugestão nº 5) — lido da
+tabela como qualquer gate (regra 6), nunca constante em código.
+"""
+from sinalizador.l1_gatilhos.abortos import deve_rastrear_clv, registrar_aborto
 
 
 class GatesFake:
-    def __init__(self, edge_min_pct):
-        self._m = {"edge_min_pct": edge_min_pct}
+    def __init__(self, edge_min_pct, rastreio_edge_min_pct=1.0):
+        self._m = {
+            "edge_min_pct": edge_min_pct,
+            "rastreio_edge_min_pct": rastreio_edge_min_pct,
+        }
 
     def get(self, nome):
         return self._m[nome]
@@ -23,7 +26,7 @@ class BancoFake:
         return {"id": "aborto-uuid", **registro}
 
 
-# ---- deve_rastrear_clv: intervalo [piso, edge_min) ----
+# ---- deve_rastrear_clv: intervalo [rastreio_edge_min_pct, edge_min_pct) ----
 
 def test_rastreia_near_miss_dentro_do_intervalo():
     gates = GatesFake(edge_min_pct=2.0)
@@ -44,7 +47,14 @@ def test_nao_rastreia_no_ou_acima_do_gate():
 
 def test_piso_e_inclusivo():
     gates = GatesFake(edge_min_pct=2.0)
-    assert deve_rastrear_clv(PISO_RASTREIO_EDGE_PCT / 100.0, gates) is True
+    assert deve_rastrear_clv(0.010, gates) is True     # exatamente no piso (1%)
+
+
+def test_piso_vem_da_tabela_nao_de_constante():
+    # Mudar o gate no banco muda a fronteira — prova que o piso não é hard-coded.
+    gates = GatesFake(edge_min_pct=2.0, rastreio_edge_min_pct=1.5)
+    assert deve_rastrear_clv(0.012, gates) is False    # 1,2% < piso 1,5%
+    assert deve_rastrear_clv(0.016, gates) is True     # 1,6% ∈ [1,5%, 2%)
 
 
 # ---- registrar_aborto: append-only em abortos_l1 ----

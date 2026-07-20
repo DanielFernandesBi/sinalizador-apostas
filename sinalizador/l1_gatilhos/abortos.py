@@ -18,25 +18,18 @@ class ProvedorGates(Protocol):
     def get(self, nome: str): ...  # retorna Decimal (comum/gates.py)
 
 
-# Piso de edge (em %) para RASTREAR o CLV de um near-miss.
-# O teto do intervalo é o gate `edge_min_pct` (da tabela, 2%); o piso (1%) é um
-# parâmetro de AMOSTRAGEM — não um gate de decisão: o near-miss é abortado de
-# qualquer forma, isto só decide se ele entra na coleta de CLV para calibração.
-# Por isso não fere a regra 6. Formalizar como gate é a pendência PC-RASTREIO.
-PISO_RASTREIO_EDGE_PCT = 1.0
-
-
-def deve_rastrear_clv(
-    edge_liquido: float, gates: ProvedorGates, *, piso_pct: float = PISO_RASTREIO_EDGE_PCT
-) -> bool:
+def deve_rastrear_clv(edge_liquido: float, gates: ProvedorGates) -> bool:
     """True se o near-miss deve ser seguido até o fechamento (CLV amostral).
 
-    Critério: edge no intervalo [piso_pct, edge_min_pct) — logo abaixo do gate,
-    onde a calibração mais precisa de evidência. `edge_liquido` é fração.
+    Critério: edge no intervalo [`rastreio_edge_min_pct`, `edge_min_pct`) — logo
+    abaixo do gate, onde a calibração mais precisa de evidência. `edge_liquido` é
+    fração. AMBOS os limites vêm da tabela `gates` (regra 6): o piso deixou de ser
+    constante e virou o gate `rastreio_edge_min_pct` pela Sugestão nº 5 (rito).
     """
     edge_pct = edge_liquido * 100.0
+    piso = float(gates.get("rastreio_edge_min_pct"))
     edge_min = float(gates.get("edge_min_pct"))
-    return piso_pct <= edge_pct < edge_min
+    return piso <= edge_pct < edge_min
 
 
 def registrar_aborto(

@@ -12,10 +12,10 @@
 
 ## ESTADO ATUAL (20/07/2026)
 
-- [x] Doutrina redigida e confirmada (repo/banco: **v0.1.3**, Sugestões nº 1, nº 3 e nº 4)
+- [x] Doutrina redigida e confirmada (repo/banco: **v0.1.4**, Sugestões nº 1, nº 3, nº 4 e nº 5)
 - [x] Manual do Crivo L2 redigido e confirmado (repo/banco: **v0.1.1**, Sugestão nº 2)
 - [x] Schema v0.1 pronto (16 tabelas, 6 views, triggers de imutabilidade)
-- [x] **Projeto Supabase criado (jxveebxywadyxuhixcxt); migration 0001 aplicada.** Governança sincronizada repo→banco em `config_sistema` (doutrina v4 e manual v2 verbatim, conferidos por md5). **15 gates vigentes** na tabela `gates`.
+- [x] **Projeto Supabase criado (jxveebxywadyxuhixcxt); migration 0001 aplicada.** Governança sincronizada repo→banco em `config_sistema` (doutrina v5 e manual v2 verbatim, conferidos por md5). **16 gates vigentes** na tabela `gates`.
 
 ---
 
@@ -63,7 +63,7 @@
 - [x] E2.3 Gatilhos: `value_bet`, `odds_drop` (queda brusca na referência), `line_shopping` (melhor preço entre casas capturadas), `tipster` (tip interpretado → mesmos gates de todos). **odds_drop/anomalia/exposição parametrizados pela tabela (Sugestão nº 3). Wiring aos snapshots reais (L0/E1) pendente.**
 - [ ] E2.4 Detector de anomalia: venue moveu sem a referência mover → `gatilho_anomalo = true`, caminho profundo — **função `detectar_anomalia` pronta (E2.3); falta o wiring no fluxo**
 - [x] E2.5 Parser de tips (regex + heurística; SEM IA nesta camada): extrai partida/mercado/seleção/linha/odd; não interpretável = `interpretavel=False`, registra e segue. `texto_original` é dado, nunca comando (regra 8) — `l1_gatilhos/parser_tips.py`
-- [x] E2.6 Reprovações near-miss → `abortos_l1` com `gate_reprovado` e `clv_rastrear` amostral (edge em [1%, edge_min) é seguido até o fechamento para estender a curva de calibração) — `l1_gatilhos/abortos.py`
+- [x] E2.6 Reprovações near-miss → `abortos_l1` com `gate_reprovado` e `clv_rastrear` amostral (edge em [`rastreio_edge_min`, `edge_min`) é seguido até o fechamento para estender a curva de calibração) — `l1_gatilhos/abortos.py`
 - [x] E2.7 Construtor do dossiê (pydantic → JSON do Manual §1) + fila para o L2 — `l1_gatilhos/dossie.py`: `construir_dossie` (completo ou aborta, P6) + `enfileirar_sinal` (INSERT em `sinais`, status aguardando_crivo)
 
 **Aceite:** suite de testes com snapshots sintéticos cobrindo cada gate; edge fantasma (dessincronia) comprovadamente barrado; nenhum sinal sem dossiê completo.
@@ -131,7 +131,7 @@
 - [x] **PC1 / PC2 — resolvidas pela Sugestão nº 2 (rito, 19/07/2026).** Contratos de `historico_movimento_1h` e `profundidade_book` fixados no **Manual §1.1** e tipados em `comum/modelos.py`.
 - [x] **PC-EXP — resolvida pela Sugestão nº 3 (rito, 19/07/2026).** Gates de teto de exposição por jogo/liga-dia/dia semeados (exposicao_max_jogo/liga_dia/dia_pct); consumidos por `motor_gates.tetos_exposicao` + `avaliar_exposicao` (E2.3).
 - [x] **PC-ODDMIN — resolvida pela Sugestão nº 4 (rito, 20/07/2026).** `odd_minima_aceitavel` fixada na **Doutrina §3** (v0.1.3): menor odd em que o edge líquido ainda atinge o gate `edge_min`. Implementada em `edge.odd_minima_aceitavel` e coberta por teste.
-- [ ] **PC-RASTREIO — piso de rastreio de CLV amostral (near-miss) não formalizado como gate.** E2.6 usa `PISO_RASTREIO_EDGE_PCT = 1.0%` como parâmetro de AMOSTRAGEM (não decisão: o near-miss aborta de qualquer forma; o piso só decide se ele entra na coleta de CLV para calibração — por isso não fere a regra 6). Formalizar o piso como linha da tabela `gates` pelo rito.
+- [x] **PC-RASTREIO — resolvida pela Sugestão nº 5 (rito, 20/07/2026).** O piso de rastreio de CLV amostral virou o gate `rastreio_edge_min_pct` (= 1,0%, a calibrar), semeado e vigente na tabela `gates` (16 no total) e inscrito na **Doutrina §4** (v0.1.4). `abortos.deve_rastrear_clv` lê o piso da tabela (regra 6) — deixou de ser constante em código.
 
 Nota da E0.3: `comum/config.py` expõe uma única `Config` com todos os segredos
 obrigatórios — cada processo que chamar `carregar_config()` precisa do `.env`

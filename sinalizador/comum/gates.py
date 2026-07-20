@@ -8,7 +8,7 @@ Doutrina §4 — usadas como tripwire de integridade, não como valores de opera
 "Dado ausente = abortar" (Doutrina P6) vale para configuração: em
 `validar_integridade()` — chamada na inicialização de todo processo — qualquer
 um dos casos abaixo levanta `GateInvalidoError` e o processo NÃO sobe:
-  - um dos 15 gates nomeados ausente;
+  - um dos 16 gates nomeados ausente;
   - flag `petreo` ou `direcao_endurecer` divergente do esperado;
   - um pétreo AFROUXADO abaixo da baseline (proibido pela Doutrina — pétreo só endurece).
 
@@ -51,7 +51,8 @@ class MetaGate:
 # frouxo em relação ao vigente e o aviso "pétreo endurecido" vira ruído permanente.
 #
 # Espelho estrutural do seed do schema 0001 e da Doutrina §4 (com as Sugestões
-# nº 1, janela_sincronia_s, e nº 3, exposição em camadas + odds_drop + anomalia).
+# nº 1, janela_sincronia_s; nº 3, exposição em camadas + odds_drop + anomalia; e
+# nº 5, piso de rastreio de CLV amostral).
 # Para os gates "a calibrar" (não pétreos) NÃO há baseline: seus valores mudam
 # pelo backtest/rito e não podem ser fixados em código.
 # ---------------------------------------------------------------------------
@@ -69,6 +70,8 @@ METADADOS_GATES: dict[str, MetaGate] = {
     "drop_min_pct":            MetaGate(petreo=False, direcao="maior"),
     "janela_drop_s":           MetaGate(petreo=False, direcao="menor"),
     "anomalia_move_pct":       MetaGate(petreo=False, direcao="menor"),
+    # Sugestão nº 5 — piso de edge para rastrear CLV de near-miss (PC-RASTREIO).
+    "rastreio_edge_min_pct":   MetaGate(petreo=False, direcao="menor"),
     "stake_max_pct":           MetaGate(petreo=True,  direcao="menor", baseline_petreo=Decimal("2.0")),
     "kelly_fracao":            MetaGate(petreo=True,  direcao="menor", baseline_petreo=Decimal("0.25")),
     "drawdown_suspensao_pct":  MetaGate(petreo=True,  direcao="menor", baseline_petreo=Decimal("20")),

@@ -78,6 +78,7 @@ Nenhuma conclusão sobre desempenho com menos de **200 apostas/sinais**. ROI esp
 | Queda mínima da referência para `odds_drop` | ≥ 3% | a calibrar |
 | Janela do `odds_drop` | ≤ 900 s | a calibrar |
 | Movimento do venue para `gatilho_anomalo` (referência parada) | ≥ 3% | a calibrar |
+| Piso de edge para rastrear CLV de near-miss (`rastreio_edge_min`) | ≥ 1,0% | a calibrar |
 | Stake máximo | 2% da banca | **pétreo** |
 | Fração de Kelly | ¼ | **pétreo** (só reduz, nunca sobe) |
 | Drawdown de suspensão | 20% do pico | **pétreo** |
@@ -108,3 +109,5 @@ Mudanças seguem o rito de **sugestões numeradas** (padrão "Evolução do sist
 ---
 
 *v0.1.3 — 20/07/2026. Alteração única (Sugestão nº 4): definição canônica de **odd mínima aceitável** — menor odd em que o edge líquido ainda atinge o gate `edge_min`.*
+
+*v0.1.4 — 20/07/2026. Alteração única (Sugestão nº 5): novo gate `rastreio_edge_min` (≥ 1,0%, a calibrar) na §4 — piso de edge para rastrear o CLV de near-miss (quase-sinais logo abaixo de `edge_min`), estendendo a curva de calibração do modo sombra com dado real.*
