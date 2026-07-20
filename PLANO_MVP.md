@@ -32,7 +32,7 @@
   ├── scripts/             # sync_governanca (repo → config_sistema)
   ├── sinalizador/
   │   ├── l0_captura/      # daemons de ingestão
-  │   ├── l1_gatilhos/     # motor mecânico (devig, edge, motor de gates, gatilhos)
+  │   ├── l1_gatilhos/     # motor mecânico (devig, edge, gates, gatilhos, dossiê)
   │   ├── l2_crivo/        # cliente Anthropic + validação
   │   ├── l3_notifica/     # bot Telegram
   │   ├── l4_fechamento/   # CLV e contabilidade
@@ -64,7 +64,7 @@
 - [ ] E2.4 Detector de anomalia: venue moveu sem a referência mover → `gatilho_anomalo = true`, caminho profundo — **função `detectar_anomalia` pronta (E2.3); falta o wiring no fluxo**
 - [ ] E2.5 Parser de tips (regex + heurística; SEM IA nesta camada): extrai evento/mercado/seleção/odd; não interpretável = registra e segue
 - [ ] E2.6 Reprovações near-miss → `abortos_l1` com `gate_reprovado` e `clv_rastrear` amostral
-- [ ] E2.7 Construtor do dossiê (pydantic → JSON do Manual §1) + fila para o L2
+- [x] E2.7 Construtor do dossiê (pydantic → JSON do Manual §1) + fila para o L2 — `l1_gatilhos/dossie.py`: `construir_dossie` (completo ou aborta, P6) + `enfileirar_sinal` (INSERT em `sinais`, status aguardando_crivo)
 
 **Aceite:** suite de testes com snapshots sintéticos cobrindo cada gate; edge fantasma (dessincronia) comprovadamente barrado; nenhum sinal sem dossiê completo.
 
@@ -130,6 +130,7 @@
 
 - [x] **PC1 / PC2 — resolvidas pela Sugestão nº 2 (rito, 19/07/2026).** Contratos de `historico_movimento_1h` e `profundidade_book` fixados no **Manual §1.1** e tipados em `comum/modelos.py`.
 - [x] **PC-EXP — resolvida pela Sugestão nº 3 (rito, 19/07/2026).** Gates de teto de exposição por jogo/liga-dia/dia semeados (exposicao_max_jogo/liga_dia/dia_pct); consumidos por `motor_gates.tetos_exposicao` + `avaliar_exposicao` (E2.3).
+- [ ] **PC-ODDMIN — fórmula de `odd_minima_aceitavel` não fixada em governança.** L1 usa a definição principiada (menor odd em que o edge ainda atinge o gate `edge_min`) em `edge.odd_minima_aceitavel`; confirmar/ajustar por rito (ex.: piso no gate edge_min vs. em break-even edge=0).
 
 Nota da E0.3: `comum/config.py` expõe uma única `Config` com todos os segredos
 obrigatórios — cada processo que chamar `carregar_config()` precisa do `.env`

@@ -48,3 +48,32 @@ def edge_liquido(
     ganho = p_justa * (odd_venue - 1.0) * (1.0 - comissao)
     perda = 1.0 - p_justa
     return ganho - perda - slippage
+
+
+def odd_minima_aceitavel(
+    p_justa: float,
+    comissao: float,
+    edge_min_fracao: float,
+    slippage: float = 0.0,
+) -> float:
+    """Menor odd do venue em que o edge líquido ainda atinge o gate `edge_min`.
+
+    Resolve edge_liquido(p, odd, comissao) − slippage = edge_min_fracao para odd:
+        odd = 1 + (edge_min_fracao + (1 − p) + slippage) / (p · (1 − comissao)).
+
+    Assim o sinal é aceitável exatamente enquanto o edge ≥ edge_min — a mesma
+    fronteira do gate. É o piso que o L3 usa na re-checagem (odd < mínima → sinal
+    expirado, E4.2).
+
+    NOTA: a Doutrina/Manual NÃO fixam a fórmula de `odd_minima_aceitavel`; esta é
+    a definição principiada (amarrada ao gate edge_min), registrada como pendência
+    PC-ODDMIN no PLANO_MVP para confirmação por rito. `edge_min_fracao` vem do gate
+    edge_min_pct/100 (regra 6) — nunca constante.
+    """
+    if not 0.0 < p_justa <= 1.0:
+        raise ValueError(f"p_justa fora de (0,1]: {p_justa}")
+    if not 0.0 <= comissao < 1.0:
+        raise ValueError(f"comissao (fração) fora de [0,1): {comissao}")
+    if slippage < 0.0:
+        raise ValueError(f"slippage não pode ser negativo: {slippage}")
+    return 1.0 + (edge_min_fracao + (1.0 - p_justa) + slippage) / (p_justa * (1.0 - comissao))
