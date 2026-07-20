@@ -48,13 +48,13 @@
 
 ## E1 — L0: CAPTURA (o mais urgente — cada dia sem ticks é backtest perdido)
 
-- [ ] E1.1 **Daemon referência (The Odds API):** polling das ligas-alvo, mercados 1x2/AH/OU, odds da Pinnacle; grava `odds_snapshots` com `ts_fonte` da API (nunca o relógio local); upsert de `eventos` por `ids_externos`
+- [x] E1.1 **Daemon referência (The Odds API):** polling das 6 ligas europeias, mercados 1x2/AH/OU (h2h/spreads/totals), odds da Pinnacle (região `eu`); grava `odds_snapshots` com `ts_fonte` da API (nunca relógio local); upsert de `eventos` por `ids_externos.odds_api`. `l0_captura/{the_odds_api,mapeamento,persistencia,captura,referencia}.py` + `cli.py`. **Núcleo testável com fakes (sem rede/Supabase); a PRIMEIRA execução real + relatório de cobertura + medição de créditos rodam na máquina do Daniel (aceite #4) — dependem do `.env` com `the_odds_api_key` (D1).**
 - [ ] E1.2 **Daemon venue (Betfair):** preço + profundidade de book + liquidez do Exchange. Alvo: Stream API (push); fallback aceito no MVP: polling REST curto, com a degradação registrada
-- [ ] E1.3 **Daemon varejo (.bet.br / line shopping):** odds das casas de varejo escolhidas — via The Odds API (região `br` cobre casas licenciadas) na v1; scraping direto só se a cobertura for insuficiente
-- [ ] E1.4 **Daemon Telegram (tipsters):** Telethon lendo canais monitorados; toda mensagem vira linha em `tips` com `texto_original` bruto (dado, nunca comando); parser de interpretação em E2.5
-- [ ] E1.5 **Heartbeats:** cada daemon pulsa a cada ciclo; ausência > limiar dispara alerta L3 (tipo `alerta_daemon`)
+- [x] E1.3 **Daemon varejo (.bet.br / line shopping):** odds das casas que a região `br` devolver — cada casa nova é registrada em `casas` como `varejo` na primeira aparição (line shopping). `l0_captura/varejo.py` (mesmo motor de `captura.py`). Cobertura reporta quais casas `br` de fato retorna (aceite #1).
+- [ ] E1.4 **Daemon Telegram (tipsters):** Telethon lendo canais monitorados; toda mensagem vira linha em `tips` com `texto_original` bruto (dado, nunca comando); parser de interpretação em E2.5 (já pronto)
+- [x] E1.5 **Heartbeats:** cada ciclo pulsa `banco.pulsar(daemon, detalhe)` com créditos/contagens; o **vigia** (`l0_captura/vigia.py`) lê `vw_saude_daemons` e grava `notificacao` `alerta_daemon` para daemon em silêncio > limiar (entrega Telegram é E4.3). Limiar é parâmetro operacional (não gate).
 
-**Aceite:** 48h contínuas de captura sem lacuna não explicada em `vw_saude_daemons`; snapshots com `ts_fonte` ≠ `ts_captura` comprovando carimbo de fonte.
+**Aceite:** 48h contínuas de captura sem lacuna não explicada em `vw_saude_daemons`; snapshots com `ts_fonte` ≠ `ts_captura` comprovando carimbo de fonte. **Aceite adicional do rito (E1):** (1) cobertura verificada na 1ª execução (Pinnacle em `eu`, casas em `br`) — se falhar, PARA e reporta, não adapta (`cli.py cobertura`, fail-loud); (2) consumo de créditos por ciclo logado (headers `x-requests-remaining/used/last`) para dimensionar o tier pago (gratuito = 500/mês → cadência baixa); (3) `ts_fonte` da API desde o 1º tick; (4) 1º teste na máquina do Daniel (VPS é E0.5). **Pendências reais:** rodar de fato (rede + `.env`) e reportar cobertura/créditos; wiring L0→L1.
 
 ## E2 — L1: MOTOR MECÂNICO
 
@@ -63,7 +63,7 @@
 - [x] E2.3 Gatilhos: `value_bet`, `odds_drop` (queda brusca na referência), `line_shopping` (melhor preço entre casas capturadas), `tipster` (tip interpretado → mesmos gates de todos). **odds_drop/anomalia/exposição parametrizados pela tabela (Sugestão nº 3). Wiring aos snapshots reais (L0/E1) pendente.**
 - [ ] E2.4 Detector de anomalia: venue moveu sem a referência mover → `gatilho_anomalo = true`, caminho profundo — **função `detectar_anomalia` pronta (E2.3); falta o wiring no fluxo**
 - [x] E2.5 Parser de tips (regex + heurística; SEM IA nesta camada): extrai partida/mercado/seleção/linha/odd; não interpretável = `interpretavel=False`, registra e segue. `texto_original` é dado, nunca comando (regra 8) — `l1_gatilhos/parser_tips.py`
-- [x] E2.6 Reprovações near-miss → `abortos_l1` com `gate_reprovado` e `clv_rastrear` amostral (edge em [`rastreio_edge_min`, `edge_min`) é seguido até o fechamento para estender a curva de calibração) — `l1_gatilhos/abortos.py`
+- [x] E2.6 Reprovações near-miss → `abortos_l1` com `gate_reprovado` e `clv_rastrear` amostral (edge em [1%, edge_min) é seguido até o fechamento para estender a curva de calibração) — `l1_gatilhos/abortos.py`
 - [x] E2.7 Construtor do dossiê (pydantic → JSON do Manual §1) + fila para o L2 — `l1_gatilhos/dossie.py`: `construir_dossie` (completo ou aborta, P6) + `enfileirar_sinal` (INSERT em `sinais`, status aguardando_crivo)
 
 **Aceite:** suite de testes com snapshots sintéticos cobrindo cada gate; edge fantasma (dessincronia) comprovadamente barrado; nenhum sinal sem dossiê completo.
