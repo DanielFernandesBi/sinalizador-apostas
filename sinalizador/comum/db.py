@@ -17,6 +17,7 @@ Operações expostas:
   - publicar_config(chave, valor)          publica nova versão vigente de governança (rito)
   - gates_vigentes() / config_vigente() / casa_por_nome() / exposicao_aberta()    leituras
   - evento_por_id_externo() / saude_daemons()                                      leituras (L0)
+  - snapshots_desde() / casas_ativas() / eventos_por_ids() / banca_atual()          leituras (L1)
 """
 from __future__ import annotations
 
@@ -104,6 +105,35 @@ class Banco:
         """Linhas de `vw_saude_daemons` (último pulso e silêncio por daemon) — E1.5."""
         resp = self._c.table("vw_saude_daemons").select("*").execute()
         return resp.data or []
+
+    def snapshots_desde(self, ts_iso: str) -> list[dict[str, Any]]:
+        """Snapshots com `ts_captura >= ts_iso` (janela de trabalho do L1)."""
+        resp = (
+            self._c.table("odds_snapshots")
+            .select("*")
+            .gte("ts_captura", ts_iso)
+            .order("ts_captura")
+            .execute()
+        )
+        return resp.data or []
+
+    def casas_ativas(self) -> list[dict[str, Any]]:
+        """Todas as casas ativas (mapa id→tipo/comissão para o L1)."""
+        resp = self._c.table("casas").select("*").eq("ativa", True).execute()
+        return resp.data or []
+
+    def eventos_por_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+        """Eventos pelos ids (liga/partida/início para o dossiê)."""
+        if not ids:
+            return []
+        resp = self._c.table("eventos").select("*").in_("id", ids).execute()
+        return resp.data or []
+
+    def banca_atual(self) -> Optional[dict[str, Any]]:
+        """Linha de `vw_banca` (saldo/pico/drawdown/kill_switch). None se sem ledger."""
+        resp = self._c.table("vw_banca").select("*").limit(1).execute()
+        dados = resp.data or []
+        return dados[0] if dados else None
 
     # ---------------- ESCRITA: apenas o permitido ----------------
 

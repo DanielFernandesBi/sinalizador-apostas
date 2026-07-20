@@ -51,8 +51,17 @@ def _seg(a: datetime, b: datetime) -> float:
     return (a - b).total_seconds()
 
 
-def avaliar(ctx: ContextoAvaliacao, gates: ProvedorGates) -> ResultadoGate:
-    """Avalia os gates de integridade/valor. Retorna o primeiro reprovado."""
+def avaliar(
+    ctx: ContextoAvaliacao, gates: ProvedorGates, *, avaliar_liquidez: bool = True
+) -> ResultadoGate:
+    """Avalia os gates de integridade/valor. Retorna o primeiro reprovado.
+
+    `avaliar_liquidez` só é False quando o venue NÃO tem book de exchange (varejo):
+    o gate `liquidez_multiplo_stake` é um conceito de exchange (profundidade para o
+    stake sem mover o preço) e é inaplicável a casa de varejo. O chamador decide —
+    e registra a inaplicabilidade no dossiê; nunca se inventa um valor de liquidez
+    para "passar" o gate (isso seria fabricar dado, P6).
+    """
     # 1) Sincronia entre as fontes (edge fantasma por dessincronia — Correção #1).
     janela = float(gates.get("janela_sincronia_s"))
     desassincronia = abs(_seg(ctx.ts_fonte_venue, ctx.ts_fonte_referencia))
@@ -84,12 +93,13 @@ def avaliar(ctx: ContextoAvaliacao, gates: ProvedorGates) -> ResultadoGate:
         return ResultadoGate(False, "edge_min_pct",
                              f"edge {ctx.edge_liquido*100:.2f}% < mínimo {edge_min_pct:.2f}%")
 
-    # 6) Liquidez suficiente para o stake sem mover o preço.
-    mult = float(gates.get("liquidez_multiplo_stake"))
-    exigida = mult * ctx.stake_valor
-    if ctx.liquidez_disponivel < exigida:
-        return ResultadoGate(False, "liquidez_multiplo_stake",
-                             f"liquidez {ctx.liquidez_disponivel} < {mult:.0f}× stake ({exigida})")
+    # 6) Liquidez suficiente para o stake sem mover o preço (só p/ venue de exchange).
+    if avaliar_liquidez:
+        mult = float(gates.get("liquidez_multiplo_stake"))
+        exigida = mult * ctx.stake_valor
+        if ctx.liquidez_disponivel < exigida:
+            return ResultadoGate(False, "liquidez_multiplo_stake",
+                                 f"liquidez {ctx.liquidez_disponivel} < {mult:.0f}× stake ({exigida})")
 
     return ResultadoGate(True, None, None)
 
