@@ -1,0 +1,195 @@
+"""Testes do wiring L0→L1 (orquestrador): snapshots reais → sinal/aborto."""
+from datetime import datetime, timedelta, timezone
+
+from sinalizador.l1_gatilhos.devig import devig_shin
+from sinalizador.l1_gatilhos.edge import odd_minima_aceitavel
+from sinalizador.l1_gatilhos.orquestrador import PoliticaVenue, rodar_l1
+
+AGORA = datetime(2026, 7, 20, 20, 0, 30, tzinfo=timezone.utc)
+T = "2026-07-20T20:00:10Z"   # dentro de sincronia (0s) e idade (20s)
+
+_GATES = {
+    "janela_sincronia_s": 60, "snapshot_idade_max_s": 600, "odd_teto": 3.30,
+    "edge_min_pct": 2.0, "liquidez_multiplo_stake": 10, "janela_drop_s": 900,
+    "drop_min_pct": 3.0, "anomalia_move_pct": 3.0, "kelly_fracao": 0.25,
+    "stake_max_pct": 2.0, "rastreio_edge_min_pct": 1.0,
+    "exposicao_max_jogo_pct": 3.0, "exposicao_max_liga_dia_pct": 6.0,
+    "exposicao_max_dia_pct": 10.0,
+}
+
+
+class GatesFake:
+    def get(self, nome):
+        return _GATES[nome]
+
+
+CASAS = [
+    {"id": "c-pin", "nome": "pinnacle", "tipo": "referencia", "comissao_pct": 0, "ativa": True},
+    {"id": "c-bf", "nome": "betfair_exchange", "tipo": "exchange", "comissao_pct": 6.5, "ativa": True},
+    {"id": "c-bf2", "nome": "betfair2", "tipo": "exchange", "comissao_pct": 6.5, "ativa": True},
+    {"id": "c-b365", "nome": "bet365_br", "tipo": "varejo", "comissao_pct": 0, "ativa": True},
+]
+EVENTOS = [{"id": "ev1", "liga": "Premier League", "mandante": "A", "visitante": "B",
+            "inicio_utc": "2026-07-20T21:00:00Z"}]
+
+REF_1X2 = [("1", 2.0), ("X", 3.5), ("2", 4.0)]
+
+
+def _p1():
+    probs, _ = devig_shin([o for _, o in REF_1X2])
+    return probs[0]
+
+
+class BancoFake:
+    def __init__(self, snaps, *, banca=1000.0, exposicao=None):
+        self._snaps = snaps
+        self._banca = banca
+        self._exposicao = exposicao or []
+        self.inseridos = []
+        self.pulsos = []
+
+    def snapshots_desde(self, ts_iso):
+        return self._snaps
+
+    def casas_ativas(self):
+        return CASAS
+
+    def eventos_por_ids(self, ids):
+        return [e for e in EVENTOS if e["id"] in ids]
+
+    def banca_atual(self):
+        return {"saldo": self._banca} if self._banca is not None else None
+
+    def exposicao_aberta(self):
+        return self._exposicao
+
+    def inserir(self, tabela, registro):
+        self.inseridos.append((tabela, registro))
+        return {"id": f"{tabela}-{len(self.inseridos)}", **registro}
+
+    def pulsar(self, daemon, detalhe=None):
+        self.pulsos.append((daemon, detalhe))
+
+    def por_tabela(self, tabela):
+        return [r for (t, r) in self.inseridos if t == tabela]
+
+
+def _snap(sel, odd, casa_id, *, liquidez=None, ts=T, linha=None, mercado="1x2"):
+    return {"evento_id": "ev1", "casa_id": casa_id, "mercado": mercado, "selecao": sel,
+            "linha": linha, "odd": odd, "liquidez": liquidez, "ts_fonte": ts, "ts_captura": ts}
+
+
+def _ref_snaps():
+    return [_snap(sel, odd, "c-pin") for sel, odd in REF_1X2]
+
+
+def test_sinal_ponta_a_ponta_exchange():
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)  # edge > 2%
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+
+    assert r.sinais == 1 and r.abortos == 0
+    sinal = banco.por_tabela("sinais")[0]
+    assert sinal["gatilho"] == "value_bet" and sinal["mercado"] == "1x2"
+    assert sinal["selecao"] == "1" and sinal["casa_venue_id"] == "c-bf"
+    assert sinal["edge_liquido_pct"] >= 2.0
+    assert banco.pulsos[0][0] == "l1"
+
+
+def test_near_miss_edge_gera_aborto_com_clv_rastrear():
+    p1 = _p1()
+    odd_baixa = round((odd_minima_aceitavel(p1, 0.065, 0.01)
+                       + odd_minima_aceitavel(p1, 0.065, 0.02)) / 2, 3)  # edge ~1,5%
+    snaps = _ref_snaps() + [_snap("1", odd_baixa, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+
+    assert r.sinais == 0 and r.abortos == 1 and r.rastreados_clv == 1
+    aborto = banco.por_tabela("abortos_l1")[0]
+    assert aborto["gate_reprovado"] == "edge_min_pct"
+    assert aborto["clv_rastrear"] is True
+
+
+def test_odd_acima_do_teto_aborta_por_odd_teto():
+    snaps = _ref_snaps() + [_snap("1", 4.00, "c-bf", liquidez=100000)]  # 4.0 > 3.30
+    banco = BancoFake(snaps)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    assert r.sinais == 0 and r.abortos == 1
+    assert banco.por_tabela("abortos_l1")[0]["gate_reprovado"] == "odd_teto"
+
+
+def test_referencia_incompleta_e_pulada():
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    # falta a seleção "2" na referência → sem devig
+    snaps = [_snap("1", 2.0, "c-pin"), _snap("X", 3.5, "c-pin"),
+             _snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    assert r.sinais == 0 and r.abortos == 0
+    assert any("referência incompleta" in m for m in r.pulados)
+
+
+def test_line_shopping_escolhe_o_maior_preco():
+    p1 = _p1()
+    odd_ok = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.10, 3)
+    snaps = _ref_snaps() + [
+        _snap("1", odd_ok, "c-bf", liquidez=100000),
+        _snap("1", odd_ok + 0.20, "c-bf2", liquidez=100000),  # melhor preço
+    ]
+    banco = BancoFake(snaps)
+    rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    sinal = banco.por_tabela("sinais")[0]
+    assert sinal["casa_venue_id"] == "c-bf2"
+    assert len(sinal["dossie"]["venues_comparados"]) == 2
+
+
+def test_exchange_puro_sem_exchange_nao_gera_sinal():
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    # só venue de varejo capturado; política exchange → nenhum venue elegível
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-b365")]
+    banco = BancoFake(snaps)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    assert r.sinais == 0 and r.abortos == 0
+    assert any("sem venue" in m for m in r.pulados)
+
+
+def test_retail_sombra_gera_sinal_e_marca_desvio():
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.15, 3)  # varejo comissão 0
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-b365")]  # varejo, sem liquidez
+    banco = BancoFake(snaps)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+    assert r.sinais == 1  # gate de liquidez inaplicável a varejo
+    dossie = banco.por_tabela("sinais")[0]["dossie"]
+    assert dossie["liquidez"]["gate_liquidez_ok"] is False
+    assert dossie["liquidez"]["sombra_varejo"] is True
+
+
+def test_anomalia_marca_caminho_profundo():
+    p1 = _p1()
+    odd_base = odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15
+    t0 = "2026-07-20T19:55:10Z"   # ~5 min antes; dentro da janela_drop (900s)
+    # venue moveu +4% (>= anomalia 3%); referência parada (1 ponto → move 0)
+    snaps = _ref_snaps() + [
+        _snap("1", round(odd_base, 3), "c-bf", liquidez=100000, ts=t0),
+        _snap("1", round(odd_base * 1.04, 3), "c-bf", liquidez=100000, ts=T),
+    ]
+    banco = BancoFake(snaps)
+    rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    sinal = banco.por_tabela("sinais")[0]
+    assert sinal["gatilho_anomalo"] is True
+    assert sinal["dossie"]["caminho"] == "profundo"
+
+
+def test_sem_banca_nao_gera_nada():
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps, banca=None)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    assert r.sinais == 0 and r.abortos == 0
+    assert banco.pulsos[0][1]["motivo"] == "sem_banca"
