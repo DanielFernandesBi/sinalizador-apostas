@@ -13,8 +13,8 @@ Gates avaliados aqui (todos definidos na Doutrina §4 / seed do schema):
   - liquidez_multiplo_stake  liquidez disponível vs. stake
 
 Exposição (tetos por jogo/liga/dia) é avaliada por `avaliar_exposicao`, à parte,
-porque depende de dados agregados (vw_exposicao_aberta) e de gates de teto que
-AINDA NÃO existem na tabela — ver pendência PC-EXP no PLANO_MVP (definir por rito).
+porque depende de dados agregados (vw_exposicao_aberta). Os tetos absolutos vêm
+dos gates exposicao_max_jogo/liga_dia/dia_pct (Sugestão nº 3) via `tetos_exposicao`.
 """
 from __future__ import annotations
 
@@ -113,6 +113,26 @@ def stake_kelly_fracao(p_justa: float, odd_venue: float, gates: ProvedorGates) -
     return min(fracao, teto)
 
 
+# Gates de exposição (Sugestão nº 3) → nível lógico usado por avaliar_exposicao.
+_GATE_EXPOSICAO = {
+    "jogo": "exposicao_max_jogo_pct",
+    "liga_dia": "exposicao_max_liga_dia_pct",
+    "dia": "exposicao_max_dia_pct",
+}
+
+
+def tetos_exposicao(gates: ProvedorGates, banca: float) -> dict[str, float]:
+    """Tetos absolutos de exposição por camada = (gate_pct / 100) × banca.
+
+    Os percentuais vêm da tabela `gates` (regra 6): exposicao_max_jogo_pct,
+    _liga_dia_pct, _dia_pct. Nunca constante.
+    """
+    return {
+        nivel: float(gates.get(gate)) / 100.0 * banca
+        for nivel, gate in _GATE_EXPOSICAO.items()
+    }
+
+
 def avaliar_exposicao(
     stake_valor: float,
     exposto: dict[str, float],
@@ -120,14 +140,9 @@ def avaliar_exposicao(
 ) -> ResultadoGate:
     """Avalia a exposição AGREGADA por jogo/liga-dia/dia (vw_exposicao_aberta).
 
-    `exposto` e `tetos` mapeiam níveis ('jogo', 'liga_dia', 'dia') → valor. Só os
-    níveis presentes em `tetos` são checados. Reprova se exposto + stake ultrapassa
-    o teto do nível.
-
-    IMPORTANTE: os gates de teto de exposição por jogo/liga/dia AINDA NÃO existem
-    na tabela `gates` (ver pendência PC-EXP no PLANO_MVP). Enquanto não definidos
-    por rito, o chamador passa `tetos={}` e nada é reprovado aqui — nunca se
-    inventa um teto (regra 6).
+    `exposto` e `tetos` mapeiam níveis ('jogo', 'liga_dia', 'dia') → valor. Monte
+    `tetos` com `tetos_exposicao(gates, banca)`. Só os níveis presentes em `tetos`
+    são checados. Reprova se exposto + stake ultrapassa o teto do nível.
     """
     for nivel, teto in tetos.items():
         atual = exposto.get(nivel, 0.0)
