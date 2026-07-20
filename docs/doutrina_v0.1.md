@@ -71,6 +71,12 @@ Nenhuma conclusão sobre desempenho com menos de **200 apostas/sinais**. ROI esp
 | Liquidez mínima disponível no venue (para o stake calculado sem mover preço) | ≥ 10× o stake | a calibrar |
 | Idade máxima do snapshot | ≤ 10 min | a calibrar |
 | Janela de sincronia entre snapshots (referência × venue) | ≤ 60 s | a calibrar |
+| Exposição máxima aberta por jogo | ≤ 3% da banca | a calibrar |
+| Exposição máxima aberta por liga/dia | ≤ 6% da banca | a calibrar |
+| Exposição máxima aberta por dia | ≤ 10% da banca | a calibrar |
+| Queda mínima da referência para `odds_drop` | ≥ 3% | a calibrar |
+| Janela do `odds_drop` | ≤ 900 s | a calibrar |
+| Movimento do venue para `gatilho_anomalo` (referência parada) | ≥ 3% | a calibrar |
 | Stake máximo | 2% da banca | **pétreo** |
 | Fração de Kelly | ¼ | **pétreo** (só reduz, nunca sobe) |
 | Drawdown de suspensão | 20% do pico | **pétreo** |
@@ -100,4 +106,4 @@ Mudanças seguem o rito de **sugestões numeradas** (padrão "Evolução do sist
 
 ---
 
-*v0.1.1 — 18/07/2026. Alteração única: formalização do gate de sincronia (Sugestão nº 1).*
+*v0.1.2 — 19/07/2026. Alteração única (Sugestão nº 3): seis gates novos — exposição aberta em camadas por jogo/liga-dia/dia (PC-EXP / Correção #6) e parâmetros de `odds_drop` (queda mínima, janela) e do detector de `gatilho_anomalo`.*

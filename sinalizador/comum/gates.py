@@ -8,7 +8,7 @@ Doutrina §4 — usadas como tripwire de integridade, não como valores de opera
 "Dado ausente = abortar" (Doutrina P6) vale para configuração: em
 `validar_integridade()` — chamada na inicialização de todo processo — qualquer
 um dos casos abaixo levanta `GateInvalidoError` e o processo NÃO sobe:
-  - um dos 9 gates nomeados ausente;
+  - um dos 15 gates nomeados ausente;
   - flag `petreo` ou `direcao_endurecer` divergente do esperado;
   - um pétreo AFROUXADO abaixo da baseline (proibido pela Doutrina — pétreo só endurece).
 
@@ -50,9 +50,10 @@ class MetaGate:
 # correspondente é atualizada AQUI, no MESMO ato do rito. Senão o tripwire fica
 # frouxo em relação ao vigente e o aviso "pétreo endurecido" vira ruído permanente.
 #
-# Espelho estrutural do seed do schema 0001 e da Doutrina §4 (com a Sugestão nº 1,
-# janela_sincronia_s). Para os gates "a calibrar" (não pétreos) NÃO há baseline:
-# seus valores mudam pelo backtest/rito e não podem ser fixados em código.
+# Espelho estrutural do seed do schema 0001 e da Doutrina §4 (com as Sugestões
+# nº 1, janela_sincronia_s, e nº 3, exposição em camadas + odds_drop + anomalia).
+# Para os gates "a calibrar" (não pétreos) NÃO há baseline: seus valores mudam
+# pelo backtest/rito e não podem ser fixados em código.
 # ---------------------------------------------------------------------------
 METADADOS_GATES: dict[str, MetaGate] = {
     "edge_min_pct":            MetaGate(petreo=False, direcao="maior"),
@@ -60,6 +61,14 @@ METADADOS_GATES: dict[str, MetaGate] = {
     "liquidez_multiplo_stake": MetaGate(petreo=False, direcao="maior"),
     "snapshot_idade_max_s":    MetaGate(petreo=False, direcao="menor"),
     "janela_sincronia_s":      MetaGate(petreo=False, direcao="menor"),
+    # Sugestão nº 3 — exposição aberta em camadas (PC-EXP / Correção #6).
+    "exposicao_max_jogo_pct":     MetaGate(petreo=False, direcao="menor"),
+    "exposicao_max_liga_dia_pct": MetaGate(petreo=False, direcao="menor"),
+    "exposicao_max_dia_pct":      MetaGate(petreo=False, direcao="menor"),
+    # Sugestão nº 3 — gatilho odds_drop e detector de gatilho_anomalo.
+    "drop_min_pct":            MetaGate(petreo=False, direcao="maior"),
+    "janela_drop_s":           MetaGate(petreo=False, direcao="menor"),
+    "anomalia_move_pct":       MetaGate(petreo=False, direcao="menor"),
     "stake_max_pct":           MetaGate(petreo=True,  direcao="menor", baseline_petreo=Decimal("2.0")),
     "kelly_fracao":            MetaGate(petreo=True,  direcao="menor", baseline_petreo=Decimal("0.25")),
     "drawdown_suspensao_pct":  MetaGate(petreo=True,  direcao="menor", baseline_petreo=Decimal("20")),
