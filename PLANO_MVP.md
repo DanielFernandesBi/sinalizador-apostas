@@ -50,11 +50,11 @@
 
 - [x] E1.1 **Daemon referência (The Odds API):** polling das 6 ligas europeias, mercados 1x2/AH/OU (h2h/spreads/totals), odds da Pinnacle (região `eu`); grava `odds_snapshots` com `ts_fonte` da API (nunca relógio local); upsert de `eventos` por `ids_externos.odds_api`. `l0_captura/{the_odds_api,mapeamento,persistencia,captura,referencia}.py` + `cli.py`. **Núcleo testável com fakes (sem rede/Supabase); a PRIMEIRA execução real + relatório de cobertura + medição de créditos rodam na máquina do Daniel (aceite #4) — dependem do `.env` com `the_odds_api_key` (D1).**
 - [ ] E1.2 **Daemon venue (Betfair):** preço + profundidade de book + liquidez do Exchange. Alvo: Stream API (push); fallback aceito no MVP: polling REST curto, com a degradação registrada. **SUSPENSO aguardando resposta do developer support (app key).** Enquanto isso, o único venue de execução com liquidez não existe — ver PC-VENUE-SOMBRA.
-- [x] E1.3 **Daemon varejo (.bet.br / line shopping):** odds das casas que a região `br` devolver — cada casa nova é registrada em `casas` como `varejo` na primeira aparição (line shopping). `l0_captura/varejo.py` (mesmo motor de `captura.py`). Cobertura reporta quais casas `br` de fato retorna (aceite #1).
+- [ ] E1.3 **Daemon varejo (.bet.br / line shopping):** **a The Odds API NÃO tem região `br`** (fato conhecido) — o `varejo.py` (região `br`) é, na prática, não-funcional por essa fonte (as chamadas 422 e caem em degradação segura, sem gastar sinal). A FONTE das casas .bet.br está em avaliação: **sonda OddsPapi** (`l0_captura/sonda_oddspapi.py` + `cli.py sonda` — free tier, reporta casas BR licenciadas, Pinnacle, frescor, mercados). É sonda experimental, NÃO integração — adotar (ou não) é decisão do rito (**PC-VENUE**). Daniel cria a conta free e põe `ODDSPAPI_API_KEY` no `.env`.
 - [ ] E1.4 **Daemon Telegram (tipsters):** Telethon lendo canais monitorados; toda mensagem vira linha em `tips` com `texto_original` bruto (dado, nunca comando); parser de interpretação em E2.5 (já pronto)
 - [x] E1.5 **Heartbeats:** cada ciclo pulsa `banco.pulsar(daemon, detalhe)` com créditos/contagens; o **vigia** (`l0_captura/vigia.py`) lê `vw_saude_daemons` e grava `notificacao` `alerta_daemon` para daemon em silêncio > limiar (entrega Telegram é E4.3). Limiar é parâmetro operacional (não gate).
 
-**Aceite:** 48h contínuas de captura sem lacuna não explicada em `vw_saude_daemons`; snapshots com `ts_fonte` ≠ `ts_captura` comprovando carimbo de fonte. **Aceite adicional do rito (E1):** (1) cobertura verificada na 1ª execução (Pinnacle em `eu`, casas em `br`) — se falhar, PARA e reporta, não adapta (`cli.py cobertura`, fail-loud); (2) consumo de créditos por ciclo logado (headers `x-requests-remaining/used/last`) para dimensionar o tier pago (gratuito = 500/mês → cadência baixa); (3) `ts_fonte` da API desde o 1º tick; (4) 1º teste na máquina do Daniel (VPS é E0.5). **Pendências reais:** rodar de fato (rede + `.env`) e reportar cobertura/créditos. (Wiring L0→L1 já feito — E2.8.)
+**Aceite:** 48h contínuas de captura sem lacuna não explicada em `vw_saude_daemons`; snapshots com `ts_fonte` ≠ `ts_captura` comprovando carimbo de fonte. **Aceite adicional do rito (E1):** (1) cobertura da 1ª execução consulta só a região `eu` (não há `br` na The Odds API) e imprime, por jogo, os bookmakers — com destaque para a Pinnacle e para `betfair_ex_*`; fail-loud SÓ no pressuposto da referência (**Pinnacle ausente na `eu` = erro**); ausência de casas de varejo NÃO é erro (`cli.py cobertura`); (2) consumo de créditos por ciclo logado (headers `x-requests-remaining/used/last`) para dimensionar o tier pago (gratuito = 500/mês → cadência baixa); (3) `ts_fonte` da API desde o 1º tick; (4) 1º teste na máquina do Daniel (VPS é E0.5). **Pendências reais:** rodar de fato (rede + `.env`) e reportar cobertura/créditos. (Wiring L0→L1 já feito — E2.8.)
 
 ## E2 — L1: MOTOR MECÂNICO
 
@@ -121,7 +121,7 @@
 |---|---|---|
 | D1 | Plano da The Odds API (tier gratuito = 500 req/mês, insuficiente; tier pago conforme cadência desejada) | E1.1 |
 | D2 | Conta Betfair Brasil + solicitação de chave de API (app key) | E1.2 |
-| D3 | Quais casas .bet.br monitorar no line shopping (sugestão inicial: as de maior volume cobertas pela The Odds API) | E1.3 |
+| D3 | Quais casas .bet.br monitorar no line shopping — **depende da fonte (PC-VENUE): a The Odds API não cobre `br`; avaliar OddsPapi via `cli.py sonda`** | E1.3 |
 | D4 | Lista inicial de canais de tipsters no Telegram (5–10 para começar o ranking) | E1.4 |
 | D5 | VPS (provedor e orçamento — R$ 30–60/mês resolve o MVP) | E0.5 |
 | D6 | Ligas-alvo iniciais (sugestão: Brasileirão A/B + 2–3 ligas europeias líquidas quando retomarem em agosto). **Nota E6.1: o Football-Data NÃO cobre o Brasileirão — o backtest inicial roda nas 6 ligas europeias cobertas (E0/SP1/I1/D1/F1/P1); fonte para Brasileirão a definir.** | E1.1, E6 |
@@ -134,11 +134,14 @@
 - [x] **PC-ODDMIN — resolvida pela Sugestão nº 4 (rito, 20/07/2026).** `odd_minima_aceitavel` fixada na **Doutrina §3** (v0.1.3): menor odd em que o edge líquido ainda atinge o gate `edge_min`. Implementada em `edge.odd_minima_aceitavel` e coberta por teste.
 - [x] **PC-RASTREIO — resolvida pela Sugestão nº 5 (rito, 20/07/2026).** O piso de rastreio de CLV amostral virou o gate `rastreio_edge_min_pct` (= 1,0%, a calibrar), semeado e vigente na tabela `gates` (16 no total) e inscrito na **Doutrina §4** (v0.1.4). `abortos.deve_rastrear_clv` lê o piso da tabela (regra 6) — deixou de ser constante em código.
 - [ ] **PC-VENUE-SOMBRA — venue de execução na ausência da Betfair (E1.2 suspenso).** A Doutrina §3 define o venue como Betfair Exchange. Sem ela, não há venue com liquidez. O wiring (E2.8) roda por padrão em `exchange` (puro: sem exchange, só abortos + rastreio de CLV alimentam a calibração). O modo opt-in `retail_sombra` usa o melhor preço de varejo como venue, com o gate de liquidez **inaplicável** (varejo não tem book) e o sinal marcado `sombra_varejo=true` no dossiê. É um DESVIO do desenho — **decidir por rito** se/como habilitar o modo sombra para os primeiros sinais ponta a ponta, ou aguardar o E1.2. Nada foi habilitado por default.
+- [ ] **PC-VENUE — fonte das casas de varejo .bet.br (The Odds API não tem região `br`).** Em avaliação pela **sonda OddsPapi** (`l0_captura/sonda_oddspapi.py` + `cli.py sonda`, free tier): reporta casas BR licenciadas presentes, Pinnacle, frescor (timestamps) e mercados. É sonda de avaliação, não integração — **decidir por rito** se a OddsPapi (ou outra fonte) vira a origem do line shopping .bet.br. Nota: a rota/base da OddsPapi no cliente é provisória (confirmar na doc real); o parsing é defensivo. Daniel: conta free + `ODDSPAPI_API_KEY` no `.env`.
 - [ ] **PC-SLIPPAGE — modelo de slippage não existe.** A Doutrina P4 manda deduzir slippage estimado pela liquidez. Não há estimador ainda; o edge do L1 usa `slippage=0` (otimista). Formalizar o estimador (ou um piso conservador) pelo rito, com evidência do book real (E1.2) + backtest.
 
-Nota da E0.3: `comum/config.py` expõe uma única `Config` com todos os segredos
-obrigatórios — cada processo que chamar `carregar_config()` precisa do `.env`
-completo. Se daemons isolados vierem a exigir só um subconjunto, segmentar pelo rito.
+Nota da E0.3 (config por camada — FEITO): `comum/config.py` exige na carga só os
+segredos UNIVERSAIS (Supabase). Os demais (`the_odds_api_key`, `anthropic_api_key`,
+`telegram_*`, `oddspapi_api_key`) são opcionais no schema e cobrados no PONTO DE USO
+por `Config.exigir(campo)` — cada camada falha alto só pelo segredo que ELA consome
+(o L0 não precisa da chave do Telegram, etc.).
 
 Nota da E2.8 (L1): o L1 só dimensiona stake se houver banca. Antes de rodar o
 `l1.cli` (mesmo em modo sombra, sem dinheiro), semear a **banca de papel** em

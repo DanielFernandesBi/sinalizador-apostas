@@ -1,18 +1,27 @@
 """Configuração do sistema — segredos e parâmetros de ambiente.
 
 Carregada de variáveis de ambiente / `.env` (fora do git — regra 9). "Dado
-ausente = abortar" (Doutrina P6) vale para configuração: a falta de qualquer
-segredo obrigatório levanta `ValidationError` na carga e o processo NÃO sobe.
+ausente = abortar" (Doutrina P6) vale para configuração — mas **por camada**:
+só os segredos UNIVERSAIS (o acesso ao Supabase, que toda camada usa) são
+obrigatórios na carga. Os demais são opcionais no schema e cobrados **no ponto de
+uso** por `exigir(...)`: assim o daemon do L0 não precisa da chave do Telegram, e
+o do L3 não precisa da The Odds API — cada processo falha alto só pelo segredo que
+ELE consome, nunca pelos das outras camadas.
 
-A carga é preguiçosa (`carregar_config()`), então importar o módulo não exige
-o `.env` presente — só chamá-lo exige.
+A carga é preguiçosa (`carregar_config()`), então importar o módulo não exige o
+`.env` presente — só chamá-lo exige (e só os universais).
 """
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class SegredoAusenteError(RuntimeError):
+    """Um segredo exigido por esta camada não está no ambiente/.env (P6)."""
 
 
 class Config(BaseSettings):
@@ -22,17 +31,32 @@ class Config(BaseSettings):
         extra="ignore",
     )
 
+    # Universais — toda camada fala com o banco. Obrigatórios na carga.
     supabase_url: str = Field(..., description="URL do projeto Supabase próprio")
     supabase_service_role_key: str = Field(
         ..., description="Service role key — acesso total, usado só via comum/db.py"
     )
-    the_odds_api_key: str = Field(..., description="Chave The Odds API (L0 referência/varejo)")
-    anthropic_api_key: str = Field(..., description="Chave Anthropic (L2 crivo)")
-    telegram_bot_token: str = Field(..., description="Token do bot Telegram (L3)")
-    telegram_chat_id: str = Field(..., description="Chat/canal privado de destino (L3)")
+
+    # Por camada — opcionais no schema, cobrados no ponto de uso via `exigir`.
+    the_odds_api_key: Optional[str] = Field(None, description="The Odds API (L0 referência/varejo)")
+    anthropic_api_key: Optional[str] = Field(None, description="Anthropic (L2 crivo)")
+    telegram_bot_token: Optional[str] = Field(None, description="Bot Telegram (L3)")
+    telegram_chat_id: Optional[str] = Field(None, description="Canal privado de destino (L3)")
+    # Experimental (sonda de avaliação PC-VENUE) — nunca obrigatório.
+    oddspapi_api_key: Optional[str] = Field(None, description="OddsPapi (sonda de avaliação)")
+
+    def exigir(self, campo: str) -> str:
+        """Valor do segredo `campo` ou falha alto se ausente (P6, por camada)."""
+        valor = getattr(self, campo, None)
+        if not valor:
+            raise SegredoAusenteError(
+                f"segredo obrigatório para esta camada ausente: {campo!r} — "
+                f"defina-o no .env"
+            )
+        return valor
 
 
 @lru_cache(maxsize=1)
 def carregar_config() -> Config:
-    """Instancia a Config uma vez. Levanta erro claro se faltar segredo obrigatório."""
+    """Instancia a Config uma vez. Levanta erro claro se faltar segredo UNIVERSAL."""
     return Config()  # type: ignore[call-arg]  # campos vêm do ambiente/.env

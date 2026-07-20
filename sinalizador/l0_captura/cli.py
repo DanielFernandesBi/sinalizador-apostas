@@ -1,12 +1,13 @@
 """CLI do L0 — amarra o núcleo à infraestrutura real (Banco + The Odds API).
 
-Roda na máquina do Daniel (E1 aceite #4) e depois no VPS (E0.5). Exige o `.env`
-completo (Supabase + the_odds_api_key). Subcomandos:
+Roda na máquina do Daniel (E1 aceite #4) e depois no VPS (E0.5). Config por camada:
+cada subcomando exige só o segredo que usa (P6 no ponto de uso). Subcomandos:
 
-    python -m sinalizador.l0_captura.cli cobertura           # E1 aceite #1 (fail-loud)
+    python -m sinalizador.l0_captura.cli cobertura           # E1 aceite #1 (fail-loud na Pinnacle)
     python -m sinalizador.l0_captura.cli referencia --once   # E1.1 (um ciclo)
     python -m sinalizador.l0_captura.cli referencia --intervalo-s 3600
     python -m sinalizador.l0_captura.cli varejo --once       # E1.3
+    python -m sinalizador.l0_captura.cli sonda --caminho ... # avaliação PC-VENUE (OddsPapi)
     python -m sinalizador.l0_captura.cli vigia --once        # E1.5
 
 Cadência: no tier gratuito (500 créditos/mês) rode em intervalo alto. O custo de
@@ -28,13 +29,15 @@ from . import referencia, varejo, vigia
 from .captura import MERCADOS_PADRAO, rodar_ciclo
 from .cobertura import CoberturaInsuficienteError, inspecionar, verificar_ou_parar
 from .mapeamento import SPORTS_ALVO
+from .sonda_oddspapi import SondaOddsPapi, analisar
 from .the_odds_api import ClienteOddsAPI
 
 _log = logging.getLogger("l0_captura.cli")
 
 
 def _cliente() -> ClienteOddsAPI:
-    return ClienteOddsAPI(carregar_config().the_odds_api_key)
+    # Config por camada: cobra só a chave que ESTE processo usa (P6 no ponto de uso).
+    return ClienteOddsAPI(carregar_config().exigir("the_odds_api_key"))
 
 
 def _loop(rodar, *, intervalo_s: float) -> None:
@@ -74,7 +77,16 @@ def _cmd_cobertura(args) -> int:
     except CoberturaInsuficienteError as e:
         print(f"\nFALHA DE COBERTURA — PARAR: {e}", file=sys.stderr)
         return 2
-    print("\nCobertura OK — pressuposto referência × line shopping sustentado.")
+    print("\nCobertura OK — Pinnacle presente na eu (pressuposto da referência sustentado).")
+    return 0
+
+
+def _cmd_sonda(args) -> int:
+    # Avaliação PC-VENUE: não persiste nada, não integra — só reporta.
+    sonda = SondaOddsPapi(carregar_config().exigir("oddspapi_api_key"))
+    params = dict(p.split("=", 1) for p in (args.param or []))
+    eventos = sonda.buscar(args.caminho, params)
+    print(analisar(eventos).relatorio())
     return 0
 
 
@@ -102,9 +114,13 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--sports", nargs="+", default=None, help="sport_keys (default: as 6 do backtest)")
         p.add_argument("--markets", nargs="+", default=None, help="h2h spreads totals")
 
-    pc = sub.add_parser("cobertura", help="E1 aceite #1 — verifica cobertura (fail-loud)")
+    pc = sub.add_parser("cobertura", help="E1 aceite #1 — cobertura eu (fail-loud só na Pinnacle)")
     pc.add_argument("--sport", default="soccer_epl")
     pc.add_argument("--market", default="h2h")
+
+    ps = sub.add_parser("sonda", help="avaliação PC-VENUE — sonda OddsPapi (experimental)")
+    ps.add_argument("--caminho", required=True, help="rota da OddsPapi (ver doc); ex.: v1/odds")
+    ps.add_argument("--param", nargs="*", default=None, help="k=v repetível (ex.: sport=soccer)")
 
     pv = sub.add_parser("vigia", help="E1.5 — alerta daemon mudo")
     pv.add_argument("--once", action="store_true")
@@ -119,6 +135,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_captura(varejo.PERFIL, args)
     if args.cmd == "cobertura":
         return _cmd_cobertura(args)
+    if args.cmd == "sonda":
+        return _cmd_sonda(args)
     if args.cmd == "vigia":
         return _cmd_vigia(args)
     return 1
