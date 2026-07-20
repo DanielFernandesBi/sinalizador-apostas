@@ -57,6 +57,7 @@ Nenhuma conclusão sobre desempenho com menos de **200 apostas/sinais**. ROI esp
 - **Referência sharp:** linha da Pinnacle (via agregador com API), de-vigada pelo **método de Shin**. É a fonte da verdade para probabilidade justa. Não é venue de execução.
 - **Venue:** ambiente onde Daniel executa. Padrão: **Betfair Exchange (Brasil)**. O sinal só é válido para o venue cujo preço e liquidez foram capturados.
 - **Edge líquido:** `p_justa × (odd_venue − 1) × (1 − comissão) − (1 − p_justa)`, deduzido slippage estimado.
+- **Odd mínima aceitável:** menor odd do venue em que o edge líquido ainda atinge o gate `edge_min` — a mesma fronteira que aprova o sinal. Abaixo dela, o sinal está sem valor suficiente e expira na re-checagem de preço do L3.
 - **CLV de um sinal:** diferença entre a odd capturada na emissão e a odd de fechamento da referência sharp para o mesmo mercado/seleção, convertidas a probabilidade.
 - **Unidade (u):** 1% da banca corrente no momento do sinal.
 - **Janela de validade do dado:** idade máxima do snapshot de odds para que o cálculo seja admissível. Provisório: **10 minutos** (a calibrar).
@@ -106,4 +107,4 @@ Mudanças seguem o rito de **sugestões numeradas** (padrão "Evolução do sist
 
 ---
 
-*v0.1.2 — 19/07/2026. Alteração única (Sugestão nº 3): seis gates novos — exposição aberta em camadas por jogo/liga-dia/dia (PC-EXP / Correção #6) e parâmetros de `odds_drop` (queda mínima, janela) e do detector de `gatilho_anomalo`.*
+*v0.1.3 — 20/07/2026. Alteração única (Sugestão nº 4): definição canônica de **odd mínima aceitável** — menor odd em que o edge líquido ainda atinge o gate `edge_min`.*
