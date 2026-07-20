@@ -10,12 +10,12 @@
 
 ---
 
-## ESTADO ATUAL (19/07/2026)
+## ESTADO ATUAL (20/07/2026)
 
-- [x] Doutrina redigida e confirmada (repo/banco: **v0.1.2**, Sugestões nº 1 e nº 3)
+- [x] Doutrina redigida e confirmada (repo/banco: **v0.1.3**, Sugestões nº 1, nº 3 e nº 4)
 - [x] Manual do Crivo L2 redigido e confirmado (repo/banco: **v0.1.1**, Sugestão nº 2)
 - [x] Schema v0.1 pronto (16 tabelas, 6 views, triggers de imutabilidade)
-- [x] **Projeto Supabase criado (jxveebxywadyxuhixcxt); migration 0001 aplicada.** Governança sincronizada repo→banco em `config_sistema` (doutrina v3 e manual v2 verbatim, conferidos por md5). **15 gates vigentes** na tabela `gates`.
+- [x] **Projeto Supabase criado (jxveebxywadyxuhixcxt); migration 0001 aplicada.** Governança sincronizada repo→banco em `config_sistema` (doutrina v4 e manual v2 verbatim, conferidos por md5). **15 gates vigentes** na tabela `gates`.
 
 ---
 
@@ -51,7 +51,7 @@
 - [ ] E1.1 **Daemon referência (The Odds API):** polling das ligas-alvo, mercados 1x2/AH/OU, odds da Pinnacle; grava `odds_snapshots` com `ts_fonte` da API (nunca o relógio local); upsert de `eventos` por `ids_externos`
 - [ ] E1.2 **Daemon venue (Betfair):** preço + profundidade de book + liquidez do Exchange. Alvo: Stream API (push); fallback aceito no MVP: polling REST curto, com a degradação registrada
 - [ ] E1.3 **Daemon varejo (.bet.br / line shopping):** odds das casas de varejo escolhidas — via The Odds API (região `br` cobre casas licenciadas) na v1; scraping direto só se a cobertura for insuficiente
-- [ ] E1.4 **Daemon Telegram (tipsters):** Telethon lendo canais monitorados; toda mensagem vira linha em `tips` com `texto_original` bruto (dado, nunca comando); parser de interpretação em E2
+- [ ] E1.4 **Daemon Telegram (tipsters):** Telethon lendo canais monitorados; toda mensagem vira linha em `tips` com `texto_original` bruto (dado, nunca comando); parser de interpretação em E2.5
 - [ ] E1.5 **Heartbeats:** cada daemon pulsa a cada ciclo; ausência > limiar dispara alerta L3 (tipo `alerta_daemon`)
 
 **Aceite:** 48h contínuas de captura sem lacuna não explicada em `vw_saude_daemons`; snapshots com `ts_fonte` ≠ `ts_captura` comprovando carimbo de fonte.
@@ -60,10 +60,10 @@
 
 - [x] E2.1 De-vig **Shin** (com testes contra casos conhecidos) + edge líquido conforme definição canônica da Doutrina (comissão + slippage estimado)
 - [x] E2.2 Motor de gates: lê `gates` vigentes; avalia sincronia (`janela_sincronia_s`), estabilidade da referência, idade de snapshot, liquidez, teto de odd, edge mínimo, exposição (vw_exposicao_aberta + tetos por jogo/liga/dia)
-- [x] E2.3 Gatilhos: `value_bet`, `odds_drop` (queda brusca na referência), `line_shopping` (melhor preço entre casas capturadas), `tipster` (tip interpretado → mesmos gates de todos). **odds_drop/anomalia/exposição parametrizados pela tabela (Sugestão nº 3). Parser de tips (E2.5) e wiring aos snapshots reais (L0/E1) pendentes.**
+- [x] E2.3 Gatilhos: `value_bet`, `odds_drop` (queda brusca na referência), `line_shopping` (melhor preço entre casas capturadas), `tipster` (tip interpretado → mesmos gates de todos). **odds_drop/anomalia/exposição parametrizados pela tabela (Sugestão nº 3). Wiring aos snapshots reais (L0/E1) pendente.**
 - [ ] E2.4 Detector de anomalia: venue moveu sem a referência mover → `gatilho_anomalo = true`, caminho profundo — **função `detectar_anomalia` pronta (E2.3); falta o wiring no fluxo**
-- [ ] E2.5 Parser de tips (regex + heurística; SEM IA nesta camada): extrai evento/mercado/seleção/odd; não interpretável = registra e segue
-- [ ] E2.6 Reprovações near-miss → `abortos_l1` com `gate_reprovado` e `clv_rastrear` amostral
+- [x] E2.5 Parser de tips (regex + heurística; SEM IA nesta camada): extrai partida/mercado/seleção/linha/odd; não interpretável = `interpretavel=False`, registra e segue. `texto_original` é dado, nunca comando (regra 8) — `l1_gatilhos/parser_tips.py`
+- [x] E2.6 Reprovações near-miss → `abortos_l1` com `gate_reprovado` e `clv_rastrear` amostral (edge em [1%, edge_min) é seguido até o fechamento para estender a curva de calibração) — `l1_gatilhos/abortos.py`
 - [x] E2.7 Construtor do dossiê (pydantic → JSON do Manual §1) + fila para o L2 — `l1_gatilhos/dossie.py`: `construir_dossie` (completo ou aborta, P6) + `enfileirar_sinal` (INSERT em `sinais`, status aguardando_crivo)
 
 **Aceite:** suite de testes com snapshots sintéticos cobrindo cada gate; edge fantasma (dessincronia) comprovadamente barrado; nenhum sinal sem dossiê completo.
@@ -100,8 +100,8 @@
 ## E6 — BACKTEST (paralelo, desde que E2.1 exista)
 
 - [x] E6.1 Ingestão do histórico Football-Data.co.uk (ligas-alvo, com odds de abertura e fechamento) — `backtest/football_data.py` (E0/SP1/I1/D1/F1/P1)
-- [ ] E6.2 Replay do L1 sobre o histórico: o gatilho `value_bet` teria CLV positivo? Em quais ligas/mercados? — **motor de replay + medição de CLV + relatório prontos e testados (`backtest/replay.py`, 1x2/OU/AH); aguarda execução sobre dados reais (download bloqueado neste ambiente, roda no VPS/dev)**
-- [ ] E6.3 Calibração dos gates "a calibrar" (edge mínimo, teto de odd, etc.) com evidência → propostas formais pelo rito
+- [ ] E6.2 Replay do L1 sobre o histórico: o gatilho `value_bet` teria CLV positivo? Em quais ligas/mercados? — **motor de replay + medição de CLV + relatório prontos e testados (`backtest/replay.py`, 1x2/OU/AH); aguarda execução sobre dados reais (download bloqueado neste ambiente, roda no VPS/dev). Temporadas recomendadas: `--temporadas 2425 2324 2223 2122 2021 1920` (a 24/25 completa é a mais relevante). Recorte da tabela de células = `value_bet_provisional=True`; candidatos completos em `candidatos.csv`.**
+- [ ] E6.3 Calibração dos gates "a calibrar" (edge mínimo, teto de odd, etc.) com evidência → propostas formais pelo rito. **Alimentada também pela coleta amostral de CLV dos near-miss (E2.6, `clv_rastrear`).**
 - [ ] E6.4 Homologação inicial de mercados → `mercados_homologados`
 
 **Aceite:** relatório de backtest com CLV por liga/mercado e amostra ≥ 200 por célula homologada.
@@ -130,7 +130,8 @@
 
 - [x] **PC1 / PC2 — resolvidas pela Sugestão nº 2 (rito, 19/07/2026).** Contratos de `historico_movimento_1h` e `profundidade_book` fixados no **Manual §1.1** e tipados em `comum/modelos.py`.
 - [x] **PC-EXP — resolvida pela Sugestão nº 3 (rito, 19/07/2026).** Gates de teto de exposição por jogo/liga-dia/dia semeados (exposicao_max_jogo/liga_dia/dia_pct); consumidos por `motor_gates.tetos_exposicao` + `avaliar_exposicao` (E2.3).
-- [ ] **PC-ODDMIN — fórmula de `odd_minima_aceitavel` não fixada em governança.** L1 usa a definição principiada (menor odd em que o edge ainda atinge o gate `edge_min`) em `edge.odd_minima_aceitavel`; confirmar/ajustar por rito (ex.: piso no gate edge_min vs. em break-even edge=0).
+- [x] **PC-ODDMIN — resolvida pela Sugestão nº 4 (rito, 20/07/2026).** `odd_minima_aceitavel` fixada na **Doutrina §3** (v0.1.3): menor odd em que o edge líquido ainda atinge o gate `edge_min`. Implementada em `edge.odd_minima_aceitavel` e coberta por teste.
+- [ ] **PC-RASTREIO — piso de rastreio de CLV amostral (near-miss) não formalizado como gate.** E2.6 usa `PISO_RASTREIO_EDGE_PCT = 1.0%` como parâmetro de AMOSTRAGEM (não decisão: o near-miss aborta de qualquer forma; o piso só decide se ele entra na coleta de CLV para calibração — por isso não fere a regra 6). Formalizar o piso como linha da tabela `gates` pelo rito.
 
 Nota da E0.3: `comum/config.py` expõe uma única `Config` com todos os segredos
 obrigatórios — cada processo que chamar `carregar_config()` precisa do `.env`
