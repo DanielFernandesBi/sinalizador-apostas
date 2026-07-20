@@ -1,4 +1,4 @@
-"""Cliente Supabase (service role) — ÚnICO ponto de escrita no banco.
+"""Cliente Supabase (service role) — ÚNICO ponto de escrita no banco.
 
 Este módulo NASCE sabendo da imutabilidade (Doutrina P7 / schema 0001): as
 tabelas de log não aceitam UPDATE nem DELETE, e `sinais`/`apostas`/`tips` só
@@ -16,6 +16,7 @@ Operações expostas:
   - fechar_tip(...)                        único preenchimento de fechamento em `tips`
   - publicar_config(chave, valor)          publica nova versão vigente de governança (rito)
   - gates_vigentes() / config_vigente() / casa_por_nome() / exposicao_aberta()    leituras
+  - evento_por_id_externo() / saude_daemons()                                      leituras (L0)
 """
 from __future__ import annotations
 
@@ -85,6 +86,23 @@ class Banco:
     def exposicao_aberta(self) -> list[dict[str, Any]]:
         """Linhas de `vw_exposicao_aberta` (exposto por jogo/liga-dia/dia)."""
         resp = self._c.table("vw_exposicao_aberta").select("*").execute()
+        return resp.data or []
+
+    def evento_por_id_externo(self, fonte: str, valor: str) -> Optional[dict[str, Any]]:
+        """Evento cujo `ids_externos->>fonte` == valor (upsert do L0 por id da fonte)."""
+        resp = (
+            self._c.table("eventos")
+            .select("*")
+            .eq(f"ids_externos->>{fonte}", valor)
+            .limit(1)
+            .execute()
+        )
+        dados = resp.data or []
+        return dados[0] if dados else None
+
+    def saude_daemons(self) -> list[dict[str, Any]]:
+        """Linhas de `vw_saude_daemons` (último pulso e silêncio por daemon) — E1.5."""
+        resp = self._c.table("vw_saude_daemons").select("*").execute()
         return resp.data or []
 
     # ---------------- ESCRITA: apenas o permitido ----------------

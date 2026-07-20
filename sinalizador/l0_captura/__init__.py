@@ -1,5 +1,7 @@
-"""L0 — Captura: daemons de ingestão (referência, venue, varejo, tipsters).
+"""L0 — captura de odds (referência, varejo) e vigia de heartbeats.
 
-Um daemon = um processo = um systemd unit = um heartbeat próprio. Grava
-snapshots com `ts_fonte` da FONTE (nunca now()). Ver PLANO_MVP.md E1.
+Núcleo testável (the_odds_api, mapeamento, persistencia, captura, cobertura,
+vigia) depende só de objetos injetados — sem Supabase nem rede. O `cli` amarra
+tudo à infraestrutura real (Banco + ClienteOddsAPI) e roda na máquina do Daniel
+ou no VPS.
 """
