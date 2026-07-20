@@ -288,7 +288,10 @@ def escrever_saidas(candidatos: list[dict], celulas: list[dict], destino: str, *
         f"- Candidatos (edge > 0): **{len(candidatos)}**",
         f"- value_bets provisórios: **{sum(1 for c in candidatos if c['value_bet_provisional'])}**",
         f"- Células: **{len(celulas)}** (com amostra suficiente: **{len(suf)}**)",
-        "\n## Células (value_bet provisório)\n",
+        "\n## Células — apenas value_bet provisório\n",
+        "_Recorte: só candidatos com `value_bet_provisional = True` (edge ≥ edge_min "
+        "**e** odd ≤ odd_teto). NÃO é o conjunto de candidatos (edge > 0) — este está "
+        "completo em `candidatos.csv` para a re-varredura de gates do E6.3._\n",
         _tabela_celulas(celulas) if celulas else "_(nenhuma célula)_",
         "\n---\n*Dados estruturados re-processáveis pelo E6.3: `candidatos.csv`, "
         "`celulas.csv`, `celulas.json`.*\n",

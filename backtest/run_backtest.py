@@ -1,10 +1,12 @@
 """CLI do backtest (E6.1 + E6.2): baixa (ou lê local), roda o replay, escreve saídas.
 
-Uso (no VPS/dev com rede aberta):
-    python -m backtest.run_backtest --ligas E0 SP1 I1 D1 F1 P1 --temporadas 2324 2223 --saida ./saida_backtest
+Uso (no VPS/dev com rede aberta) — temporadas recomendadas (a 24/25 completa é a
+mais relevante e vai incluída):
+    python -m backtest.run_backtest --ligas E0 SP1 I1 D1 F1 P1 \\
+        --temporadas 2425 2324 2223 2122 2021 1920 --saida ./saida_backtest
 
 Modo offline (CSVs já baixados em <dir>/<DIV>_<SEASON>.csv), útil sem rede:
-    python -m backtest.run_backtest --offline ./csvs --ligas E0 --temporadas 2324 --saida ./saida
+    python -m backtest.run_backtest --offline ./csvs --ligas E0 --temporadas 2425 --saida ./saida
 """
 from __future__ import annotations
 
