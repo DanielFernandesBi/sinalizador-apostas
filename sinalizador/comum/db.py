@@ -15,11 +15,14 @@ Operações expostas:
   - transicionar_status_sinal(...)         única mutação de `sinais` (a partir de aguardando_crivo)
   - liquidar_aposta(...)                   única mutação de `apostas` (pendente -> final)
   - fechar_tip(...)                        único preenchimento de fechamento em `tips`
+  - marcar_notificacao_entregue(id)        `notificacoes` aceita UPDATE (não é append-only)
   - publicar_config(chave, valor)          publica nova versão vigente de governança (rito)
   - gates_vigentes() / config_vigente() / casa_por_nome() / exposicao_aberta()    leituras
   - evento_por_id_externo() / saude_daemons()                                      leituras (L0)
   - snapshots_desde() / casas_ativas() / eventos_por_ids() / banca_atual()          leituras (L1)
   - sinais_aguardando_crivo()                                                        leitura (L2)
+  - sinais_por_status() / crivo_do_sinal() / ultimo_snapshot_venue() /
+    notificacoes_do_sinal() / notificacoes_pendentes()                              leituras (L3)
 """
 from __future__ import annotations
 
@@ -131,6 +134,12 @@ class Banco:
         resp = self._c.table("eventos").select("*").in_("id", ids).execute()
         return resp.data or []
 
+    def evento_por_id(self, evento_id: str) -> Optional[dict[str, Any]]:
+        """Um evento pelo id (L3/L4: liga/partida/início para cartão e fechamento)."""
+        resp = self._c.table("eventos").select("*").eq("id", evento_id).limit(1).execute()
+        dados = resp.data or []
+        return dados[0] if dados else None
+
     def banca_atual(self) -> Optional[dict[str, Any]]:
         """Linha de `vw_banca` (saldo/pico/drawdown/kill_switch). None se sem ledger."""
         resp = self._c.table("vw_banca").select("*").limit(1).execute()
@@ -144,6 +153,60 @@ class Banco:
             .select("*")
             .eq("status", "aguardando_crivo")
             .order("criado_em")
+            .limit(limite)
+            .execute()
+        )
+        return resp.data or []
+
+    def sinais_por_status(self, status: str, limite: int = 200) -> list[dict[str, Any]]:
+        """Sinais em um dado status (L3: 'confirmado' para notificar)."""
+        resp = (
+            self._c.table("sinais")
+            .select("*")
+            .eq("status", status)
+            .order("criado_em")
+            .limit(limite)
+            .execute()
+        )
+        return resp.data or []
+
+    def crivo_do_sinal(self, sinal_id: str) -> Optional[dict[str, Any]]:
+        """Veredicto do L2 para um sinal (para compor o cartão da notificação)."""
+        resp = self._c.table("crivos").select("*").eq("sinal_id", sinal_id).limit(1).execute()
+        dados = resp.data or []
+        return dados[0] if dados else None
+
+    def ultimo_snapshot_venue(
+        self, evento_id: str, casa_id: str, mercado: str, selecao: str, linha: Optional[float]
+    ) -> Optional[dict[str, Any]]:
+        """Último snapshot da casa/venue para a seleção (re-checagem de preço, E4.2)."""
+        q = (
+            self._c.table("odds_snapshots")
+            .select("*")
+            .eq("evento_id", evento_id)
+            .eq("casa_id", casa_id)
+            .eq("mercado", mercado)
+            .eq("selecao", selecao)
+        )
+        q = q.is_("linha", "null") if linha is None else q.eq("linha", linha)
+        resp = q.order("ts_captura", desc=True).limit(1).execute()
+        dados = resp.data or []
+        return dados[0] if dados else None
+
+    def notificacoes_do_sinal(self, sinal_id: str, tipo: Optional[str] = None) -> list[dict[str, Any]]:
+        """Notificações já registradas para um sinal (evita reenvio do cartão)."""
+        q = self._c.table("notificacoes").select("*").eq("sinal_id", sinal_id)
+        if tipo is not None:
+            q = q.eq("tipo", tipo)
+        return q.execute().data or []
+
+    def notificacoes_pendentes(self, limite: int = 200) -> list[dict[str, Any]]:
+        """Notificações não entregues (fila de envio do L3 — alertas e cartões)."""
+        resp = (
+            self._c.table("notificacoes")
+            .select("*")
+            .eq("entregue", False)
+            .order("id")
             .limit(limite)
             .execute()
         )
@@ -169,6 +232,18 @@ class Banco:
     def pulsar(self, daemon: str, detalhe: Optional[dict[str, Any]] = None) -> None:
         """Heartbeat do daemon (E1.5). É apenas um INSERT em `heartbeats`."""
         self.inserir("heartbeats", {"daemon": daemon, "detalhe": detalhe})
+
+    def marcar_notificacao_entregue(self, notif_id: int) -> dict[str, Any]:
+        """`notificacoes` NÃO é append-only (schema 0001 não bloqueia UPDATE nela):
+        marca a entrega (entregue=true + enviado_em). Único campo de estado que muda."""
+        resp = (
+            self._c.table("notificacoes")
+            .update({"entregue": True, "enviado_em": _agora_utc_iso()})
+            .eq("id", notif_id)
+            .execute()
+        )
+        atualizados = resp.data or []
+        return atualizados[0] if atualizados else {}
 
     def transicionar_status_sinal(self, sinal_id: str, novo_status: str) -> dict[str, Any]:
         """Única mutação de `sinais`: muda só `status`, e só a partir de
