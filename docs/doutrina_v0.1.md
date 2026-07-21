@@ -56,7 +56,8 @@ Nenhuma conclusão sobre desempenho com menos de **200 apostas/sinais**. ROI esp
 
 - **Referência sharp:** linha da Pinnacle (via agregador com API), de-vigada pelo **método de Shin**. É a fonte da verdade para probabilidade justa. Não é venue de execução.
 - **Venue:** ambiente onde Daniel executa. Padrão: **Betfair Exchange (Brasil)**. O sinal só é válido para o venue cujo preço e liquidez foram capturados.
-- **Edge líquido:** `p_justa × (odd_venue − 1) × (1 − comissão) − (1 − p_justa)`, deduzido slippage estimado.
+- **Venue sombra (modo sombra — Sugestão nº 6):** enquanto não houver venue de exchange capturável (sem API da Betfair), o **modo sombra** (Seção 6, paper trading) opera sobre o **melhor preço de varejo (.bet.br)** como venue, com o sinal marcado `sombra_varejo`. Justificativa: o KPI do modo sombra é o **CLV, que não depende de book**; o gate de liquidez (conceito de exchange) é **inaplicável ao varejo**; e em **odd fixa o `slippage = 0` é definição, não otimismo** — o preço exibido é o executável, e a **odd mínima aceitável** é a trava contra movimento até a execução. A honestidade é preservada pela marca `sombra_varejo` no dossiê. **Nada disso libera dinheiro real**, que permanece condicionado ao gate do paper trading (Seção 6). O estimador de slippage volta ao rito quando existir venue de exchange com book capturável.
+- **Edge líquido:** `p_justa × (odd_venue − 1) × (1 − comissão) − (1 − p_justa)`, deduzido slippage estimado (no venue sombra de odd fixa, `slippage = 0` por definição — ver acima).
 - **Odd mínima aceitável:** menor odd do venue em que o edge líquido ainda atinge o gate `edge_min` — a mesma fronteira que aprova o sinal. Abaixo dela, o sinal está sem valor suficiente e expira na re-checagem de preço do L3.
 - **CLV de um sinal:** diferença entre a odd capturada na emissão e a odd de fechamento da referência sharp para o mesmo mercado/seleção, convertidas a probabilidade.
 - **Unidade (u):** 1% da banca corrente no momento do sinal.
@@ -111,3 +112,5 @@ Mudanças seguem o rito de **sugestões numeradas** (padrão "Evolução do sist
 *v0.1.3 — 20/07/2026. Alteração única (Sugestão nº 4): definição canônica de **odd mínima aceitável** — menor odd em que o edge líquido ainda atinge o gate `edge_min`.*
 
 *v0.1.4 — 20/07/2026. Alteração única (Sugestão nº 5): novo gate `rastreio_edge_min` (≥ 1,0%, a calibrar) na §4 — piso de edge para rastrear o CLV de near-miss (quase-sinais logo abaixo de `edge_min`), estendendo a curva de calibração do modo sombra com dado real.*
+
+*v0.1.5 — 21/07/2026. Alteração única (Sugestão nº 6): definição de **venue sombra** na §3 — o modo sombra opera sobre o melhor preço de varejo (.bet.br) enquanto não há exchange capturável, com `sombra_varejo`, gate de liquidez inaplicável e `slippage = 0` por definição em odd fixa (a odd mínima aceitável é a trava). Resolve PC-VENUE-SOMBRA e PC-SLIPPAGE para o modo sombra; dinheiro real segue travado pelo gate da Seção 6.*
