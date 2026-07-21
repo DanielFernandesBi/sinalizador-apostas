@@ -55,6 +55,22 @@ class RespostaOdds:
     mercados: str = ""
 
 
+@dataclass(frozen=True)
+class RespostaCalendario:
+    """Fixtures de um sport (id, times, `commence_time`) + custo da chamada.
+
+    Vem do endpoint `/events`, que devolve só o calendário (sem odds) e **não
+    consome cota** na The Odds API (`x-requests-last` = 0). É a fonte barata de
+    proximidade para a cadência adaptativa: saber QUANDO cada jogo começa sem
+    gastar crédito. O custo real é logado mesmo assim — se algum dia não vier 0, o
+    heartbeat mostra, e o rito redimensiona.
+    """
+
+    fixtures: list[dict[str, Any]]
+    custo_ultima: Optional[int] = None
+    requests_remaining: Optional[int] = None
+
+
 def _int_ou_none(v: Optional[str]) -> Optional[int]:
     if v is None:
         return None
@@ -151,4 +167,28 @@ class ClienteOddsAPI:
             custo_ultima=custo,
             regioes=regions,
             mercados=markets,
+        )
+
+    def buscar_eventos(self, sport: str) -> RespostaCalendario:
+        """Calendário de fixtures do sport (`/events`) — id, times, `commence_time`.
+
+        NÃO consome cota (é a fonte da cadência adaptativa). Falha alto em erro (P6).
+        """
+        query = urlencode({"apiKey": self._key, "dateFormat": "iso"})
+        url = f"{self._base}/sports/{sport}/events?{query}"
+        resp = self._transporte(url)
+        if resp.status != 200:
+            trecho = resp.corpo[:300].decode("utf-8", "replace")
+            raise OddsAPIError(f"The Odds API /events status {resp.status} para {sport}: {trecho}")
+        try:
+            fixtures = json.loads(resp.corpo.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise OddsAPIError(f"corpo não-JSON de /events para {sport}: {e}") from e
+        if not isinstance(fixtures, list):
+            raise OddsAPIError(f"/events para {sport}: esperava lista, veio {type(fixtures).__name__}")
+        h = resp.headers
+        return RespostaCalendario(
+            fixtures=fixtures,
+            custo_ultima=_int_ou_none(h.get("x-requests-last")),
+            requests_remaining=_int_ou_none(h.get("x-requests-remaining")),
         )
