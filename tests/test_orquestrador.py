@@ -41,12 +41,18 @@ def _p1():
 
 
 class BancoFake:
-    def __init__(self, snaps, *, banca=1000.0, exposicao=None):
+    def __init__(self, snaps, *, banca=1000.0, exposicao=None, banca_papel=None):
         self._snaps = snaps
         self._banca = banca
         self._exposicao = exposicao or []
+        self._banca_papel = banca_papel   # valor (str) da config_sistema, ou None
         self.inseridos = []
         self.pulsos = []
+
+    def config_vigente(self, chave):
+        if chave == "banca_papel" and self._banca_papel is not None:
+            return {"chave": chave, "valor": self._banca_papel, "vigente": True}
+        return None
 
     def snapshots_desde(self, ts_iso):
         return self._snaps
@@ -185,11 +191,25 @@ def test_anomalia_marca_caminho_profundo():
     assert sinal["dossie"]["caminho"] == "profundo"
 
 
-def test_sem_banca_nao_gera_nada():
+def test_sem_banca_real_nem_papel_nao_gera_nada():
     p1 = _p1()
     odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
     snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
-    banco = BancoFake(snaps, banca=None)
+    banco = BancoFake(snaps, banca=None)  # ledger vazio E sem banca_papel na config
     r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
     assert r.sinais == 0 and r.abortos == 0
     assert banco.pulsos[0][1]["motivo"] == "sem_banca"
+
+
+def test_banca_de_papel_dimensiona_quando_ledger_vazio():
+    # Sugestão nº 7: ledger real vazio → usa banca_papel; dossiê marca banca=papel.
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.15, 3)  # varejo comissão 0
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-b365")]          # venue de varejo
+    banco = BancoFake(snaps, banca=None, banca_papel="1000")
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+    assert r.sinais == 1
+    sinal = banco.por_tabela("sinais")[0]
+    assert sinal["dossie"]["banca_origem"] == "papel"
+    assert sinal["stake_pct"] > 0  # dimensionou sobre a banca de papel
+    assert banco.pulsos[-1][1]["banca_origem"] == "papel"

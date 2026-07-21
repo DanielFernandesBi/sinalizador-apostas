@@ -10,6 +10,7 @@ repensa-se a operação).
 
 Operações expostas:
   - inserir(tabela, registro)              INSERT em tabela append-only
+  - inserir_muitos(tabela, registros)      INSERT em lote (N linhas em 1 POST)
   - pulsar(daemon, detalhe)                heartbeat (INSERT em heartbeats)
   - transicionar_status_sinal(...)         única mutação de `sinais` (a partir de aguardando_crivo)
   - liquidar_aposta(...)                   única mutação de `apostas` (pendente -> final)
@@ -155,6 +156,15 @@ class Banco:
         resp = self._c.table(tabela).insert(registro).execute()
         dados = resp.data or []
         return dados[0] if dados else {}
+
+    def inserir_muitos(self, tabela: str, registros: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """INSERT append-only em LOTE: N linhas em UM POST (higiene de saída —
+        corta um ciclo de captura de dezenas de segundos para poucos). Lista vazia
+        é no-op (não faz chamada de rede)."""
+        if not registros:
+            return []
+        resp = self._c.table(tabela).insert(registros).execute()
+        return resp.data or []
 
     def pulsar(self, daemon: str, detalhe: Optional[dict[str, Any]] = None) -> None:
         """Heartbeat do daemon (E1.5). É apenas um INSERT em `heartbeats`."""

@@ -13,13 +13,18 @@ referência incompleto, sem venue capturado, sem banca ou sem carimbo de fonte �
 não gera candidato (registra e segue), nunca chuta.
 
 Política de venue (`PoliticaVenue`):
-  - `EXCHANGE` (padrão, doutrina-puro): venue = casa `exchange` (Betfair). O gate
-    de liquidez se aplica. Sem exchange capturada (E1.2 suspenso), não há sinal —
-    só o log de abortos e o rastreio de CLV alimentam a calibração desde já.
-  - `RETAIL_SOMBRA` (opt-in, NÃO ratificado): venue = melhor preço de varejo. O
-    gate de liquidez é inaplicável (varejo não tem book) e o sinal sai marcado
-    `sombra_varejo=True`. É um DESVIO do desenho (venue ≠ exchange), registrado
-    como pendência PC-VENUE-SOMBRA para ratificação pelo rito — nunca é o default.
+  - `EXCHANGE` (doutrina-puro): venue = casa `exchange` (Betfair). O gate de
+    liquidez se aplica. Sem exchange com book capturado (E1.2 suspenso), não há
+    sinal — o exchange-proxy sem book aborta no gate; só o log de abortos e o
+    rastreio de CLV alimentam a calibração desde já.
+  - `RETAIL_SOMBRA` (RATIFICADO pela Sugestão nº 6 para o modo sombra): venue =
+    melhor preço de VAREJO. O gate de liquidez é inaplicável (varejo não tem book);
+    em odd fixa `slippage=0` é DEFINIÇÃO, não otimismo (o preço exibido é o
+    executável e a `odd_minima_aceitavel` protege contra movimento — Doutrina
+    §-sombra). O sinal sai marcado `sombra_varejo=True` (honestidade preservada).
+    Dinheiro real segue travado pelo gate do E7 — o modo sombra só mede CLV, que
+    não exige book. O exchange-proxy `betfair_ex_*` fica FORA do venue sombra até
+    o rito ratificar seu tratamento sem-book (PC-EXCHANGE-PROXY).
 """
 from __future__ import annotations
 
@@ -104,10 +109,12 @@ class GrupoMercado:
 
 
 def _casas_venue_da_politica(casas: dict[str, dict], politica: PoliticaVenue) -> set[str]:
-    if politica is PoliticaVenue.EXCHANGE:
-        tipos = {"exchange"}
-    else:
-        tipos = {"exchange", "varejo"}
+    # RETAIL_SOMBRA usa SÓ varejo. O exchange-proxy (betfair_ex_*) já é capturado
+    # (Sugestão nº 6, executável) mas fica FORA do venue do modo sombra até o rito
+    # ratificar seu tratamento sem-book "com o relatório na mão" — enquanto isso
+    # ele alimenta CLV/relatório sem alterar os sinais sombra. EXCHANGE (doutrina-
+    # puro) usa a exchange e o gate de liquidez decide (proxy sem book = aborto).
+    tipos = {"exchange"} if politica is PoliticaVenue.EXCHANGE else {"varejo"}
     return {cid for cid, c in casas.items() if c.get("tipo") in tipos}
 
 
@@ -118,6 +125,7 @@ def avaliar_grupo(
     gates: Any,
     *,
     banca: float,
+    banca_origem: str,
     exposto: dict[str, float],
     agora: datetime,
     politica: PoliticaVenue,
@@ -171,7 +179,9 @@ def avaliar_grupo(
 
         casa_row = casas[melhor["casa_id"]]
         comissao = comissao_fracao(casa_row)
-        edge = edge_liquido(p_justa, melhor["odd"], comissao)  # slippage 0 (sem modelo ainda — PC-SLIPPAGE)
+        # slippage 0: em varejo de odd fixa é DEFINIÇÃO (Doutrina §-sombra / Sugestão
+        # nº 6) — o preço exibido é o executável. Estimador só p/ venue de exchange.
+        edge = edge_liquido(p_justa, melhor["odd"], comissao)
 
         # Gatilhos (sobre a série da referência e do venue escolhido).
         serie_ref = grupo.ref.get(sel, [])
@@ -233,7 +243,7 @@ def avaliar_grupo(
             stake_frac=stake_frac, odd_min=odd_min, ts_ref=ts_ref, janela_sinc=janela_sinc,
             referencia_estavel=referencia_estavel, serie_ref=serie_ref, serie_venue=serie_venue,
             candidatos_venue=candidatos_venue, exposto=exposto, liquidez_disp=liquidez_disp,
-            aplica_liquidez=aplica_liquidez, politica=politica,
+            aplica_liquidez=aplica_liquidez, politica=politica, banca_origem=banca_origem,
         )
         enfileirar_sinal(banco, dossie, evento_id=grupo.evento_id,
                          casa_venue_id=melhor["casa_id"], linha=grupo.linha)
@@ -262,6 +272,7 @@ def _montar_dossie(
     *, grupo, sel, gatilho, gatilho_anomalo, caminho, p_justa, odd_ref, melhor, edge,
     comissao, stake_frac, odd_min, ts_ref, janela_sinc, referencia_estavel, serie_ref,
     serie_venue, candidatos_venue, exposto, liquidez_disp, aplica_liquidez, politica,
+    banca_origem,
 ) -> Dossie:
     sincronia_ok = abs((melhor["ts_fonte"] - ts_ref).total_seconds()) <= janela_sinc
     liquidez: dict[str, Any] = {
@@ -276,6 +287,8 @@ def _montar_dossie(
         "gatilho": gatilho,
         "gatilho_anomalo": gatilho_anomalo,
         "caminho": caminho,
+        # Sugestão nº 7: origem da banca do sizing ('real' | 'papel'). extra="allow".
+        "banca_origem": banca_origem,
         "evento": {
             "liga": grupo.evento.get("liga", ""),
             "partida": grupo.evento.get("partida", ""),
@@ -376,6 +389,24 @@ def _exposto_do_evento(exposicao_aberta: list[dict], evento_id: str, liga: str, 
     return out
 
 
+def _banca_papel(banco: Any) -> Optional[float]:
+    """Valor nominal da banca de papel (`config_sistema.banca_papel`), ou None se
+    ausente/não-numérica. Usada SÓ com o ledger real vazio (Sugestão nº 7) — o
+    ledger real nunca é tocado por ela."""
+    ler = getattr(banco, "config_vigente", None)
+    if ler is None:
+        return None
+    doc = ler("banca_papel")
+    if not doc or not doc.get("valor"):
+        return None
+    try:
+        return float(str(doc["valor"]).strip())
+    except (TypeError, ValueError):
+        _log.warning("banca_papel na config_sistema não é número — ignorada",
+                     extra={"valor": doc.get("valor")})
+        return None
+
+
 def rodar_l1(
     banco: Any,
     gates: Any,
@@ -386,8 +417,8 @@ def rodar_l1(
 ) -> ResumoL1:
     """Um ciclo do L1: carrega snapshots da janela, roda o pipeline, pulsa o heartbeat.
 
-    `agora` é injetado (nunca chuta relógio no core). Sem banca (ledger vazio) →
-    não há sizing → nenhum sinal (P5/P6): registra e sai.
+    `agora` é injetado (nunca chuta relógio no core). Sem banca real nem de papel
+    → não há sizing → nenhum sinal (P5/P6): registra e sai.
     """
     resumo = ResumoL1()
     desde = (agora - timedelta(seconds=lookback_s)).isoformat()
@@ -398,10 +429,19 @@ def rodar_l1(
 
     banca_row = banco.banca_atual()
     banca = float(banca_row["saldo"]) if banca_row and banca_row.get("saldo") is not None else None
+    banca_origem = "real"
     if not banca or banca <= 0:
-        _log.warning("sem banca (ledger vazio) — L1 não dimensiona stake (P5/P6)")
-        banco.pulsar(DAEMON, {"grupos": 0, "sinais": 0, "abortos": 0, "motivo": "sem_banca"})
-        return resumo
+        # Ledger real vazio → banca de PAPEL (Sugestão nº 7): o modo sombra precisa
+        # dimensionar stakes, mas o ledger real fica INTOCADO até o gate do E7. O
+        # dossiê nasce marcado banca_origem=papel (honestidade estatística).
+        banca = _banca_papel(banco)
+        banca_origem = "papel"
+        if not banca or banca <= 0:
+            _log.warning("sem banca real nem banca de papel — L1 não dimensiona (P5/P6)")
+            banco.pulsar(DAEMON, {"grupos": 0, "sinais": 0, "abortos": 0, "motivo": "sem_banca"})
+            return resumo
+        _log.info("banca de papel em uso (ledger real vazio) — modo sombra",
+                  extra={"banca_papel": banca})
 
     exposicao_aberta = banco.exposicao_aberta()
     grupos = agrupar_snapshots(snaps, casas, eventos)
@@ -410,12 +450,12 @@ def rodar_l1(
         ev = eventos.get(grupo.evento_id, {})
         dia = str((_dt(ev.get("inicio_utc")) or agora).date())
         exposto = _exposto_do_evento(exposicao_aberta, grupo.evento_id, ev.get("liga", ""), dia)
-        avaliar_grupo(banco, grupo, casas, gates, banca=banca, exposto=exposto,
-                      agora=agora, politica=politica, resumo=resumo)
+        avaliar_grupo(banco, grupo, casas, gates, banca=banca, banca_origem=banca_origem,
+                      exposto=exposto, agora=agora, politica=politica, resumo=resumo)
 
     banco.pulsar(DAEMON, {"grupos": resumo.grupos, "sinais": resumo.sinais,
                           "abortos": resumo.abortos, "rastreados_clv": resumo.rastreados_clv,
-                          "politica_venue": politica.value})
+                          "politica_venue": politica.value, "banca_origem": banca_origem})
     _log.info("ciclo L1 concluído", extra={"grupos": resumo.grupos, "sinais": resumo.sinais,
                                            "abortos": resumo.abortos})
     return resumo
