@@ -1,6 +1,10 @@
-"""L2 — Crivo IA: cliente Anthropic + validação estrita da saída.
+"""L2 — o crivo (veto por IA) sobre os sinais enfileirados pelo L1.
 
-Único módulo autorizado a chamar LLM. System prompt = config_sistema.manual_crivo_l2
-vigente (nunca hard-coded). Falha jamais vira aprovação (regra 4);
-`odd_minima_aceitavel` é passthrough verificado (regra 3). Ver PLANO_MVP.md E3.
+Núcleo testável (`crivo`) depende só do Protocol `ModeloCrivo` — sem SDK nem
+rede: valida a saída (pydantic estrito), confere o passthrough da odd mínima e
+transiciona o sinal (CONFIRMA→confirmado, ABORTA→vetado). O `cli` amarra o
+`ModeloAnthropic` real e roda na máquina do Daniel / VPS.
+
+Invariante inviolável: **falha jamais vira CONFIRMA** (E3.3) — qualquer exceção
+no caminho leva o sinal a `erro`, com alerta administrativo.
 """
