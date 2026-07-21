@@ -49,6 +49,13 @@ class _AdaptadorContexto(logging.LoggerAdapter):
         return msg, kwargs
 
 
+# Bibliotecas ruidosas: o cliente HTTP do supabase-py (httpx/httpcore) loga cada
+# requisição em INFO — num ciclo de captura isso vira "cachoeira" de INSERTs no
+# terminal. Rebaixados a WARNING (higiene de saída); o que interessa (heartbeat,
+# resumo do ciclo) continua saindo pelos nossos loggers.
+_BIBLIOTECAS_SILENCIADAS = ("httpx", "httpcore", "hpack", "urllib3")
+
+
 def configurar_logging(nivel: str = "INFO") -> None:
     """Instala o formatador JSON no logger raiz. Idempotente."""
     raiz = logging.getLogger()
@@ -58,6 +65,8 @@ def configurar_logging(nivel: str = "INFO") -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(FormatadorJSON())
     raiz.addHandler(handler)
+    for nome in _BIBLIOTECAS_SILENCIADAS:
+        logging.getLogger(nome).setLevel(logging.WARNING)
 
 
 def get_logger(nome: str, **contexto: Any) -> logging.LoggerAdapter:

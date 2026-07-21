@@ -1,20 +1,21 @@
-"""Ciclo de captura do L0 — motor compartilhado por E1.1 (referência) e E1.3 (varejo).
+"""Ciclo de captura do L0 — motor compartilhado pelos daemons de captura.
 
 Um ciclo: para cada sport alvo, chama a The Odds API na região do perfil, faz
-get-or-create de eventos/casas e grava um snapshot por outcome (`ts_fonte` da
-fonte). Ao fim, PULSA o heartbeat do daemon (E1.5) com o resumo — inclusive o
-consumo de créditos do ciclo (E1 aceite #2). Um sport que falha na API não
-derruba o ciclo: registra a falha e segue (degradação segura), e o heartbeat sai
-com a contagem de falhas para o vigia enxergar.
+get-or-create de eventos/casas e monta um snapshot por outcome (`ts_fonte` da
+fonte). Ao fim, grava TODOS os snapshots do ciclo em UM POST (higiene de saída)
+e PULSA o heartbeat do daemon (E1.5) com o resumo — inclusive o consumo de
+créditos do ciclo (E1 aceite #2). Um sport que falha na API não derruba o ciclo:
+registra a falha e segue (degradação segura), e o heartbeat sai com a contagem de
+falhas para o vigia enxergar.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Optional
 
 from .mapeamento import SPORTS_ALVO, iter_snapshots, normalizar_evento
-from .persistencia import BancoL0, garantir_casa, garantir_evento, gravar_snapshot
+from .persistencia import BancoL0, garantir_casa, garantir_evento, linha_snapshot
 from .the_odds_api import ClienteOddsAPI, OddsAPIError
 
 _log = logging.getLogger(__name__)
@@ -26,12 +27,17 @@ MERCADOS_PADRAO = ("h2h", "spreads", "totals")
 
 @dataclass(frozen=True)
 class PerfilCaptura:
-    """O que distingue o daemon de referência do de varejo."""
+    """O que distingue um daemon de captura (região + como classificar as casas).
 
-    daemon: str                       # nome em `heartbeats`/`vw_saude_daemons`
-    regiao: str                       # 'eu' (referência) | 'br' (varejo)
-    tipo_casa: str                    # 'referencia' | 'varejo' (só ao criar casa nova)
-    aceitar_casa: Callable[[str], bool]
+    `classificar(chave)` devolve `(tipo, comissao_pct)` para a casa, ou `None`
+    para descartá-la. O perfil da região `eu` classifica TODAS as casas (Sugestão
+    nº 6): referência (Pinnacle), exchange-proxy (Betfair) e varejo — nada se
+    descarta, já que os snapshots vêm na mesma resposta (crédito zero adicional).
+    """
+
+    daemon: str                                   # nome em `heartbeats`/`vw_saude_daemons`
+    regiao: str                                   # 'eu' (referência+venues) | 'br' (varejo)
+    classificar: Callable[[str], Optional[tuple[str, float]]]
 
 
 @dataclass
@@ -39,6 +45,7 @@ class ResumoCiclo:
     snapshots: int = 0
     eventos: int = 0
     casas_vistas: int = 0             # casas distintas com snapshot no ciclo
+    por_tipo: dict[str, int] = field(default_factory=dict)  # casas distintas por tipo
     creditos_restantes: int | None = None
     creditos_usados: int | None = None
     custo_creditos: int = 0           # soma do custo por chamada (x-requests-last)
@@ -58,6 +65,8 @@ def rodar_ciclo(
     markets_str = ",".join(markets)
     resumo = ResumoCiclo()
     cache_casas: dict[str, str] = {}
+    tipos_por_casa: dict[str, str] = {}       # nome → tipo (para o resumo por tipo)
+    linhas: list[dict] = []                    # snapshots do ciclo → 1 INSERT em lote
 
     for sport in sports:
         try:
@@ -80,18 +89,32 @@ def rodar_ciclo(
             if evento_id is None:
                 continue
             resumo.eventos += 1
-            for snap in iter_snapshots(ev, aceitar_casa=perfil.aceitar_casa):
-                casa_id = garantir_casa(banco, snap["casa"], tipo=perfil.tipo_casa, cache=cache_casas)
+            for snap in iter_snapshots(ev):
+                classe = perfil.classificar(snap["casa"])
+                if classe is None:
+                    continue  # casa fora do perfil (descarte explícito)
+                tipo, comissao = classe
+                casa_id = garantir_casa(banco, snap["casa"], tipo=tipo,
+                                        comissao_pct=comissao, cache=cache_casas)
                 if casa_id is None:
                     continue
-                gravar_snapshot(banco, evento_id=evento_id, casa_id=casa_id, snap=snap)
-                resumo.snapshots += 1
+                tipos_por_casa[snap["casa"]] = tipo
+                linhas.append(linha_snapshot(evento_id=evento_id, casa_id=casa_id, snap=snap))
 
+    # Grava todos os snapshots do ciclo em UM POST (higiene de saída: N linhas em
+    # vez de N POSTs — corta o ciclo de dezenas de segundos para poucos).
+    if linhas:
+        banco.inserir_muitos("odds_snapshots", linhas)
+    resumo.snapshots = len(linhas)
     resumo.casas_vistas = len(cache_casas)
+    for tipo in tipos_por_casa.values():
+        resumo.por_tipo[tipo] = resumo.por_tipo.get(tipo, 0) + 1
+
     detalhe = {
         "snapshots": resumo.snapshots,
         "eventos": resumo.eventos,
         "regiao": perfil.regiao,
+        "casas_por_tipo": resumo.por_tipo,
         "creditos_restantes": resumo.creditos_restantes,
         "custo_creditos": resumo.custo_creditos,
         "sports_ok": resumo.sports_ok,

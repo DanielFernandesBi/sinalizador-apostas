@@ -2,10 +2,21 @@
 from _fixtura_odds import evento
 
 from sinalizador.l0_captura.mapeamento import (
+    classificar_casa,
     iter_snapshots,
     liga_de,
     normalizar_evento,
 )
+
+
+def test_classificar_casa_referencia_exchange_varejo():
+    # Sugestão nº 6: cada chave de bookmaker vira (tipo, comissao_pct).
+    assert classificar_casa("pinnacle") == ("referencia", 0.0)
+    assert classificar_casa("betfair_ex_eu") == ("exchange", 6.5)
+    assert classificar_casa("betfair_ex_uk") == ("exchange", 6.5)
+    # qualquer outra casa é varejo (venue do modo sombra), comissão não modelada
+    assert classificar_casa("bet365_br") == ("varejo", 0.0)
+    assert classificar_casa("betano") == ("varejo", 0.0)
 
 
 def test_normaliza_evento_com_id_externo():

@@ -38,6 +38,32 @@ _EMPATE = {"draw", "tie", "empate", "x"}
 _OVER = {"over", "o"}
 _UNDER = {"under", "u"}
 
+# --- Classificação de casa por chave de bookmaker (Sugestão nº 6, executável) ---
+# O mesmo ciclo da região `eu` traz a Pinnacle + a exchange (Betfair) + ~20 casas
+# de varejo NA MESMA resposta (custo de crédito zero adicional). Em vez de
+# descartar tudo menos a Pinnacle, classifica-se cada casa e persiste-se todas.
+CASA_REFERENCIA = "pinnacle"
+# Listagens de troca (Betfair Exchange) na The Odds API: odds de exchange, porém
+# SEM profundidade de book pela API (liquidez=None) — proxy DECLARADO de exchange
+# (Sugestão nº 6). Comissão base 6,5% (Doutrina P4). Enquanto a API da Betfair
+# (E1.2) não vier, é o preço de exchange que temos — capturado e rotulado.
+EXCHANGES_PROXY = {"betfair_ex_eu", "betfair_ex_uk", "betfair_ex_au"}
+COMISSAO_EXCHANGE_PCT = 6.5
+
+
+def classificar_casa(chave: str) -> tuple[str, float]:
+    """Chave de bookmaker (The Odds API) → (tipo, comissao_pct).
+
+    Nunca descarta: o que não é referência nem exchange-proxy é varejo (venue do
+    modo sombra). A comissão só é modelada para a exchange (6,5%); varejo de odd
+    fixa não tem comissão de exchange (Doutrina §-sombra: slippage=0 é definição).
+    """
+    if chave == CASA_REFERENCIA:
+        return ("referencia", 0.0)
+    if chave in EXCHANGES_PROXY:
+        return ("exchange", COMISSAO_EXCHANGE_PCT)
+    return ("varejo", 0.0)
+
 
 def liga_de(sport_key: str, sport_title: Optional[str] = None) -> str:
     return SPORTS_ALVO.get(sport_key) or sport_title or sport_key
@@ -87,7 +113,7 @@ def iter_snapshots(
     """Gera um dict de snapshot por (casa, mercado, outcome) do evento.
 
     Campos: casa, mercado, selecao, linha, odd, ts_fonte, raw. `aceitar_casa` filtra
-    por chave de bookmaker (referência = só pinnacle; varejo = todas).
+    por chave de bookmaker (default: todas; a classificação por tipo é do ciclo).
     """
     home = ev.get("home_team", "")
     away = ev.get("away_team", "")

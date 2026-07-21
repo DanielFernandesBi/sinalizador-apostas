@@ -20,6 +20,7 @@ class BancoL0(Protocol):
     def evento_por_id_externo(self, fonte: str, valor: str) -> Optional[dict[str, Any]]: ...
     def casa_por_nome(self, nome: str) -> Optional[dict[str, Any]]: ...
     def inserir(self, tabela: str, registro: dict[str, Any]) -> dict[str, Any]: ...
+    def inserir_muitos(self, tabela: str, registros: list[dict[str, Any]]) -> list[dict[str, Any]]: ...
     def pulsar(self, daemon: str, detalhe: Optional[dict[str, Any]] = None) -> None: ...
 
 
@@ -37,38 +38,45 @@ def garantir_evento(banco: BancoL0, ev_norm: dict[str, Any]) -> Optional[str]:
     return criado.get("id")
 
 
-def garantir_casa(banco: BancoL0, nome: str, *, tipo: str, cache: dict[str, str]) -> Optional[str]:
-    """id da casa (get-or-create por nome), com cache por ciclo. `tipo` só é usado
-    ao CRIAR uma casa nova (varejo descoberto no line shopping)."""
+def garantir_casa(
+    banco: BancoL0, nome: str, *, tipo: str, comissao_pct: float = 0.0, cache: dict[str, str]
+) -> Optional[str]:
+    """id da casa (get-or-create por nome), com cache por ciclo. `tipo` e
+    `comissao_pct` só são usados ao CRIAR uma casa nova (a existente é imutável:
+    o schema não permite UPDATE — regra 7). A classificação (referência/exchange/
+    varejo) vem de `mapeamento.classificar_casa` (Sugestão nº 6)."""
     if nome in cache:
         return cache[nome]
     existente = banco.casa_por_nome(nome)
     if existente:
         cache[nome] = existente["id"]
         return existente["id"]
-    criado = banco.inserir("casas", {"nome": nome, "tipo": tipo, "comissao_pct": 0})
+    criado = banco.inserir("casas", {"nome": nome, "tipo": tipo, "comissao_pct": comissao_pct})
     novo_id = criado.get("id")
     if novo_id:
         cache[nome] = novo_id
-        _log.info("casa nova registrada (line shopping)", extra={"casa": nome, "tipo": tipo})
+        _log.info("casa nova registrada", extra={"casa": nome, "tipo": tipo, "comissao_pct": comissao_pct})
     return novo_id
+
+
+def linha_snapshot(*, evento_id: str, casa_id: str, snap: dict[str, Any]) -> dict[str, Any]:
+    """Monta a linha de `odds_snapshots` (sem inserir). `ts_fonte` vem da API
+    (nunca relógio local); `ts_captura` é deixado ao default do schema (now())."""
+    return {
+        "evento_id": evento_id,
+        "casa_id": casa_id,
+        "mercado": snap["mercado"],
+        "selecao": snap["selecao"],
+        "linha": snap.get("linha"),
+        "odd": snap["odd"],
+        "liquidez": snap.get("liquidez"),  # None p/ referência/varejo/exchange-proxy (sem book pela API; E1.2)
+        "ts_fonte": snap["ts_fonte"],
+        "raw": snap.get("raw"),
+    }
 
 
 def gravar_snapshot(
     banco: BancoL0, *, evento_id: str, casa_id: str, snap: dict[str, Any]
 ) -> dict[str, Any]:
-    """INSERT único em `odds_snapshots` com `ts_fonte` da API (nunca relógio local)."""
-    return banco.inserir(
-        "odds_snapshots",
-        {
-            "evento_id": evento_id,
-            "casa_id": casa_id,
-            "mercado": snap["mercado"],
-            "selecao": snap["selecao"],
-            "linha": snap.get("linha"),
-            "odd": snap["odd"],
-            "liquidez": snap.get("liquidez"),  # None p/ referência/varejo; exchange é E1.2
-            "ts_fonte": snap["ts_fonte"],
-            "raw": snap.get("raw"),
-        },
-    )
+    """INSERT único em `odds_snapshots` (usado em teste; o ciclo grava em lote)."""
+    return banco.inserir("odds_snapshots", linha_snapshot(evento_id=evento_id, casa_id=casa_id, snap=snap))
