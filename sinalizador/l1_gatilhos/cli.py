@@ -3,13 +3,15 @@
 Roda na máquina do Daniel / VPS. Exige `.env` (Supabase) e uma banca semeada em
 `banca_ledger` (mesmo em modo sombra: um aporte nocional é a banca de papel).
 
-    python -m sinalizador.l1_gatilhos.cli --once                     # venue exchange (padrão)
-    python -m sinalizador.l1_gatilhos.cli --once --venue retail_sombra
+    python -m sinalizador.l1_gatilhos.cli --once                     # venue retail_sombra (modo sombra)
+    python -m sinalizador.l1_gatilhos.cli --once --venue exchange    # doutrina-puro (só com exchange capturável)
     python -m sinalizador.l1_gatilhos.cli --intervalo-s 60
 
-`--venue retail_sombra` é um DESVIO do desenho (venue ≠ exchange) — pendência
-PC-VENUE-SOMBRA, use só para os primeiros sinais de teste enquanto o E1.2 (Betfair)
-não entra. O padrão `exchange` não desvia de nada.
+Padrão `retail_sombra`: RATIFICADO pela Sugestão nº 6 como o venue do modo sombra
+(sem API da Betfair não há exchange capturável; o modo sombra mede CLV, que não
+exige book). O sinal nasce `sombra_varejo=true` e a proteção é a `odd_minima_aceitavel`
+contra o preço real no app. Dinheiro real segue travado pelo gate do E7. Use
+`--venue exchange` quando houver venue de exchange capturável (E1.2/exchange-proxy).
 """
 from __future__ import annotations
 
@@ -34,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--intervalo-s", type=float, default=60.0, help="segundos entre ciclos")
     ap.add_argument("--lookback-s", type=float, default=3600.0, help="janela de snapshots (s)")
     ap.add_argument("--venue", choices=[p.value for p in PoliticaVenue],
-                    default=PoliticaVenue.EXCHANGE.value)
+                    default=PoliticaVenue.RETAIL_SOMBRA.value)  # modo sombra (Sugestão nº 6)
     args = ap.parse_args(argv)
 
     banco = Banco()

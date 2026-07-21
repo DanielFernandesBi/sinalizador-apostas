@@ -18,6 +18,7 @@ Operações expostas:
   - gates_vigentes() / config_vigente() / casa_por_nome() / exposicao_aberta()    leituras
   - evento_por_id_externo() / saude_daemons()                                      leituras (L0)
   - snapshots_desde() / casas_ativas() / eventos_por_ids() / banca_atual()          leituras (L1)
+  - sinais_aguardando_crivo()                                                        leitura (L2)
 """
 from __future__ import annotations
 
@@ -134,6 +135,18 @@ class Banco:
         resp = self._c.table("vw_banca").select("*").limit(1).execute()
         dados = resp.data or []
         return dados[0] if dados else None
+
+    def sinais_aguardando_crivo(self, limite: int = 50) -> list[dict[str, Any]]:
+        """Fila do L2: sinais com status 'aguardando_crivo' (mais antigos primeiro)."""
+        resp = (
+            self._c.table("sinais")
+            .select("*")
+            .eq("status", "aguardando_crivo")
+            .order("criado_em")
+            .limit(limite)
+            .execute()
+        )
+        return resp.data or []
 
     # ---------------- ESCRITA: apenas o permitido ----------------
 
