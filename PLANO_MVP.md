@@ -17,7 +17,9 @@
 - [x] Schema v0.1 pronto (16 tabelas, 6 views, triggers de imutabilidade)
 - [x] **Projeto Supabase criado (jxveebxywadyxuhixcxt); migration 0001 aplicada.** Governança sincronizada repo→banco em `config_sistema` (**doutrina v6** = v0.1.5 e manual v2 verbatim, conferidos por md5). **16 gates vigentes** na tabela `gates`.
 - [x] **E3 (crivo L2) implementado** — `l2_crivo/` (modelo Anthropic injetável, crivo com validação estrita + passthrough + fila). 13 testes de crivo.
-- [x] **Sugestão nº 6 (executável) + Sugestão nº 7 + higiene de saída** — (a) perfil de captura da `eu` grava TODAS as casas classificadas (Pinnacle referência, `betfair_ex_*` exchange-proxy 6,5%, demais varejo) na mesma resposta (crédito zero adicional); (b) `banca_papel` (config_sistema, R$ 1.000) dimensiona o modo sombra quando o ledger real está vazio, com o dossiê marcando `banca_origem=papel` (ledger real intocado até o E7); (c) logger `httpx`→WARNING + snapshots em lote (1 POST por ciclo). Suíte completa **179 testes verdes**.
+- [x] **Sugestão nº 6 (executável) + Sugestão nº 7 + higiene de saída** — (a) perfil de captura da `eu` grava TODAS as casas classificadas (Pinnacle referência, `betfair_ex_*` exchange-proxy 6,5%, demais varejo) na mesma resposta (crédito zero adicional); (b) `banca_papel` (config_sistema, R$ 1.000) dimensiona o modo sombra quando o ledger real está vazio, com o dossiê marcando `banca_origem=papel` (ledger real intocado até o E7); (c) logger `httpx`→WARNING + snapshots em lote (1 POST por ciclo).
+- [x] **Cadência adaptativa do L0** (`l0_captura/cadencia.py` + `cli.py --adaptativo`): 5/10/60 min por proximidade do jogo, só ligas com jogo em D+2; calendário via `/events` (custo 0). Corta o consumo de créditos em ordem de grandeza — dimensiona o tier pago com consumo real.
+- [x] **E4 (L3 notificação Telegram)** e **E5 (L4 fechamento/CLV)** implementados e testados — cartão + re-checagem de preço + alertas (L3); linha de fechamento de-vigada + CLV real/contrafactual + execução/liquidação + relatório (L4). Suíte completa **218 testes verdes**.
 
 ---
 
@@ -50,7 +52,7 @@
 
 ## E1 — L0: CAPTURA (o mais urgente — cada dia sem ticks é backtest perdido)
 
-- [x] E1.1 **Daemon da região `eu` (The Odds API):** polling das 6 ligas europeias, mercados 1x2/AH/OU (h2h/spreads/totals). **Sugestão nº 6 (executável):** a mesma resposta traz Pinnacle + exchange + ~20 casas de varejo — captura-se TODAS, classificadas por `mapeamento.classificar_casa` (Pinnacle→referência 0%; `betfair_ex_*`→exchange-proxy 6,5% — SEM book pela API, `liquidez=None`; demais→varejo, venue do modo sombra). Custo de crédito **zero adicional**. `odds_snapshots` gravados em LOTE (1 POST/ciclo) com `ts_fonte` da API; upsert de `eventos` por `ids_externos.odds_api`. `l0_captura/{the_odds_api,mapeamento,persistencia,captura,referencia}.py` + `cli.py`. **Núcleo testável com fakes; a PRIMEIRA execução real + cobertura + medição de créditos rodam na máquina do Daniel (aceite #4) — dependem do `.env` com `the_odds_api_key` (D1).**
+- [x] E1.1 **Daemon da região `eu` (The Odds API):** polling das 6 ligas europeias, mercados 1x2/AH/OU (h2h/spreads/totals). **Sugestão nº 6 (executável):** a mesma resposta traz Pinnacle + exchange + ~20 casas de varejo — captura-se TODAS, classificadas por `mapeamento.classificar_casa` (Pinnacle→referência 0%; `betfair_ex_*`→exchange-proxy 6,5% — SEM book pela API, `liquidez=None`; demais→varejo, venue do modo sombra). Custo de crédito **zero adicional**. `odds_snapshots` gravados em LOTE (1 POST/ciclo) com `ts_fonte` da API; upsert de `eventos` por `ids_externos.odds_api`. `l0_captura/{the_odds_api,mapeamento,persistencia,captura,referencia}.py` + `cli.py`. **Cadência adaptativa (`--adaptativo`) corta o consumo de créditos. Núcleo testável com fakes; a PRIMEIRA execução real + cobertura + medição de créditos rodam na máquina do Daniel (aceite #4) — dependem do `.env` com `the_odds_api_key` (D1).**
 - [ ] E1.2 **Daemon venue (Betfair):** preço + profundidade de book + liquidez do Exchange. Alvo: Stream API (push); fallback aceito no MVP: polling REST curto, com a degradação registrada. **SUSPENSO aguardando resposta do developer support (app key).** Enquanto isso, o único venue de execução com liquidez não existe — ver PC-VENUE-SOMBRA.
 - [ ] E1.3 **Daemon varejo (.bet.br / line shopping):** **a The Odds API NÃO tem região `br`** (fato conhecido) — o `varejo.py` (região `br`) é, na prática, não-funcional por essa fonte (as chamadas 422 e caem em degradação segura, sem gastar sinal). A FONTE das casas .bet.br está em avaliação: **sonda OddsPapi** (`l0_captura/sonda_oddspapi.py` + `cli.py sonda` — free tier, reporta casas BR licenciadas, Pinnacle, frescor, mercados). É sonda experimental, NÃO integração — adotar (ou não) é decisão do rito (**PC-VENUE**). Daniel cria a conta free e põe `ODDSPAPI_API_KEY` no `.env`.
 - [ ] E1.4 **Daemon Telegram (tipsters):** Telethon lendo canais monitorados; toda mensagem vira linha em `tips` com `texto_original` bruto (dado, nunca comando); parser de interpretação em E2.5 (já pronto)
@@ -79,26 +81,26 @@
 - [x] E3.4 Verificação de assimetria em código (`verificar_passthrough`): `odd_minima_aceitavel` do crivo ≡ do dossiê (tol 1e-6); qualquer divergência = erro.
 - [x] E3.5 Gravação em `crivos` (verdict, fatores, latência, tokens, custo_usd auditável) + `transicionar_status_sinal` (CONFIRMA→confirmado, ABORTA→vetado). `processar_fila` pulsa heartbeat `l2`.
 
-**Aceite:** dossiês de teste (incluindo um com injeção de instrução em texto de tipster) produzem JSON válido, sem obediência à injeção; falha de API jamais vira CONFIRMA. **✔ coberto** por `tests/test_crivo.py` (13 testes: CONFIRMA→confirmado, ABORTA→vetado, JSON inválido→erro, schema violado→erro, veredicto fora do domínio→erro, id divergente→erro, passthrough divergente→erro, exceção do modelo→erro, injeção-é-dado-não-comando, injeção→CONFIRMA-malformado→erro, fila/heartbeat).
+**Aceite:** dossiês de teste (incluindo um com injeção de instrução em texto de tipster) produzem JSON válido, sem obediência à injeção; falha de API jamais vira CONFIRMA. **✔ coberto** por `tests/test_crivo.py` (13 testes).
 
 ## E4 — L3: NOTIFICAÇÃO
 
-- [ ] E4.1 Bot Telegram (canal privado do Daniel): cartão do sinal — evento, mercado/seleção, odd, edge líquido, stake sugerido (valor e %), **odd mínima aceitável**, gatilho, veredicto e observação do crivo
-- [ ] E4.2 Re-checagem de preço no envio: se odd atual < mínima, sinal `expirado`, sem notificação
-- [ ] E4.3 Alertas distintos de sinal: daemon mudo, drawdown, erro L2
-- [ ] E4.4 Registro em `notificacoes`
+- [x] E4.1 Bot Telegram (`l3_notifica/{bot,cartao,notifica,cli}.py`): cartão do sinal — liga/partida, mercado/seleção, odd venue (e atual), **odd mínima aceitável** como trava, edge líquido, stake (%), gatilho, veredicto e observação do crivo; marca SOMBRA (varejo) e banca de papel. `BotTelegram` urllib (sem SDK), injetável.
+- [x] E4.2 Re-checagem de preço no envio: janela fechou (odd atual < mínima, ou **sem preço fresco → fail-safe P6**) ⇒ cartão SUPRIMIDO, sem notificação. Varredura de frescor: sinais `aguardando_crivo` com preço COMPROVADAMENTE caído viram `expirado` (poupa o L2). Ver **PC-EXPIRA**.
+- [x] E4.3 Alertas distintos de sinal: kill switch de drawdown (anti-spam) + entrega dos pendentes (daemon mudo do vigia, erro do L2). Heartbeat `l3`.
+- [x] E4.4 Registro em `notificacoes` (`entregue=false` = a enviar; `true` = enviado ou interno). `marcar_notificacao_entregue` (notificacoes aceita UPDATE no schema).
 
-**Aceite:** latência captura→notificação medida; sinal expirado não notifica; alerta de daemon chega quando um daemon é derrubado de propósito.
+**Aceite:** sinal com janela fechada não notifica; alerta de daemon é entregue; envio falho fica pendente (retry). **✔ coberto** por `tests/test_notifica.py` (15 testes). Núcleo testável sem rede/token (Protocol `Bot`).
 
 ## E5 — L4: FECHAMENTO E CLV
 
-- [ ] E5.1 Job de fechamento: captura linha de fechamento da referência de todo evento com sinal, veto ou aborto rastreado (agendado por horário de início dos jogos)
-- [ ] E5.2 Cômputo de CLV → `clv_log` (real e `contrafactual`); tips fechados → `tips.clv_pct`
-- [ ] E5.3 Registro manual de execução: comando no bot ("apostei X a odd Y") → `apostas` + `banca_ledger`
-- [ ] E5.4 Liquidação de resultados (resultado do jogo → green/red/void) + `banca_ledger`
-- [ ] E5.5 Relatório diário no Telegram: sinais, vetos, CLV do dia, CLV acumulado, banca, drawdown, saúde dos daemons
+- [x] E5.1 Job de fechamento (`l4_fechamento/clv.py`): a **linha de fechamento é o último snapshot da referência (Pinnacle) antes do início** — já capturado, custo de crédito zero. `fechar_evento` de-viga Shin o book de fechamento e marca o evento `encerrado`.
+- [x] E5.2 Cômputo de CLV → `clv_log`: `clv_pct = (odd_emissao × p_fechamento − 1)×100` ("bateu o fechamento?"). Real para confirmados; **contrafactual** para vetados e abortos near-miss (auditoria do crivo). Não duplica; book incompleto → sem CLV (P6). *(tips.clv_pct: `fechar_tip` existe no `Banco`; wiring do tip→fechamento fica com o E1.4/E2.5 quando os canais entrarem.)*
+- [x] E5.3 Registro manual de execução (`cli.py apostei` → `db.registrar_aposta`): INSERT em `apostas` + lançamento `aposta` no `banca_ledger`.
+- [x] E5.4 Liquidação (`cli.py liquidei` → `db.liquidar_e_lancar`): transição única da aposta (green/red/void/meio) + lançamento `liquidacao` no `banca_ledger`.
+- [x] E5.5 Relatório diário (`l4_fechamento/relatorio.py`, `cli.py relatorio [--enviar]`): CLV real vs contrafactual, banca/drawdown/kill switch, daemons mudos — com aviso de amostra < 200 (P12).
 
-**Aceite:** `vw_clv_global`, `vw_clv_por_veto` e `vw_tipster_ranking` populando com dados reais.
+**Aceite:** `vw_clv_global`, `vw_clv_por_veto` e `vw_tipster_ranking` populando com dados reais. **Código pronto e testado** (`tests/test_fechamento.py`, 11 testes); a população real depende dos primeiros snapshots/sinais reais (E1 na máquina do Daniel).
 
 ## E6 — BACKTEST (paralelo, desde que E2.1 exista)
 
@@ -121,13 +123,14 @@
 
 | # | Decisão | Necessária para |
 |---|---|---|
-| D1 | Plano da The Odds API (tier gratuito = 500 req/mês, insuficiente; tier pago conforme cadência desejada) | E1.1 |
+| D1 | Plano da The Odds API (tier gratuito = 500 req/mês; com a cadência adaptativa, medir o consumo real antes de escolher o pago) | E1.1 |
 | D2 | Conta Betfair Brasil + solicitação de chave de API (app key) | E1.2 |
 | D3 | Quais casas .bet.br monitorar no line shopping — **depende da fonte (PC-VENUE): a The Odds API não cobre `br`; avaliar OddsPapi via `cli.py sonda`** | E1.3 |
 | D4 | Lista inicial de canais de tipsters no Telegram (5–10 para começar o ranking) | E1.4 |
 | D5 | VPS (provedor e orçamento — R$ 30–60/mês resolve o MVP) | E0.5 |
 | D6 | Ligas-alvo iniciais (sugestão: Brasileirão A/B + 2–3 ligas europeias líquidas quando retomarem em agosto). **Nota E6.1: o Football-Data NÃO cobre o Brasileirão — o backtest inicial roda nas 6 ligas europeias cobertas (E0/SP1/I1/D1/F1/P1); fonte para Brasileirão a definir.** | E1.1, E6 |
 | D7 | Conta/chave da API Anthropic para o L2 (separada do uso pessoal, para medir custo) | E3.1 |
+| D8 | Bot do Telegram para o L3 (`TELEGRAM_BOT_TOKEN`) + chat privado de destino (`TELEGRAM_CHAT_ID`) | E4 |
 
 ## PENDÊNCIAS DE CONTRATO
 
@@ -135,10 +138,11 @@
 - [x] **PC-EXP — resolvida pela Sugestão nº 3 (rito, 19/07/2026).** Gates de teto de exposição por jogo/liga-dia/dia semeados (exposicao_max_jogo/liga_dia/dia_pct); consumidos por `motor_gates.tetos_exposicao` + `avaliar_exposicao` (E2.3).
 - [x] **PC-ODDMIN — resolvida pela Sugestão nº 4 (rito, 20/07/2026).** `odd_minima_aceitavel` fixada na **Doutrina §3** (v0.1.3): menor odd em que o edge líquido ainda atinge o gate `edge_min`. Implementada em `edge.odd_minima_aceitavel` e coberta por teste.
 - [x] **PC-RASTREIO — resolvida pela Sugestão nº 5 (rito, 20/07/2026).** O piso de rastreio de CLV amostral virou o gate `rastreio_edge_min_pct` (= 1,0%, a calibrar), semeado e vigente na tabela `gates` (16 no total) e inscrito na **Doutrina §4** (v0.1.4). `abortos.deve_rastrear_clv` lê o piso da tabela (regra 6) — deixou de ser constante em código.
-- [x] **PC-VENUE-SOMBRA — resolvida pela Sugestão nº 6 (rito, 21/07/2026).** O `retail_sombra` foi **ratificado como o venue do modo sombra**: o wiring (E2.8) e o `cli.py` do L1 passam a ter `retail_sombra` como padrão (venue = melhor preço de **varejo**). O sinal nasce `sombra_varejo=true` no dossiê; a proteção de execução é a `odd_minima_aceitavel` contra o preço real no app; o gate de liquidez segue **inaplicável** (varejo não tem book). O modo sombra mede CLV (KPI soberano), que não exige book. **Dinheiro real continua travado pelo gate do E7.** Inscrito na **Doutrina §-sombra** (v0.1.5). `--venue exchange` fica disponível para quando houver exchange cap turável (E1.2 / exchange-proxy).
+- [x] **PC-VENUE-SOMBRA — resolvida pela Sugestão nº 6 (rito, 21/07/2026).** O `retail_sombra` foi **ratificado como o venue do modo sombra**: o wiring (E2.8) e o `cli.py` do L1 passam a ter `retail_sombra` como padrão (venue = melhor preço de **varejo**). O sinal nasce `sombra_varejo=true` no dossiê; a proteção de execução é a `odd_minima_aceitavel` contra o preço real no app; o gate de liquidez segue **inaplicável** (varejo não tem book). O modo sombra mede CLV (KPI soberano), que não exige book. **Dinheiro real continua travado pelo gate do E7.** Inscrito na **Doutrina §-sombra** (v0.1.5). `--venue exchange` fica disponível para quando houver exchange capturável (E1.2 / exchange-proxy).
 - [ ] **PC-EXCHANGE-PROXY — ativação do `betfair_ex_*` como venue (aguarda relatório).** A Sugestão nº 6 (executável) faz o L0 **capturar** a exchange-proxy da `eu` (`betfair_ex_*`, tipo exchange, 6,5%, SEM book pela API) — o dado já entra (alimenta CLV/relatório). Mas o venue do modo sombra segue **só varejo**: a proxy fica FORA dos sinais sombra até o rito ratificar seu tratamento sem-book (odd fixa vs. exchange) "com o relatório na mão". Sob `--venue exchange` (doutrina-puro), a proxy sem book **aborta** no gate de liquidez (honesto). Decidir: ativar a proxy como venue paralelo rotulado (com que regra de liquidez) ou aguardar a Betfair (E1.2).
 - [ ] **PC-VENUE — fonte das casas de varejo .bet.br (The Odds API não tem região `br`).** Em avaliação pela **sonda OddsPapi** (`l0_captura/sonda_oddspapi.py` + `cli.py sonda`, free tier): reporta casas BR licenciadas presentes, Pinnacle, frescor (timestamps) e mercados. É sonda de avaliação, não integração — **decidir por rito** se a OddsPapi (ou outra fonte) vira a origem do line shopping .bet.br. Nota: a rota/base da OddsPapi no cliente é provisória (confirmar na doc real); o parsing é defensivo. Daniel: conta free + `ODDSPAPI_API_KEY` no `.env`.
 - [x] **PC-SLIPPAGE — resolvida para o modo sombra pela Sugestão nº 6 (rito, 21/07/2026).** Em varejo de odd fixa, `slippage=0` **não é otimismo — é definição** (o preço no app é o preço executado; não há book para varrer). O edge do L1 no modo sombra usa `slippage=0` por desenho, inscrito na **Doutrina §-sombra** (v0.1.5). *(Fica reaberta apenas se/quando houver venue de exchange com book (E1.2): aí o estimador por liquidez da P4 volta a ser exigido.)*
+- [ ] **PC-EXPIRA — `expirado` só de aguardando_crivo (registrado, 21/07/2026).** O schema 0001 (`tg_sinais_upd`) só permite transição de status a partir de `aguardando_crivo`. Logo, a re-checagem de preço do E4.2 produz `expirado` de verdade apenas na **varredura de frescor** (sinal ainda `aguardando_crivo`, antes do L2). No ENVIO, o sinal já é `confirmado` (imutável): a janela fechada vira **supressão do cartão + registro administrativo interno**, não muda o status. Se o rito quiser `expirado` também para confirmados, muda-se o trigger/doutrina. Sem impacto no aceite (janela fechada nunca notifica).
 - [ ] **PC-CRIVO-TEMP — desvio de `temperatura 0` no L2 (registrado, 21/07/2026).** O PLANO E3.1 pedia `temperatura 0`. O modelo forte usado **rejeita `temperature` (HTTP 400)**; o determinismo é buscado por `output_config.effort` baixo + instrução do Manual, não por `temp 0`. `l2_crivo/modelo.py` **não envia `temperature`**. É um desvio consciente do texto do PLANO — sem impacto no aceite (validação estrita + passthrough + falha-nunca-CONFIRMA independem da temperatura). Ratificar/registrar no rito.
 
 Nota da E0.3 (config por camada — FEITO): `comum/config.py` exige na carga só os
