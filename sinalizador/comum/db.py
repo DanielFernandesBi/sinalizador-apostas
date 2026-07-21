@@ -14,15 +14,19 @@ Operações expostas:
   - pulsar(daemon, detalhe)                heartbeat (INSERT em heartbeats)
   - transicionar_status_sinal(...)         única mutação de `sinais` (a partir de aguardando_crivo)
   - liquidar_aposta(...)                   única mutação de `apostas` (pendente -> final)
+  - registrar_aposta(...) / liquidar_e_lancar(...)   E5.3/E5.4: aposta + banca_ledger
   - fechar_tip(...)                        único preenchimento de fechamento em `tips`
   - marcar_notificacao_entregue(id)        `notificacoes` aceita UPDATE (não é append-only)
+  - marcar_evento_encerrado(id)            `eventos.status` (L4: sai da fila de fechamento)
   - publicar_config(chave, valor)          publica nova versão vigente de governança (rito)
   - gates_vigentes() / config_vigente() / casa_por_nome() / exposicao_aberta()    leituras
-  - evento_por_id_externo() / saude_daemons()                                      leituras (L0)
+  - evento_por_id_externo() / saude_daemons() / clv_global()                       leituras
   - snapshots_desde() / casas_ativas() / eventos_por_ids() / banca_atual()          leituras (L1)
   - sinais_aguardando_crivo()                                                        leitura (L2)
   - sinais_por_status() / crivo_do_sinal() / ultimo_snapshot_venue() /
     notificacoes_do_sinal() / notificacoes_pendentes()                              leituras (L3)
+  - eventos_iniciados_sem_status_final() / snapshots_do_evento() /
+    sinais_do_evento() / abortos_rastreados_do_evento() / clv_ids_registrados()     leituras (L4)
 """
 from __future__ import annotations
 
@@ -109,6 +113,11 @@ class Banco:
     def saude_daemons(self) -> list[dict[str, Any]]:
         """Linhas de `vw_saude_daemons` (último pulso e silêncio por daemon) — E1.5."""
         resp = self._c.table("vw_saude_daemons").select("*").execute()
+        return resp.data or []
+
+    def clv_global(self) -> list[dict[str, Any]]:
+        """Linhas de `vw_clv_global` (n, clv_medio, desvio por real/contrafactual)."""
+        resp = self._c.table("vw_clv_global").select("*").execute()
         return resp.data or []
 
     def snapshots_desde(self, ts_iso: str) -> list[dict[str, Any]]:
@@ -211,6 +220,93 @@ class Banco:
             .execute()
         )
         return resp.data or []
+
+    # ---------------- LEITURA do L4 (fechamento / CLV) ----------------
+
+    def eventos_iniciados_sem_status_final(self, ate_iso: str, limite: int = 200) -> list[dict[str, Any]]:
+        """Eventos cujo início já passou (`inicio_utc <= ate_iso`) e ainda não estão
+        'encerrado' — candidatos ao fechamento de CLV (L4)."""
+        resp = (
+            self._c.table("eventos")
+            .select("*")
+            .lte("inicio_utc", ate_iso)
+            .neq("status", "encerrado")
+            .order("inicio_utc")
+            .limit(limite)
+            .execute()
+        )
+        return resp.data or []
+
+    def snapshots_do_evento(
+        self, evento_id: str, casa_ids: Optional[list[str]] = None, ate_iso: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """Snapshots de um evento (opcionalmente só de certas casas e até um `ts_fonte`).
+        Base do fechamento: a linha de fechamento é o ÚLTIMO snapshot da referência
+        antes do início (L4)."""
+        q = self._c.table("odds_snapshots").select("*").eq("evento_id", evento_id)
+        if casa_ids is not None:
+            q = q.in_("casa_id", casa_ids)
+        if ate_iso is not None:
+            q = q.lte("ts_fonte", ate_iso)
+        return q.order("ts_fonte").execute().data or []
+
+    def sinais_do_evento(self, evento_id: str, status: Optional[list[str]] = None) -> list[dict[str, Any]]:
+        """Sinais de um evento (para o CLV: confirmados = real; vetados = contrafactual)."""
+        q = self._c.table("sinais").select("*").eq("evento_id", evento_id)
+        if status is not None:
+            q = q.in_("status", status)
+        return q.execute().data or []
+
+    def abortos_rastreados_do_evento(self, evento_id: str) -> list[dict[str, Any]]:
+        """Abortos near-miss (`clv_rastrear=true`) de um evento (CLV contrafactual)."""
+        resp = (
+            self._c.table("abortos_l1")
+            .select("*")
+            .eq("evento_id", evento_id)
+            .eq("clv_rastrear", True)
+            .execute()
+        )
+        return resp.data or []
+
+    def clv_ids_registrados(self, evento_id: str) -> tuple[set, set]:
+        """(sinal_ids, aborto_ids) que JÁ têm CLV, para não duplicar o fechamento."""
+        resp = self._c.table("clv_log").select("sinal_id,aborto_l1_id").execute()
+        linhas = resp.data or []
+        sinal_ids = {r["sinal_id"] for r in linhas if r.get("sinal_id")}
+        aborto_ids = {r["aborto_l1_id"] for r in linhas if r.get("aborto_l1_id")}
+        return sinal_ids, aborto_ids
+
+    def marcar_evento_encerrado(self, evento_id: str) -> None:
+        """`eventos.status` não é imutável no schema — o fechamento marca 'encerrado'
+        para o evento sair da fila do L4."""
+        self._c.table("eventos").update({"status": "encerrado"}).eq("id", evento_id).execute()
+
+    def registrar_aposta(
+        self, *, sinal_id: str, casa_id: str, odd_executada: float, stake_valor: float, saldo_antes: float
+    ) -> dict[str, Any]:
+        """E5.3 — registra a execução humana: INSERT em `apostas` + lançamento
+        'aposta' no `banca_ledger` (saldo debitado do stake). Ambos append-only."""
+        aposta = self.inserir("apostas", {
+            "sinal_id": sinal_id, "casa_id": casa_id,
+            "odd_executada": odd_executada, "stake_valor": stake_valor,
+        })
+        self.inserir("banca_ledger", {
+            "tipo": "aposta", "valor": -abs(stake_valor), "aposta_id": aposta.get("id"),
+            "motivo": f"execução do sinal {sinal_id}", "saldo_apos": saldo_antes - abs(stake_valor),
+        })
+        return aposta
+
+    def liquidar_e_lancar(
+        self, *, aposta_id: str, resultado: str, retorno_liquido: float, saldo_antes: float
+    ) -> dict[str, Any]:
+        """E5.4 — liquida a aposta (única transição) + lançamento 'liquidacao' no
+        ledger (crédito do retorno). Usa `liquidar_aposta` (espelha o trigger)."""
+        ap = self.liquidar_aposta(aposta_id, resultado, retorno_liquido)
+        self.inserir("banca_ledger", {
+            "tipo": "liquidacao", "valor": retorno_liquido, "aposta_id": aposta_id,
+            "motivo": f"liquidação {resultado}", "saldo_apos": saldo_antes + retorno_liquido,
+        })
+        return ap
 
     # ---------------- ESCRITA: apenas o permitido ----------------
 
