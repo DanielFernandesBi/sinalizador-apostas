@@ -2,3 +2,9 @@
 pydantic>=2.6,<3
 pydantic-settings>=2.2,<3
 supabase>=2.4,<3
+# L2 (crivo) — SDK Anthropic. Precisa de versão recente (thinking adaptativo +
+# output_config). O núcleo do L2 não depende do SDK (Protocol ModeloCrivo); só o
+# `l2_crivo.cli` o importa. L0/L1/L3/L4 usam só stdlib (urllib) + supabase.
+anthropic>=0.40
+# Testes (dev): a suíte roda com `pytest` puro a partir da raiz (conftest.py).
+pytest>=8
