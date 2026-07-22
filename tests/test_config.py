@@ -1,13 +1,31 @@
-"""Testes da config por camada: universais obrigatórios, resto cobrado no uso."""
+"""Testes da config por camada: universais obrigatórios, resto cobrado no uso.
+
+Isolamento (importante): a `Config` lê `.env` + variáveis de ambiente. Sem isolar,
+o teste rodado na máquina do Daniel puxaria os segredos REAIS do `.env` — e um
+assert falho vazaria a chave no traceback. Por isso: `_env_file=None` (ignora o
+`.env`) + fixture que limpa as env vars dos opcionais.
+"""
 import pytest
 
 from sinalizador.comum.config import Config, SegredoAusenteError
+
+# Segredos opcionais que NÃO podem vazar do ambiente para dentro do teste.
+_OPCIONAIS = (
+    "the_odds_api_key", "anthropic_api_key", "telegram_bot_token",
+    "telegram_chat_id", "oddspapi_api_key",
+)
+
+
+@pytest.fixture(autouse=True)
+def _sem_ambiente(monkeypatch):
+    for nome in _OPCIONAIS:
+        monkeypatch.delenv(nome.upper(), raising=False)
 
 
 def _cfg(**over):
     base = {"supabase_url": "https://x.supabase.co", "supabase_service_role_key": "sb-secret"}
     base.update(over)
-    return Config(**base)  # kwargs sobrepõem .env/ambiente
+    return Config(_env_file=None, **base)  # ignora o .env real; kwargs explícitos
 
 
 def test_universais_carregam_sem_os_demais():
