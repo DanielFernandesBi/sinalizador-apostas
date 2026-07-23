@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import time
 from datetime import datetime, timezone
 
 from sinalizador.comum.db import Banco
 from sinalizador.comum.gates import CarregadorGates
 from sinalizador.comum.log import configurar_logging
+from sinalizador.comum.rede import MSG_REDE, parece_erro_de_rede
 
 from .orquestrador import PoliticaVenue, rodar_l1
 
@@ -41,7 +43,13 @@ def main(argv: list[str] | None = None) -> int:
 
     banco = Banco()
     gates = CarregadorGates(banco)
-    gates.validar_integridade()  # falha alto se a integridade dos gates estiver violada
+    try:
+        gates.validar_integridade()  # falha alto se a integridade dos gates estiver violada
+    except Exception as e:
+        if parece_erro_de_rede(e):
+            print(MSG_REDE, file=sys.stderr)
+            return 3
+        raise
     politica = PoliticaVenue(args.venue)
 
     def rodar() -> None:

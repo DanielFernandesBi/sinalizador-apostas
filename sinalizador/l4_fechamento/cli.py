@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import time
 from datetime import datetime, timezone
 
 from sinalizador.comum.config import carregar_config
 from sinalizador.comum.db import Banco
 from sinalizador.comum.log import configurar_logging
+from sinalizador.comum.rede import MSG_REDE, parece_erro_de_rede
 
 from .clv import rodar_fechamento
 from .relatorio import formatar_relatorio
@@ -99,14 +101,20 @@ def main(argv: list[str] | None = None) -> int:
 
     args = ap.parse_args(argv)
     banco = Banco()
-    if args.cmd == "fechar":
-        return _cmd_fechar(banco, args)
-    if args.cmd == "relatorio":
-        return _cmd_relatorio(banco, args)
-    if args.cmd == "apostei":
-        return _cmd_apostei(banco, args)
-    if args.cmd == "liquidei":
-        return _cmd_liquidei(banco, args)
+    try:
+        if args.cmd == "fechar":
+            return _cmd_fechar(banco, args)
+        if args.cmd == "relatorio":
+            return _cmd_relatorio(banco, args)
+        if args.cmd == "apostei":
+            return _cmd_apostei(banco, args)
+        if args.cmd == "liquidei":
+            return _cmd_liquidei(banco, args)
+    except Exception as e:
+        if parece_erro_de_rede(e):
+            print(MSG_REDE, file=sys.stderr)
+            return 3
+        raise
     return 1
 
 
