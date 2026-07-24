@@ -6,7 +6,17 @@ mecânico do L1 sobre cada seleção:
 
   referência (devig Shin) → edge líquido (comissão da tabela `casas`)
     → gatilhos (value_bet / odds_drop / anomalia — E2.4) → motor de gates
-      → dossiê completo + fila do L2  (sinal)   OU   `abortos_l1` (near-miss).
+      → gate de homologação (Doutrina P2 / achado 8)
+        → dossiê completo + fila do L2  (sinal, só mercado HOMOLOGADO)
+        OU  `candidato_sombra` (mercado em backtest: só rastreio de CLV, nunca cartão)
+        OU  `abortos_l1` (near-miss, ou mercado suspenso/sem homologação configurada).
+
+Homologação de mercado (P2): "só opera em mercados homologados". O L1 consulta
+`mercados_homologados` por (liga, mercado). 'homologado' → sinal normal (L2/L3);
+'backtest' (calibração) → candidato_sombra, acompanhado até o fechamento SÓ para
+medir CLV (alimenta E6.4), jamais confirmado/cartão; 'suspenso'/'caducado' ou SEM
+linha (falha de configuração — a ausência NÃO é licença implícita para calibrar) →
+grupo pulado, marcador no log de abortos. Fail-closed: sem homologação, sem sinal.
 
 SEM IA (regra 2), SEM dinheiro (P1). "Dado ausente = abortar" (P6): book de
 referência incompleto, sem venue capturado, sem banca ou sem carimbo de fonte →
@@ -78,6 +88,8 @@ class ResumoL1:
     sinais: int = 0
     abortos: int = 0
     rastreados_clv: int = 0
+    candidatos_sombra: int = 0   # achado 8: passou tudo, mercado não homologado (só CLV)
+    nao_autorizados: int = 0     # achado 8: grupo pulado (suspenso/caducado ou sem config)
     pulados: list[str] = field(default_factory=list)  # motivos de skip (P6)
 
 
@@ -169,6 +181,7 @@ def avaliar_grupo(
     agora: datetime,
     politica: PoliticaVenue,
     venues_executaveis: Optional[set[str]],
+    homolog: dict[tuple[str, str], str],
     chaves_abertas: set[str],
     chaves_abortos: set[str],
     resumo: ResumoL1,
@@ -178,6 +191,21 @@ def avaliar_grupo(
     if ordem is None:
         resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}: mercado fora do escopo")
         return
+
+    # Gate de homologação de mercado (Doutrina P2 / achado 8) — decisão de GRUPO
+    # (liga, mercado). Só 'homologado' segue o caminho normal (L2/L3); 'backtest' (a
+    # fase de calibração) vira `candidato_sombra` mais abaixo — POR SELEÇÃO, e só após
+    # passar TODOS os gates mecânicos. Mercado 'suspenso'/'caducado' (retirada
+    # explícita) ou SEM linha em `mercados_homologados` (FALHA DE CONFIGURAÇÃO — a
+    # ausência não é licença implícita para calibrar) não roda gate nem gera candidato:
+    # pula o grupo com um marcador fail-loud no log de abortos (P7).
+    liga = grupo.evento.get("liga", "")
+    status_homolog = homolog.get((liga, grupo.mercado))
+    if status_homolog not in ("homologado", "backtest", "calibracao"):
+        _marcar_grupo_nao_autorizado(banco, grupo, status_homolog, resumo,
+                                     chaves_abortos=chaves_abortos)
+        return
+    modo_sombra_homolog = status_homolog != "homologado"  # backtest/calibração → candidato_sombra
 
     # Referência: última odd de cada seleção. Falta alguma → sem devig (P6).
     ref_atual: dict[str, PontoSerie] = {}
@@ -292,7 +320,16 @@ def avaliar_grupo(
                            edge, gates, resumo, chave=chave, chaves_abortos=chaves_abortos)
             continue
 
-        # Aprovado → dossiê completo + fila do L2.
+        # Passou TODOS os gates mecânicos. Homologação (Doutrina P2 / achado 8):
+        # mercado em 'backtest' (calibração) → candidato_sombra — rastreado até o
+        # fechamento SÓ para medir CLV (alimenta E6.4), nunca sinal nem cartão. Só
+        # mercado 'homologado' é enfileirado como sinal (segue para L2/L3).
+        if modo_sombra_homolog:
+            _registrar_candidato_sombra(banco, grupo, sel, dossie_parcial, resumo,
+                                        chave=chave, chaves_abortos=chaves_abortos)
+            continue
+
+        # Homologado → dossiê completo + fila do L2.
         odd_min = odd_minima_aceitavel(p_justa, comissao, edge_min_frac)
         dossie = _montar_dossie(
             grupo=grupo, sel=sel, gatilho=gatilho, gatilho_anomalo=anomalo, caminho=caminho,
@@ -321,8 +358,14 @@ def avaliar_grupo(
 
 
 def _registrar(banco, grupo, sel, gate_reprovado, dossie_parcial, edge, gates, resumo: ResumoL1,
-               *, chave: Optional[str] = None) -> None:
-    rastrear = gate_reprovado == "edge_min_pct" and deve_rastrear_clv(edge, gates)
+               *, chave: Optional[str] = None, rastrear_forcado: Optional[bool] = None) -> None:
+    # `rastrear_forcado` sobrepõe o critério de near-miss: o candidato_sombra (achado 8)
+    # é SEMPRE rastreado (True); os marcadores de não-autorização, nunca (False). Quando
+    # None, vale a regra do near-miss (edge logo abaixo do gate — E2.6).
+    if rastrear_forcado is None:
+        rastrear = gate_reprovado == "edge_min_pct" and deve_rastrear_clv(edge, gates)
+    else:
+        rastrear = rastrear_forcado
     registrar_aborto(banco, gatilho=dossie_parcial["gatilho"], gate_reprovado=gate_reprovado or "desconhecido",
                      dossie_parcial=dossie_parcial, evento_id=grupo.evento_id, clv_rastrear=rastrear,
                      chave_candidato=chave)
@@ -332,14 +375,67 @@ def _registrar(banco, grupo, sel, gate_reprovado, dossie_parcial, edge, gates, r
 
 
 def _abortar_dedup(banco, grupo, sel, gate_reprovado, dossie_parcial, edge, gates, resumo: ResumoL1,
-                   *, chave: str, chaves_abortos: set[str]) -> None:
+                   *, chave: str, chaves_abortos: set[str],
+                   rastrear_forcado: Optional[bool] = None) -> None:
     """Registra o aborto SÓ se este candidato ainda não foi abortado na janela
     (achado 7): um near-miss persistente não vira um aborto por minuto."""
     if chave in chaves_abortos:
         resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}/{sel}: aborto já registrado (dedup)")
         return
-    _registrar(banco, grupo, sel, gate_reprovado, dossie_parcial, edge, gates, resumo, chave=chave)
+    _registrar(banco, grupo, sel, gate_reprovado, dossie_parcial, edge, gates, resumo,
+               chave=chave, rastrear_forcado=rastrear_forcado)
     chaves_abortos.add(chave)
+
+
+def _registrar_candidato_sombra(banco, grupo, sel, dossie_parcial, resumo: ResumoL1,
+                                *, chave: str, chaves_abortos: set[str]) -> None:
+    """candidato_sombra (achado 8): passou TODOS os gates mecânicos, mas o mercado
+    (liga, mercado) está em 'backtest' (calibração) — não homologado. Registrado em
+    `abortos_l1` com gate='mercado_nao_homologado' e clv_rastrear=True: acompanhado ATÉ
+    o fechamento SÓ para medir CLV (alimenta E6.4 / homologação). JAMAIS vira sinal,
+    status 'confirmado' ou cartão de execução (Doutrina P2). Deduplicado como qualquer
+    aborto (achado 7) — um candidato persistente não vira um registro por ciclo."""
+    if chave in chaves_abortos:
+        resumo.pulados.append(
+            f"{grupo.evento_id}/{grupo.mercado}/{sel}: candidato_sombra já registrado (dedup)")
+        return
+    _registrar(banco, grupo, sel, "mercado_nao_homologado", dossie_parcial, 0.0, None,
+               resumo, chave=chave, rastrear_forcado=True)
+    chaves_abortos.add(chave)
+    resumo.candidatos_sombra += 1
+
+
+def _marcar_grupo_nao_autorizado(banco, grupo, status: Optional[str], resumo: ResumoL1,
+                                 *, chaves_abortos: set[str]) -> None:
+    """Mercado (liga, mercado) NÃO autorizado a operar (Doutrina P2 / achado 8):
+    'suspenso'/'caducado' (retirada/expiração explícita) ou SEM linha em
+    `mercados_homologados`. A ausência é FALHA DE CONFIGURAÇÃO — fail-loud, jamais
+    licença implícita para calibrar. Em nenhum dos casos se roda gate ou se gera
+    candidato: o grupo é pulado e um marcador único (dedup por grupo) vai ao log de
+    abortos (P7). Não rastreia CLV (não é oportunidade a medir, é bloqueio de escopo)."""
+    liga = grupo.evento.get("liga", "")
+    if status in ("suspenso", "caducado"):
+        gate = f"mercado_{status}"
+        _log.warning("mercado não homologado (retirado) — L1 não opera (P2)",
+                     extra={"liga": liga, "mercado": grupo.mercado, "status": status})
+    else:
+        gate = "mercado_nao_configurado"
+        _log.warning("mercado SEM homologação configurada — falha de configuração (P2), "
+                     "não é licença implícita para calibrar",
+                     extra={"liga": liga, "mercado": grupo.mercado})
+    chave_grupo = f"{grupo.evento_id}|{grupo.mercado}|__homolog__|{gate}"
+    if chave_grupo in chaves_abortos:
+        resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}: {gate} (dedup)")
+        return
+    registrar_aborto(
+        banco, gatilho="homologacao", gate_reprovado=gate,
+        dossie_parcial={"evento_id": grupo.evento_id, "mercado": grupo.mercado,
+                        "linha": grupo.linha, "liga": liga, "status_homologacao": status},
+        evento_id=grupo.evento_id, clv_rastrear=False, chave_candidato=chave_grupo,
+    )
+    chaves_abortos.add(chave_grupo)
+    resumo.abortos += 1
+    resumo.nao_autorizados += 1
 
 
 def _serie_1h(serie: list[PontoSerie], agora: datetime) -> list[dict[str, Any]]:
@@ -573,6 +669,13 @@ def rodar_l1(
     _abortos = getattr(banco, "chaves_abortos_desde", None)
     chaves_abortos: set[str] = set(_abortos(desde)) if _abortos else set()
 
+    # Gate de homologação de mercado (Doutrina P2 / achado 8): só mercado 'homologado'
+    # gera sinal; 'backtest' vira candidato_sombra (só CLV). Mapa ausente (banco sem o
+    # método) → {} → TODO mercado cai em "falha de configuração" (fail-closed: P2 não
+    # autoriza calibração implícita — nenhum sinal sem homologação declarada).
+    _homolog = getattr(banco, "homologacao_mercados", None)
+    homolog: dict[tuple[str, str], str] = _homolog() if _homolog else {}
+
     exposicao_aberta = banco.exposicao_aberta()
     grupos = agrupar_snapshots(snaps, casas, eventos)
     for grupo in grupos:
@@ -582,11 +685,13 @@ def rodar_l1(
         exposto = _exposto_do_evento(exposicao_aberta, grupo.evento_id, ev.get("liga", ""), dia)
         avaliar_grupo(banco, grupo, casas, gates, banca=banca, banca_origem=banca_origem,
                       exposto=exposto, agora=agora, politica=politica,
-                      venues_executaveis=venues_executaveis, chaves_abertas=chaves_abertas,
-                      chaves_abortos=chaves_abortos, resumo=resumo)
+                      venues_executaveis=venues_executaveis, homolog=homolog,
+                      chaves_abertas=chaves_abertas, chaves_abortos=chaves_abortos, resumo=resumo)
 
     banco.pulsar(DAEMON, {"grupos": resumo.grupos, "sinais": resumo.sinais,
                           "abortos": resumo.abortos, "rastreados_clv": resumo.rastreados_clv,
+                          "candidatos_sombra": resumo.candidatos_sombra,
+                          "nao_autorizados": resumo.nao_autorizados,
                           "politica_venue": politica.value, "banca_origem": banca_origem})
     _log.info("ciclo L1 concluído", extra={"grupos": resumo.grupos, "sinais": resumo.sinais,
                                            "abortos": resumo.abortos})

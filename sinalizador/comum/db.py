@@ -23,6 +23,7 @@ Operações expostas:
   - evento_por_id_externo() / saude_daemons() / clv_global()                       leituras
   - snapshots_desde() / casas_ativas() / eventos_por_ids() / banca_atual()          leituras (L1)
   - chaves_sinais_abertos() / chaves_abortos_desde()                               anti-duplicidade (L1)
+  - homologacao_mercados()                                                          gate de homologação (L1, P2)
   - sinais_aguardando_crivo()                                                        leitura (L2)
   - sinais_por_status() / crivo_do_sinal() / ultimo_snapshot_venue() /
     notificacoes_do_sinal() / notificacoes_pendentes()                              leituras (L3)
@@ -178,6 +179,30 @@ class Banco:
             .execute()
         )
         return {r["chave_candidato"] for r in (resp.data or []) if r.get("chave_candidato")}
+
+    def homologacao_mercados(self) -> dict[tuple[str, str], str]:
+        """Status de homologação por (liga, mercado) — Doutrina P2 / achado 8.
+
+        Chave canônica: (`eventos.liga`, mercado em {'1x2','ah','ou'} — o mesmo string
+        que o L0 grava em `odds_snapshots.mercado`; o comentário do schema 0001
+        ('ou_gols') é ilustrativo, não há CHECK em `mercado`). Valor = `status`
+        ('backtest'|'homologado'|'suspenso'|'caducado'); `suspenso_em` preenchido força
+        'suspenso'. Só 'homologado' autoriza o caminho normal (L2/L3); 'backtest' →
+        candidato_sombra (só CLV). A AUSÊNCIA de linha NÃO aparece aqui — o L1 a trata
+        como falha de configuração (P2 não autoriza calibração implícita)."""
+        resp = (
+            self._c.table("mercados_homologados")
+            .select("liga,mercado,status,suspenso_em")
+            .execute()
+        )
+        out: dict[tuple[str, str], str] = {}
+        for r in (resp.data or []):
+            liga, mercado = r.get("liga"), r.get("mercado")
+            if not liga or not mercado:
+                continue
+            status = "suspenso" if r.get("suspenso_em") else (r.get("status") or "")
+            out[(str(liga), str(mercado))] = status
+        return out
 
     def sinais_aguardando_crivo(self, limite: int = 50) -> list[dict[str, Any]]:
         """Fila do L2: sinais com status 'aguardando_crivo' (mais antigos primeiro)."""

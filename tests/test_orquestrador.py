@@ -35,6 +35,14 @@ EVENTOS = [{"id": "ev1", "liga": "Premier League", "mandante": "A", "visitante":
 
 REF_1X2 = [("1", 2.0), ("X", 3.5), ("2", 4.0)]
 
+# Homologação padrão (achado 8): os mercados usados nos testes de sinal já homologados
+# (liga "Premier League"). Testes de sombra/não-autorização passam um mapa próprio.
+HOMOLOG_PADRAO = {
+    ("Premier League", "1x2"): "homologado",
+    ("Premier League", "ah"): "homologado",
+    ("Premier League", "ou"): "homologado",
+}
+
 
 def _p1():
     probs, _ = devig_shin([o for _, o in REF_1X2])
@@ -43,7 +51,8 @@ def _p1():
 
 class BancoFake:
     def __init__(self, snaps, *, banca=1000.0, exposicao=None, banca_papel=None,
-                 kill_switch=False, venues_exec=None, abertas=None, abortos=None):
+                 kill_switch=False, venues_exec=None, abertas=None, abortos=None,
+                 homologados=None):
         self._snaps = snaps
         self._banca = banca
         self._exposicao = exposicao or []
@@ -52,6 +61,9 @@ class BancoFake:
         self._venues_exec = venues_exec   # lista de chaves (allowlist), ou None
         self._abertas = set(abertas or ())   # chaves de candidato com sinal aberto (achado 7)
         self._abortos = set(abortos or ())   # chaves de candidato já abortadas na janela
+        # achado 8: mapa (liga, mercado)→status de mercados_homologados. None = padrão
+        # (mercados dos testes homologados). {} = nenhum homologado (falha de config).
+        self._homologados = HOMOLOG_PADRAO if homologados is None else homologados
         self.inseridos = []
         self.pulsos = []
 
@@ -60,6 +72,9 @@ class BancoFake:
 
     def chaves_abortos_desde(self, ts_iso):
         return set(self._abortos)
+
+    def homologacao_mercados(self):
+        return dict(self._homologados)
 
     def config_vigente(self, chave):
         if chave == "banca_papel" and self._banca_papel is not None:
@@ -342,3 +357,72 @@ def test_banca_de_papel_dimensiona_quando_ledger_vazio():
     assert sinal["dossie"]["banca_origem"] == "papel"
     assert sinal["stake_pct"] > 0  # dimensionou sobre a banca de papel
     assert banco.pulsos[-1][1]["banca_origem"] == "papel"
+
+
+# ---- achado 8: gate de homologação de mercado (Doutrina P2) ----
+
+def test_mercado_backtest_vira_candidato_sombra_nao_sinal():
+    # achado 8: mercado em 'backtest' (calibração) que passa em TODOS os gates NÃO vira
+    # sinal — vira candidato_sombra: aborto com gate 'mercado_nao_homologado' e
+    # clv_rastrear=True (só CLV, alimenta E6.4), jamais confirmado/cartão (P2).
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)  # edge > 2%
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps, homologados={("Premier League", "1x2"): "backtest"})
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+
+    assert r.sinais == 0                       # nada enfileirado como sinal
+    assert banco.por_tabela("sinais") == []
+    assert r.candidatos_sombra == 1 and r.rastreados_clv == 1
+    aborto = banco.por_tabela("abortos_l1")[0]
+    assert aborto["gate_reprovado"] == "mercado_nao_homologado"
+    assert aborto["clv_rastrear"] is True
+    assert aborto["chave_candidato"] == chave_candidato("ev1", "1x2", None, "1", "c-bf")
+    assert banco.pulsos[-1][1]["candidatos_sombra"] == 1
+
+
+def test_mercado_sem_homologacao_e_falha_de_config_pula_grupo():
+    # achado 8: sem linha em mercados_homologados = FALHA DE CONFIGURAÇÃO (fail-loud),
+    # não licença para calibrar. O grupo é pulado (nem sinal, nem candidato_sombra);
+    # marcador 'mercado_nao_configurado' no log de abortos (sem rastrear CLV).
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps, homologados={})   # nenhum mercado configurado
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+
+    assert r.sinais == 0 and r.candidatos_sombra == 0
+    assert r.nao_autorizados == 1 and r.rastreados_clv == 0
+    assert banco.por_tabela("sinais") == []
+    aborto = banco.por_tabela("abortos_l1")[0]
+    assert aborto["gate_reprovado"] == "mercado_nao_configurado"
+    assert aborto["clv_rastrear"] is False
+    assert banco.pulsos[-1][1]["nao_autorizados"] == 1
+
+
+def test_mercado_suspenso_nao_gera_sinal_nem_sombra():
+    # achado 8: mercado 'suspenso' (retirada explícita) não opera — nem candidato_sombra.
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps, homologados={("Premier League", "1x2"): "suspenso"})
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+
+    assert r.sinais == 0 and r.candidatos_sombra == 0 and r.nao_autorizados == 1
+    assert banco.por_tabela("abortos_l1")[0]["gate_reprovado"] == "mercado_suspenso"
+
+
+def test_candidato_sombra_deduplicado_na_janela():
+    # achado 8 + 7: candidato_sombra cujo candidato já foi registrado na janela não
+    # re-registra (um por ciclo, não um por minuto).
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    chave = chave_candidato("ev1", "1x2", None, "1", "c-bf")
+    banco = BancoFake(snaps, homologados={("Premier League", "1x2"): "backtest"},
+                      abortos={chave})
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+
+    assert r.candidatos_sombra == 0 and r.abortos == 0
+    assert banco.por_tabela("abortos_l1") == []
+    assert any("candidato_sombra já registrado" in m for m in r.pulados)
