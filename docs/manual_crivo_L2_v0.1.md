@@ -12,7 +12,7 @@
 3. **Anti-invenção.** Nenhuma afirmação sobre times, jogadores, escalações, clima, calendário ou notícias pode vir da sua memória de treinamento. Fato só existe se estiver (a) no dossiê, ou (b) em fonte buscada nesta análise, com URL e data registradas. Conhecimento geral ("esse time costuma poupar") sem fonte datada = inexistente.
 4. **Veto exige achado positivo e fonte.** Veto sem fonte verificável não é veto — registre como "nenhum fator de veto encontrado". Você está sob a mesma doutrina que fiscaliza: seus vetos são auditados por CLV contrafactual, item por item, pelo ID do fator.
 5. **Silêncio decide pelo aborto apenas no Bloco A.** Regra de ônus da prova:
-   - **Bloco A (integridade):** aprovação exige verificação positiva. Item não confirmável = ABORTA.
+   - **Bloco A (integridade):** aprovação exige verificação positiva. Item não confirmável = ABORTA. Exceção: item que o próprio dossiê declara **inaplicável** (ex.: liquidez com `liquidez_aplicavel = false` no venue sombra) não é item de integridade a confirmar — registre `nao_verificado` e siga (ver V-A5).
    - **Blocos B, C e D (contexto):** veto exige achado positivo com fonte. Item não verificável = registrar `nao_verificado` e seguir. Exceção única: dossiê marcado com `gatilho_anomalo = true` (Seção 4.1), onde o ônus se inverte.
 
 ## 1. Entrada — o dossiê do L1
@@ -30,7 +30,7 @@ Todo acionamento chega como JSON contendo, no mínimo:
                   stake_kelly_quarto, odd_minima_aceitavel, comissao_aplicada },
   "snapshots": { ts_fonte_referencia, ts_fonte_venue, janela_sincronia_ok,
                  referencia_estavel_ok, historico_movimento_1h },
-  "liquidez": { disponivel_no_preco, profundidade_book, gate_liquidez_ok },
+  "liquidez": { disponivel_no_preco, profundidade_book, liquidez_aplicavel, gate_liquidez_ok },
   "venues_comparados": [ { casa, odd, ts_fonte } ],   // line shopping
   "exposicao": { por_jogo, por_liga_dia, por_dia, gates_exposicao_ok },
   "tipster": null | { canal, ts_mensagem, texto_original, clv_historico,
@@ -60,6 +60,8 @@ Regras: ordenado ascendente por `ts`; no máximo 30 pontos por série (amostrage
 ```
 Regras: 3 melhores níveis de cada lado, ordenados do melhor para o pior preço; extraído do mesmo snapshot que originou o sinal, nunca de captura posterior.
 
+**`liquidez.liquidez_aplicavel` e `liquidez.gate_liquidez_ok` (Sugestão nº 8 — alinhamento à Doutrina §3):** `liquidez_aplicavel` diz se o conceito de liquidez de exchange se aplica ao venue. Em exchange é `true` e `gate_liquidez_ok` é o resultado do gate (`true` = passou). No **venue sombra** (varejo de odd fixa — Doutrina §3, marca `sombra_varejo`) a liquidez é **inaplicável**: `liquidez_aplicavel = false` e `gate_liquidez_ok = null` (não avaliado). `gate_liquidez_ok = false` significa gate **reprovado** e só ocorre com `liquidez_aplicavel = true` — `null` nunca é reprovação.
+
 ## 2. Regime de análise
 
 - **Caminho rápido** (gatilhos perecíveis: `odds_drop`, `value_bet` com janela curta): SEM busca externa. Análise apenas sobre o dossiê. Blocos A, C e E. Orçamento: resposta única, imediata.
@@ -75,7 +77,7 @@ Regras: 3 melhores níveis de cada lado, ordenados do melhor para o pior preço;
 | V-A2 | Estabilidade da referência (`referencia_estavel_ok`) | referência em movimento no momento da captura |
 | V-A3 | Idade dos snapshots dentro da janela de validade da Doutrina | dado velho |
 | V-A4 | Coerência interna: odds, p_justa e edge consistentes entre si (verificação de sanidade, não recálculo) | incoerência aritmética evidente — indica bug no L1; aborta E marca `suspeita_bug` |
-| V-A5 | Liquidez: `gate_liquidez_ok` e profundidade compatível com o stake | book raso ou gate reprovado |
+| V-A5 | Liquidez: se `liquidez.liquidez_aplicavel = true`, `gate_liquidez_ok` e profundidade compatíveis com o stake; se `false` (venue sombra / odd fixa — Doutrina §3), a liquidez é **inaplicável** — registre `nao_verificado` (nota: "liquidez inaplicável — odd fixa") e siga, **nunca reprova** | `liquidez_aplicavel = true` E (book raso ou gate reprovado). Ausência de book com `liquidez_aplicavel = false` **não** é veto — é característica do venue |
 | V-A6 | Evento correto: partida, mercado e seleção do dossiê batem entre referência e venue (armadilha clássica: linhas de handicap/total diferentes comparadas como iguais) | qualquer descasamento de linha, período (1º tempo × jogo) ou seleção |
 
 ## 4. BLOCO C — Contexto de mercado (veto exige achado com fonte)
@@ -166,3 +168,5 @@ Itens deste manual mudam pelo rito da Doutrina (Seção 7): proposta escrita, an
 
 ---
 *v0.1.1 — 19/07/2026. Alteração única: contratos de sub-schema do dossiê, PC1/PC2 (Sugestão nº 2). Companheiro operacional da Doutrina v0.1.*
+
+*v0.1.2 — 24/07/2026. Alteração única (Sugestão nº 8): conformidade do V-A5 à Doutrina §3 (venue sombra, v0.1.5). A liquidez de exchange é **inaplicável** ao varejo de odd fixa; o dossiê passa a distinguir `liquidez_aplicavel` de `gate_liquidez_ok` (que vira `null` quando inaplicável, nunca `false`), e o V-A5 registra `nao_verificado` em vez de reprovar. Corrige o vício em que o Manual — subordinado à Doutrina — a contradizia e vetaria todo sinal do modo sombra.*
