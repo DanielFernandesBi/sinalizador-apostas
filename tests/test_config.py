@@ -50,3 +50,19 @@ def test_exigir_falha_alto_quando_ausente():
 def test_exigir_oddspapi_ausente_por_padrao():
     with pytest.raises(SegredoAusenteError):
         _cfg().exigir("oddspapi_api_key")
+
+
+def test_dotenv_vence_variavel_do_so(tmp_path, monkeypatch):
+    """O `.env` do projeto tem prioridade sobre a env var do SO — assim a
+    SUPABASE_URL global de OUTRO projeto não sequestra este (bug real, 22/07)."""
+    env = tmp_path / ".env"
+    env.write_text(
+        "SUPABASE_URL=https://certo.supabase.co\n"
+        "SUPABASE_SERVICE_ROLE_KEY=chave-do-projeto\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SUPABASE_URL", "https://outro-projeto.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "chave-de-outro-projeto")
+    cfg = Config(_env_file=str(env))  # type: ignore[call-arg]
+    assert cfg.supabase_url == "https://certo.supabase.co"
+    assert cfg.supabase_service_role_key == "chave-do-projeto"

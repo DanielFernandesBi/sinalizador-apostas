@@ -10,6 +10,15 @@ ELE consome, nunca pelos das outras camadas.
 
 A carga é preguiçosa (`carregar_config()`), então importar o módulo não exige o
 `.env` presente — só chamá-lo exige (e só os universais).
+
+PRECEDÊNCIA (importante): o **`.env` do projeto vence a variável de ambiente do
+SO**. O padrão do pydantic-settings é o contrário (env do SO > `.env`), o que já
+sequestrou este projeto uma vez — uma variável global `SUPABASE_URL` de OUTRO
+projeto apontava para outro Supabase e o `.env` correto era ignorado (host morto →
+`getaddrinfo failed`). Aqui cada projeto é dono do seu `.env`: variável global de
+outro projeto não interfere. Em servidor sem `.env` (VPS/CI), a env do SO segue
+valendo (a fonte `.env` fica vazia). `init` (kwargs, usados em teste) continua no
+topo.
 """
 from __future__ import annotations
 
@@ -17,7 +26,11 @@ from functools import lru_cache
 from typing import Optional
 
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 
 class SegredoAusenteError(RuntimeError):
@@ -30,6 +43,19 @@ class Config(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # `.env` ANTES da env do SO: o projeto é dono da sua config, imune à
+        # interferência de variáveis globais de outros projetos (ver docstring).
+        return (init_settings, dotenv_settings, env_settings, file_secret_settings)
 
     # Universais — toda camada fala com o banco. Obrigatórios na carga.
     supabase_url: str = Field(..., description="URL do projeto Supabase próprio")
