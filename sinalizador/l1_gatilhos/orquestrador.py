@@ -432,6 +432,14 @@ def rodar_l1(
     eventos = {e["id"]: e for e in banco.eventos_por_ids(evento_ids)}
 
     banca_row = banco.banca_atual()
+    # P9 (kill switch) — achado 4 da auditoria: drawdown ≥ suspensão SUSPENDE a
+    # EMISSÃO de sinais. A trava é aqui, DURA, antes de dimensionar qualquer coisa:
+    # o alerta do L3 chega depois: se o L1 não parar aqui, ele já teria enfileirado
+    # sinais novos. A captura (L0) e o CLV (L4) seguem — só a emissão para (Doutrina §P9).
+    if banca_row and banca_row.get("kill_switch"):
+        _log.warning("kill switch ativo (drawdown ≥ suspensão) — L1 não emite sinais (P9)")
+        banco.pulsar(DAEMON, {"grupos": 0, "sinais": 0, "abortos": 0, "motivo": "kill_switch"})
+        return resumo
     banca = float(banca_row["saldo"]) if banca_row and banca_row.get("saldo") is not None else None
     banca_origem = "real"
     if not banca or banca <= 0:

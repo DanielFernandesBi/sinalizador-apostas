@@ -41,11 +41,12 @@ def _p1():
 
 
 class BancoFake:
-    def __init__(self, snaps, *, banca=1000.0, exposicao=None, banca_papel=None):
+    def __init__(self, snaps, *, banca=1000.0, exposicao=None, banca_papel=None, kill_switch=False):
         self._snaps = snaps
         self._banca = banca
         self._exposicao = exposicao or []
         self._banca_papel = banca_papel   # valor (str) da config_sistema, ou None
+        self._kill_switch = kill_switch   # espelha vw_banca.kill_switch (P9)
         self.inseridos = []
         self.pulsos = []
 
@@ -64,7 +65,8 @@ class BancoFake:
         return [e for e in EVENTOS if e["id"] in ids]
 
     def banca_atual(self):
-        return {"saldo": self._banca} if self._banca is not None else None
+        # vw_banca só tem linha quando há ledger; carrega o kill_switch (P9).
+        return {"saldo": self._banca, "kill_switch": self._kill_switch} if self._banca is not None else None
 
     def exposicao_aberta(self):
         return self._exposicao
@@ -197,6 +199,19 @@ def test_anomalia_marca_caminho_profundo():
     sinal = banco.por_tabela("sinais")[0]
     assert sinal["gatilho_anomalo"] is True
     assert sinal["dossie"]["caminho"] == "profundo"
+
+
+def test_kill_switch_suspende_emissao():
+    # P9 (achado 4): drawdown ≥ suspensão → o L1 NÃO emite sinais, mesmo com um
+    # sinal que passaria em tudo. A captura/CLV seguem (fora do L1); só a emissão para.
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps, kill_switch=True)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    assert r.sinais == 0 and r.abortos == 0
+    assert banco.por_tabela("sinais") == []               # nada enfileirado
+    assert banco.pulsos[-1][1]["motivo"] == "kill_switch"  # pulsou o motivo
 
 
 def test_sem_banca_real_nem_papel_nao_gera_nada():
