@@ -278,7 +278,11 @@ def _montar_dossie(
     liquidez: dict[str, Any] = {
         "disponivel_no_preco": liquidez_disp,
         "profundidade_book": None,
-        "gate_liquidez_ok": bool(aplica_liquidez),
+        # Sugestão nº 8: distingue "inaplicável" de "reprovado". No varejo sombra a
+        # liquidez é inaplicável (Doutrina §3) → gate_liquidez_ok=None (não avaliado),
+        # jamais False (que o V-A5 leria como reprovação e vetaria todo sinal sombra).
+        "liquidez_aplicavel": bool(aplica_liquidez),
+        "gate_liquidez_ok": True if aplica_liquidez else None,
     }
     if politica is PoliticaVenue.RETAIL_SOMBRA and not aplica_liquidez:
         liquidez["sombra_varejo"] = True  # extra="allow": marca o desvio no dossiê

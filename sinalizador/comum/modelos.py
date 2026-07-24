@@ -117,7 +117,13 @@ class Liquidez(_BaseDossie):
     disponivel_no_preco: float
     # PC2 (Sugestão nº 2). null quando o venue não é exchange.
     profundidade_book: Optional[ProfundidadeBook] = None
-    gate_liquidez_ok: bool
+    # Sugestão nº 8: liquidez inaplicável no venue sombra (varejo de odd fixa) —
+    # alinha o contrato à Doutrina §3 (v0.1.5, venue sombra). Quando
+    # `liquidez_aplicavel=False`, `gate_liquidez_ok` é `None` (NÃO avaliado, NÃO
+    # reprovado): V-A5 do Manual não reprova o sinal sombra. Em exchange,
+    # `liquidez_aplicavel=True` e `gate_liquidez_ok` reflete o gate (True = passou).
+    liquidez_aplicavel: bool = True
+    gate_liquidez_ok: Optional[bool] = None
 
 
 class VenueComparado(_BaseDossie):

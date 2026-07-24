@@ -102,6 +102,11 @@ def test_sinal_ponta_a_ponta_exchange():
     assert sinal["selecao"] == "1" and sinal["casa_venue_id"] == "c-bf"
     assert sinal["edge_liquido_pct"] >= 2.0
     assert banco.pulsos[0][0] == "l1"
+    # Sugestão nº 8: em exchange a liquidez é aplicável e o gate passou (sinal só
+    # nasce após aprovação); nada de marca sombra.
+    liq = sinal["dossie"]["liquidez"]
+    assert liq["liquidez_aplicavel"] is True and liq["gate_liquidez_ok"] is True
+    assert "sombra_varejo" not in liq
 
 
 def test_near_miss_edge_gera_aborto_com_clv_rastrear():
@@ -171,7 +176,10 @@ def test_retail_sombra_gera_sinal_e_marca_desvio():
     r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
     assert r.sinais == 1  # gate de liquidez inaplicável a varejo
     dossie = banco.por_tabela("sinais")[0]["dossie"]
-    assert dossie["liquidez"]["gate_liquidez_ok"] is False
+    # Sugestão nº 8: inaplicável ≠ reprovado. gate_liquidez_ok=None (não avaliado),
+    # nunca False — senão o V-A5 do L2 vetaria todo sinal sombra.
+    assert dossie["liquidez"]["liquidez_aplicavel"] is False
+    assert dossie["liquidez"]["gate_liquidez_ok"] is None
     assert dossie["liquidez"]["sombra_varejo"] is True
 
 
