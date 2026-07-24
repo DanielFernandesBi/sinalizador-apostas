@@ -13,8 +13,7 @@ Operações expostas:
   - inserir_muitos(tabela, registros)      INSERT em lote (N linhas em 1 POST)
   - pulsar(daemon, detalhe)                heartbeat (INSERT em heartbeats)
   - transicionar_status_sinal(...)         única mutação de `sinais` (a partir de aguardando_crivo)
-  - liquidar_aposta(...)                   única mutação de `apostas` (pendente -> final)
-  - registrar_aposta(...) / liquidar_e_lancar(...)   E5.3/E5.4: aposta + banca_ledger
+  - registrar_aposta(...) / liquidar_e_lancar(...)   E5.3/E5.4: TRANSACIONAIS (RPC, migration 0004)
   - fechar_tip(...)                        único preenchimento de fechamento em `tips`
   - marcar_notificacao_entregue(id)        `notificacoes` aceita UPDATE (não é append-only)
   - marcar_evento_encerrado(id)            `eventos.status` (L4: sai da fila de fechamento)
@@ -38,6 +37,7 @@ from typing import Any, Optional
 from supabase import Client, create_client
 
 from .config import carregar_config
+from .dinheiro import centavos, dec, validar_odd, validar_stake
 
 # Espelham os CHECKs / triggers do schema 0001.
 _STATUS_SINAL_PERMITIDOS = {"confirmado", "vetado", "expirado", "erro"}
@@ -331,33 +331,52 @@ class Banco:
         self._c.table("eventos").update({"status": "encerrado"}).eq("id", evento_id).execute()
 
     def registrar_aposta(
-        self, *, sinal_id: str, casa_id: str, odd_executada: float, stake_valor: float, saldo_antes: float
+        self, *, sinal_id: str, casa_id: str, odd_executada: Any, stake_valor: Any
     ) -> dict[str, Any]:
-        """E5.3 — registra a execução humana: INSERT em `apostas` + lançamento
-        'aposta' no `banca_ledger` (saldo debitado do stake). Ambos append-only."""
-        aposta = self.inserir("apostas", {
-            "sinal_id": sinal_id, "casa_id": casa_id,
-            "odd_executada": odd_executada, "stake_valor": stake_valor,
-        })
-        self.inserir("banca_ledger", {
-            "tipo": "aposta", "valor": -abs(stake_valor), "aposta_id": aposta.get("id"),
-            "motivo": f"execução do sinal {sinal_id}", "saldo_apos": saldo_antes - abs(stake_valor),
-        })
-        return aposta
+        """E5.3 — registra a execução humana: aposta + débito do STAKE no ledger,
+        em UMA TRANSAÇÃO (`fn_registrar_aposta`, migration 0004).
 
-    def liquidar_e_lancar(
-        self, *, aposta_id: str, resultado: str, retorno_liquido: float, saldo_antes: float
-    ) -> dict[str, Any]:
-        """E5.4 — liquida a aposta (única transição) + lançamento 'liquidacao' no
-        ledger (crédito do retorno). Usa `liquidar_aposta` (espelha o trigger)."""
-        ap = self.liquidar_aposta(aposta_id, resultado, retorno_liquido)
-        self.inserir("banca_ledger", {
-            "tipo": "liquidacao", "valor": retorno_liquido, "aposta_id": aposta_id,
-            "motivo": f"liquidação {resultado}", "saldo_apos": saldo_antes + retorno_liquido,
+        Antes eram dois POSTs separados: falha entre eles deixava a banca
+        inconsistente — e a imutabilidade (P7) impede reparar com UPDATE/DELETE. O
+        saldo é lido DENTRO da transação (com lock), não pelo app antes de chamar
+        (TOCTOU). Devolve {'aposta': {...}, 'saldo': novo_saldo}.
+        """
+        validar_odd(odd_executada)
+        validar_stake(stake_valor)
+        return self._rpc("fn_registrar_aposta", {
+            "p_sinal_id": sinal_id, "p_casa_id": casa_id,
+            "p_odd": str(dec(odd_executada)), "p_stake": str(centavos(stake_valor)),
         })
-        return ap
+
+    def liquidar_e_lancar(self, *, aposta_id: str, resultado: str) -> dict[str, Any]:
+        """E5.4 — liquida a aposta + crédito do PAYOUT BRUTO no ledger, em UMA
+        TRANSAÇÃO (`fn_liquidar_aposta`, migration 0004).
+
+        O payout é DERIVADO no banco de (resultado, stake, odd) — nunca digitado: o
+        valor manual era a origem do erro contábil (debitava-se o stake e creditava-se
+        só o lucro, de modo que uma green de R$20 @ 2,05 movia a banca +R$1 em vez de
+        +R$21). Devolve {'payout_bruto', 'lucro_liquido', 'saldo', ...}. Recusa (erro
+        do banco) se a aposta já estiver liquidada — a liquidação é única.
+        """
+        if resultado not in _RESULTADO_APOSTA_FINAL:
+            raise ValueError(
+                f"resultado de aposta inválido: {resultado!r} "
+                f"(permitidos: {sorted(_RESULTADO_APOSTA_FINAL)})"
+            )
+        return self._rpc("fn_liquidar_aposta", {
+            "p_aposta_id": aposta_id, "p_resultado": resultado,
+        })
 
     # ---------------- ESCRITA: apenas o permitido ----------------
+
+    def _rpc(self, funcao: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Chama uma função SQL (RPC). É assim que as operações TRANSACIONAIS da
+        banca acontecem: o Postgres executa registro/liquidação inteiros dentro de
+        UMA transação — ou grava tudo, ou nada (migration 0004). Um erro levantado
+        pela função (stake ≤ 0, aposta já liquidada, violação de idempotência)
+        desfaz a transação e sobe como exceção aqui."""
+        resp = self._c.rpc(funcao, params).execute()
+        return resp.data if isinstance(resp.data, dict) else {"retorno": resp.data}
 
     def inserir(self, tabela: str, registro: dict[str, Any]) -> dict[str, Any]:
         """INSERT append-only. Não há update/delete equivalente por desenho."""
@@ -413,34 +432,10 @@ class Banco:
             )
         return atualizados[0]
 
-    def liquidar_aposta(
-        self, aposta_id: str, resultado: str, retorno_liquido: float
-    ) -> dict[str, Any]:
-        """Única mutação de `apostas`: liquidação única (pendente -> final)."""
-        if resultado not in _RESULTADO_APOSTA_FINAL:
-            raise ValueError(
-                f"resultado de aposta inválido: {resultado!r} "
-                f"(permitidos: {sorted(_RESULTADO_APOSTA_FINAL)})"
-            )
-        resp = (
-            self._c.table("apostas")
-            .update(
-                {
-                    "resultado": resultado,
-                    "retorno_liquido": retorno_liquido,
-                    "liquidada_em": _agora_utc_iso(),
-                }
-            )
-            .eq("id", aposta_id)
-            .eq("resultado", "pendente")
-            .execute()
-        )
-        atualizados = resp.data or []
-        if not atualizados:
-            raise EstadoInesperadoError(
-                f"aposta {aposta_id} não estava 'pendente' — a liquidação é única"
-            )
-        return atualizados[0]
+    # `liquidar_aposta` (UPDATE cru em `apostas`) foi REMOVIDO pela migration 0004:
+    # liquidar sem lançar no ledger, ou lançar sem liquidar, é justamente a falha
+    # parcial que corrompia a banca. A liquidação só existe como transação completa —
+    # `liquidar_e_lancar`. O verbo perigoso simplesmente não existe aqui (regra 7).
 
     def fechar_tip(
         self, tip_id: int, odd_fechamento_ref: float, clv_pct: float

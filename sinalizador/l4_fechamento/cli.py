@@ -3,7 +3,11 @@
     python -m sinalizador.l4_fechamento.cli fechar --once          # E5.1/E5.2
     python -m sinalizador.l4_fechamento.cli relatorio [--enviar]   # E5.5
     python -m sinalizador.l4_fechamento.cli apostei --sinal <id> --casa <id> --odd 2.05 --stake 20   # E5.3
-    python -m sinalizador.l4_fechamento.cli liquidei --aposta <id> --resultado green --retorno 21    # E5.4
+    python -m sinalizador.l4_fechamento.cli liquidei --aposta <id> --resultado green                # E5.4
+
+O `liquidei` NÃO recebe valor: o payout bruto é derivado de (resultado, stake, odd)
+dentro da transação do banco (migration 0004). Digitar o retorno à mão era a origem
+do erro contábil — e do risco de erro humano a cada liquidação.
 """
 from __future__ import annotations
 
@@ -22,14 +26,6 @@ from .clv import rodar_fechamento
 from .relatorio import formatar_relatorio
 
 _log = logging.getLogger("l4.cli")
-
-
-def _saldo(banco: Banco) -> float:
-    banca = banco.banca_atual()
-    try:
-        return float(banca["saldo"]) if banca and banca.get("saldo") is not None else 0.0
-    except (TypeError, ValueError):
-        return 0.0
 
 
 def _cmd_fechar(banco: Banco, args) -> int:
@@ -62,20 +58,23 @@ def _cmd_relatorio(banco: Banco, args) -> int:
 
 
 def _cmd_apostei(banco: Banco, args) -> int:
-    ap = banco.registrar_aposta(
-        sinal_id=args.sinal, casa_id=args.casa, odd_executada=args.odd,
-        stake_valor=args.stake, saldo_antes=_saldo(banco),
+    r = banco.registrar_aposta(
+        sinal_id=args.sinal, casa_id=args.casa,
+        odd_executada=args.odd, stake_valor=args.stake,
     )
-    print(f"[l4] aposta registrada id={ap.get('id')} stake={args.stake} @ {args.odd}")
+    ap = r.get("aposta") or {}
+    print(f"[l4] aposta registrada id={ap.get('id')} stake={args.stake} @ {args.odd} "
+          f"| stake debitado — saldo={r.get('saldo')}")
     return 0
 
 
 def _cmd_liquidei(banco: Banco, args) -> int:
-    banco.liquidar_e_lancar(
-        aposta_id=args.aposta, resultado=args.resultado,
-        retorno_liquido=args.retorno, saldo_antes=_saldo(banco),
-    )
-    print(f"[l4] aposta {args.aposta} liquidada: {args.resultado} retorno={args.retorno}")
+    # Sem `--retorno`: o payout BRUTO é derivado no banco de (resultado, stake, odd),
+    # dentro da mesma transação que grava a liquidação (migration 0004).
+    r = banco.liquidar_e_lancar(aposta_id=args.aposta, resultado=args.resultado)
+    print(f"[l4] aposta {args.aposta} liquidada: {args.resultado} "
+          f"| payout bruto={r.get('payout_bruto')} lucro={r.get('lucro_liquido')} "
+          f"saldo={r.get('saldo')}")
     return 0
 
 
@@ -101,7 +100,6 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--aposta", required=True)
     pl.add_argument("--resultado", required=True,
                     choices=["green", "red", "void", "meio_green", "meio_red"])
-    pl.add_argument("--retorno", type=float, required=True, help="retorno líquido (com sinal)")
 
     args = ap.parse_args(argv)
     banco = Banco()
