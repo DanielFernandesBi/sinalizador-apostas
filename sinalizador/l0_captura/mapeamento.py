@@ -107,6 +107,25 @@ def _selecao(mercado: str, nome: str, home: str, away: str) -> Optional[str]:
     return None
 
 
+def _linha_canonica(mercado: str, selecao: str, point: Any) -> Optional[float]:
+    """Linha canônica SEMPRE sob a perspectiva do MANDANTE (achado 5 da auditoria).
+
+    A The Odds API dá o handicap asiático com sinais OPOSTOS por lado (mandante
+    -0.5, visitante +0.5). Sem canonizar, mandante e visitante caem em grupos
+    `(evento, mercado, linha)` DIFERENTES no L1 e o book de AH nunca fica completo
+    (86 de 91 books de referência incompletos na auditoria do banco). Canoniza-se
+    NEGANDO o ponto do visitante: os dois lados passam a ter a MESMA linha (a do
+    mandante), e o par casa no mesmo grupo. O ponto original fica preservado em
+    `raw.point_fonte`. OU usa o mesmo total nos dois lados — não precisa canonizar;
+    1x2 não tem linha (point None)."""
+    if point is None:
+        return None
+    valor = float(point)
+    if mercado == "ah" and selecao == "visitante":
+        return -valor
+    return valor
+
+
 def iter_snapshots(
     ev: dict[str, Any], *, aceitar_casa=lambda _k: True
 ) -> Iterator[dict[str, Any]]:
@@ -143,12 +162,18 @@ def iter_snapshots(
                         extra={"casa": casa, "mercado": mercado, "nome": nome},
                     )
                     continue
+                ponto = out.get("point")
                 yield {
                     "casa": casa,
                     "mercado": mercado,
                     "selecao": selecao,
-                    "linha": out.get("point"),  # None p/ 1x2; total/handicap p/ ou/ah
+                    # linha CANÔNICA (perspectiva do mandante — achado 5): no AH o
+                    # visitante é negado para os dois lados casarem no mesmo grupo do L1.
+                    "linha": _linha_canonica(mercado, selecao, ponto),
                     "odd": odd,
                     "ts_fonte": ts_fonte,
-                    "raw": {"bookmaker": casa, "market": mkt.get("key"), "outcome": out},
+                    # ponto original da fonte preservado (auditoria): o AH do visitante
+                    # sai como -point na `linha`, mas `raw.point_fonte` guarda o +point.
+                    "raw": {"bookmaker": casa, "market": mkt.get("key"),
+                            "outcome": out, "point_fonte": ponto},
                 }

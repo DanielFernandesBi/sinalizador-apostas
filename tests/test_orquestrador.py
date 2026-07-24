@@ -201,6 +201,27 @@ def test_anomalia_marca_caminho_profundo():
     assert sinal["dossie"]["caminho"] == "profundo"
 
 
+def test_ah_mandante_e_visitante_casam_no_mesmo_grupo_geram_sinal():
+    # achado 5: com a linha CANÔNICA (perspectiva do mandante), mandante(-0.5) e
+    # visitante(-0.5) caem no MESMO grupo (evento, mercado, linha) → book de AH
+    # completo → devig 2-way → sinal. Antes o visitante ficava em +0.5, em grupo
+    # separado, e o book nunca fechava (86/91 incompletos na auditoria).
+    p_mand = devig_shin([1.90, 1.95])[0][0]              # (probs, z) → prob do mandante
+    odd_venue = round(odd_minima_aceitavel(p_mand, 0.065, 0.02) + 0.15, 3)  # edge > 2%
+    snaps = [
+        _snap("mandante", 1.90, "c-pin", linha=-0.5, mercado="ah"),
+        _snap("visitante", 1.95, "c-pin", linha=-0.5, mercado="ah"),   # canônica (fonte dava +0.5)
+        _snap("mandante", odd_venue, "c-bf", liquidez=100000, linha=-0.5, mercado="ah"),
+    ]
+    banco = BancoFake(snaps)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    assert r.sinais == 1                                  # o book fechou (senão seria 0)
+    assert not any("referência incompleta" in m for m in r.pulados)
+    sinal = banco.por_tabela("sinais")[0]
+    assert sinal["mercado"] == "ah" and sinal["selecao"] == "mandante"
+    assert sinal["linha"] == -0.5
+
+
 def test_kill_switch_suspende_emissao():
     # P9 (achado 4): drawdown ≥ suspensão → o L1 NÃO emite sinais, mesmo com um
     # sinal que passaria em tudo. A captura/CLV seguem (fora do L1); só a emissão para.

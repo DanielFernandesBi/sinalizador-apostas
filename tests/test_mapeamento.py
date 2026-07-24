@@ -47,9 +47,13 @@ def test_snapshots_1x2_ou_ah_normalizados():
     # ou → over/under com linha = point
     assert m[("ou", "over")]["odd"] == 1.90 and m[("ou", "over")]["linha"] == 2.5
     assert m[("ou", "under")]["linha"] == 2.5
-    # ah → mandante/visitante com handicap
+    # ah → linha CANÔNICA sob a perspectiva do mandante (achado 5): mandante mantém
+    # o ponto; o visitante é NEGADO, para os dois lados caírem no MESMO grupo do L1.
     assert m[("ah", "mandante")]["linha"] == -0.5
-    assert m[("ah", "visitante")]["linha"] == 0.5
+    assert m[("ah", "visitante")]["linha"] == -0.5              # canônico (fonte dava +0.5)
+    # o ponto original da fonte fica preservado em raw (auditoria)
+    assert m[("ah", "visitante")]["raw"]["point_fonte"] == 0.5
+    assert m[("ah", "mandante")]["raw"]["point_fonte"] == -0.5
 
 
 def test_ts_fonte_vem_do_mercado_e_cai_pro_bookmaker():
