@@ -46,6 +46,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Optional
 
+from sinalizador.comum.erros import e_violacao_unicidade
 from sinalizador.comum.modelos import Dossie
 
 from .abortos import deve_rastrear_clv, registrar_aborto
@@ -161,12 +162,11 @@ def chave_candidato(
 
 
 def _e_duplicidade(exc: Exception) -> bool:
-    """Reconhece a violação do índice de unicidade do candidato (corrida entre
-    daemons): o banco rejeita o 2º sinal aberto do mesmo candidato. Backstop do
-    dedup de aplicação — é ignorado (o sinal já existe), não é erro real."""
-    txt = f"{getattr(exc, 'code', '')} {exc}".lower()
-    return ("23505" in txt or "duplicate key" in txt
-            or "ux_sinais_candidato" in txt or "chave_candidato" in txt)
+    """Violação do índice de unicidade do candidato (corrida entre daemons): o banco
+    rejeita o 2º sinal aberto do mesmo candidato. Backstop do dedup de aplicação — é
+    ignorado (o sinal já existe), não é erro real. Reconhecimento compartilhado com o
+    L4 (`comum.erros.e_violacao_unicidade`) — a mesma corrida, tabelas diferentes."""
+    return e_violacao_unicidade(exc)
 
 
 def avaliar_grupo(

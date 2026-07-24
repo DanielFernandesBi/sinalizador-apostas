@@ -1,4 +1,7 @@
 """Testes do L4 (fechamento/CLV) e do relatório diário."""
+import pytest
+
+from sinalizador.comum.erros import e_violacao_unicidade
 from sinalizador.l1_gatilhos.devig import devig_shin
 from sinalizador.l4_fechamento.clv import (
     clv_pct,
@@ -52,12 +55,21 @@ def test_probs_fechamento_pula_mercado_incompleto():
     assert probs_fechamento_por_mercado(snaps) == {}
 
 
+class ErroUnicidade(RuntimeError):
+    """Equivale ao 23505 que o banco levanta em ux_clv_sinal / ux_clv_aborto."""
+
+
 class BancoFake:
-    def __init__(self, *, snaps_ref, sinais=None, abortos=None, com_clv=(set(), set())):
+    def __init__(self, *, snaps_ref, sinais=None, abortos=None, com_clv=(set(), set()),
+                 clv_ja_no_banco=(), erro_no_insert=None):
         self._snaps = snaps_ref
         self._sinais = sinais or []
         self._abortos = abortos or []
         self._com_clv = com_clv
+        # achado #2: linhas que JÁ existem no banco mas que o dedup em código NÃO viu
+        # (a corrida: outro processo gravou entre a leitura e o INSERT).
+        self._clv_ja_no_banco = set(clv_ja_no_banco)
+        self._erro_no_insert = erro_no_insert
         self.inseridos = []
         self.encerrados = []
         self.pulsos = []
@@ -79,6 +91,16 @@ class BancoFake:
         return self._com_clv
 
     def inserir(self, tabela, registro):
+        if tabela == "clv_log":
+            if self._erro_no_insert is not None:
+                raise self._erro_no_insert
+            # simula ux_clv_sinal / ux_clv_aborto (migration 0005)
+            chave = ("s", registro["sinal_id"]) if registro.get("sinal_id") \
+                else ("a", registro["aborto_l1_id"])
+            if chave in self._clv_ja_no_banco:
+                raise ErroUnicidade(
+                    'duplicate key value violates unique constraint "ux_clv_sinal"')
+            self._clv_ja_no_banco.add(chave)
         row = {"id": len(self.inseridos) + 1, **registro}
         self.inseridos.append((tabela, row))
         return row
@@ -135,6 +157,61 @@ def test_fechar_evento_nao_duplica_clv():
              "linha": None, "odd_venue": 2.2, "p_justa": _p_fech()["1"]}
     banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[sinal], com_clv=({"s1"}, set()))
     assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}) == 0
+
+
+# ---- achado #2: idempotência do CLV garantida pelo banco ----
+
+def _sinal(id_, odd=2.2):
+    return {"id": id_, "status": "confirmado", "mercado": "1x2", "selecao": "1",
+            "linha": None, "odd_venue": odd, "p_justa": _p_fech()["1"]}
+
+
+def test_corrida_de_clv_nao_duplica_nem_derruba_o_ciclo():
+    # O dedup em código NÃO viu s1 (outro processo gravou entre a leitura e o INSERT):
+    # o banco recusa por ux_clv_sinal. O fechamento tem de ABSORVER a recusa e seguir
+    # gravando os demais — perder o CLV de s2 por causa da duplicata de s1 seria
+    # perder amostra do KPI soberano.
+    banco = BancoFake(snaps_ref=_snaps_completos(),
+                      sinais=[_sinal("s1"), _sinal("s2")],
+                      clv_ja_no_banco={("s", "s1")})   # já existe no banco, invisível ao dedup
+    n = fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+
+    assert n == 1                                       # só s2 contou como gravado
+    gravados = {r["sinal_id"] for r in banco.clv()}
+    assert gravados == {"s2"}                           # s1 não duplicou
+    assert banco.encerrados == ["ev1"]                  # o ciclo terminou normalmente
+
+
+def test_corrida_de_clv_em_aborto_tambem_e_absorvida():
+    aborto = {"id": 7, "dossie_parcial": {"mercado": "1x2", "selecao": "1", "linha": None,
+                                          "odd_venue": 2.20, "p_justa": _p_fech()["1"]}}
+    banco = BancoFake(snaps_ref=_snaps_completos(), abortos=[aborto],
+                      clv_ja_no_banco={("a", 7)})
+    assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}) == 0
+    assert banco.clv() == []
+
+
+def test_erro_que_nao_e_unicidade_sobe():
+    # Só a violação de unicidade é engolida. Um erro real (rede, coluna faltando)
+    # NÃO pode ser confundido com "já existe" — isso esconderia perda de CLV.
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
+                      erro_no_insert=RuntimeError("connection reset by peer"))
+    with pytest.raises(RuntimeError, match="connection reset"):
+        fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+
+
+def test_reconhece_violacao_de_unicidade():
+    assert e_violacao_unicidade(ErroUnicidade(
+        'duplicate key value violates unique constraint "ux_clv_sinal"'))
+    assert e_violacao_unicidade(RuntimeError("23505"))
+    # embrulhado (o supabase-py re-levanta o erro original como causa)
+    interno = ErroUnicidade("23505")
+    externo = RuntimeError("falha ao inserir")
+    externo.__cause__ = interno
+    assert e_violacao_unicidade(externo)
+    # não confunde outros erros
+    assert not e_violacao_unicidade(RuntimeError("connection reset by peer"))
+    assert not e_violacao_unicidade(ValueError("odd inválida"))
 
 
 def test_fechar_evento_sem_book_completo_nao_gera_clv():

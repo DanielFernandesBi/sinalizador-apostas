@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from sinalizador.comum.erros import e_violacao_unicidade
 from sinalizador.l1_gatilhos.devig import devig_shin
 from sinalizador.l1_gatilhos.orquestrador import ORDEM_SELECAO
 
@@ -90,6 +91,29 @@ def _linha_clv(
     }
 
 
+def _gravar_clv(banco: Any, linha: dict[str, Any], ref: str) -> bool:
+    """Grava uma linha de `clv_log`. Devolve False (sem erro) se o CLV já existia.
+
+    A unicidade real é do BANCO (`ux_clv_sinal`/`ux_clv_aborto`, migration 0005): o
+    dedup em código é caminho rápido, não garantia — entre a leitura dos ids já
+    registrados e este INSERT, outro processo do L4 pode ter gravado o mesmo CLV.
+    Nesse caso o banco recusa, e a recusa é o resultado desejado (o CLV existe).
+
+    Engolir SÓ a violação de unicidade é essencial: sem isso a corrida derrubaria o
+    fechamento do evento inteiro, deixando SEM CLV os demais sinais — perder amostra
+    do KPI soberano por causa de uma duplicata evitada. Qualquer outro erro sobe.
+    """
+    try:
+        banco.inserir("clv_log", linha)
+        return True
+    except Exception as e:
+        if e_violacao_unicidade(e):
+            _log.info("CLV já registrado por outro processo (corrida) — ignorado",
+                      extra={"ref": ref})
+            return False
+        raise
+
+
 def fechar_evento(banco: Any, evento: dict[str, Any]) -> int:
     """Fecha o CLV de um evento já iniciado. Devolve quantas linhas de `clv_log`
     gravou. Marca o evento 'encerrado' ao fim (sai da fila do L4)."""
@@ -114,12 +138,12 @@ def fechar_evento(banco: Any, evento: dict[str, Any]) -> int:
         p = (fechamentos.get((sinal["mercado"], _linha_key(sinal.get("linha")))) or {}).get(sinal["selecao"])
         if p is None:
             continue
-        banco.inserir("clv_log", _linha_clv(
+        if _gravar_clv(banco, _linha_clv(
             sinal_id=sinal["id"], aborto_id=None, odd_emissao=float(sinal["odd_venue"]),
             p_emissao=float(sinal["p_justa"]), p_fechamento=p,
             contrafactual=(sinal["status"] == "vetado"), ts_fechamento=inicio,
-        ))
-        gravadas += 1
+        ), ref=f"sinal={sinal['id']}"):
+            gravadas += 1
 
     for aborto in banco.abortos_rastreados_do_evento(evento["id"]):
         if aborto["id"] in aborto_ids_com_clv:
@@ -131,12 +155,12 @@ def fechar_evento(banco: Any, evento: dict[str, Any]) -> int:
         p = (fechamentos.get((dp.get("mercado"), _linha_key(dp.get("linha")))) or {}).get(sel)
         if p is None:
             continue
-        banco.inserir("clv_log", _linha_clv(
+        if _gravar_clv(banco, _linha_clv(
             sinal_id=None, aborto_id=aborto["id"], odd_emissao=float(odd_venue),
             p_emissao=float(dp.get("p_justa") or prob_implicita(odd_venue)),
             p_fechamento=p, contrafactual=True, ts_fechamento=inicio,
-        ))
-        gravadas += 1
+        ), ref=f"aborto={aborto['id']}"):
+            gravadas += 1
 
     banco.marcar_evento_encerrado(evento["id"])
     _log.info("evento fechado", extra={"evento_id": evento["id"], "clv_gravadas": gravadas})
