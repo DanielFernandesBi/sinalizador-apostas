@@ -243,3 +243,17 @@ def test_bot_telegram_envia_ok():
 def test_bot_telegram_status_ruim_vira_false():
     bot = BotTelegram("T", "1", transporte=lambda u, c: (403, b'{"ok": false}'))
     assert bot.enviar("x") is False
+
+
+def test_bot_telegram_erro_de_rede_vira_false_nao_propaga():
+    """Erro de rede falando com o Telegram NUNCA sobe — devolve False (senão a
+    camada de cima o confunde com falha do Supabase, bug real 24/07). Cobre tanto
+    ConnectionError quanto um OSError cru (timeout/gaierror) do transporte."""
+    def transporte_connectionerror(u, c):
+        raise ConnectionError("getaddrinfo failed")
+
+    def transporte_oserror(u, c):
+        raise TimeoutError("timed out")  # OSError cru, não embrulhado
+
+    assert BotTelegram("T", "1", transporte=transporte_connectionerror).enviar("x") is False
+    assert BotTelegram("T", "1", transporte=transporte_oserror).enviar("x") is False

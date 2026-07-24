@@ -53,7 +53,11 @@ def _cmd_relatorio(banco: Banco, args) -> int:
     if args.enviar:
         from sinalizador.l3_notifica.bot import BotTelegram
         cfg = carregar_config()
-        BotTelegram(cfg.exigir("telegram_bot_token"), cfg.exigir("telegram_chat_id")).enviar(texto)
+        bot = BotTelegram(cfg.exigir("telegram_bot_token"), cfg.exigir("telegram_chat_id"))
+        ok = bot.enviar(texto)
+        # o `.enviar()` nunca levanta por rede (devolve False e loga), então o
+        # relatório sai impresso mesmo se o Telegram cair — e aqui dizemos o resultado.
+        print(f"[l4] enviado ao Telegram: {ok}")
     return 0
 
 

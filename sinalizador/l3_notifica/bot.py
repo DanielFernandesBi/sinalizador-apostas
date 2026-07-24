@@ -31,6 +31,11 @@ def _transporte_urllib(url: str, corpo: bytes, *, timeout: float = 15.0) -> tupl
         return e.code, (e.read() if hasattr(e, "read") else b"")
     except URLError as e:
         raise ConnectionError(f"falha de rede ao falar com o Telegram: {e.reason}") from e
+    except OSError as e:
+        # timeout / getaddrinfo / conexão recusada que não vieram embrulhados em
+        # URLError (ex.: socket.timeout, ConnectionResetError). URLError já é OSError,
+        # mas é pego acima; aqui fica o resto — nunca deixa escapar erro de rede.
+        raise ConnectionError(f"falha de rede ao falar com o Telegram: {e}") from e
 
 
 class BotTelegram:
@@ -57,7 +62,10 @@ class BotTelegram:
                             "disable_web_page_preview": True}).encode("utf-8")
         try:
             status, resposta = self._transporte(url, corpo)
-        except ConnectionError as e:
+        except (ConnectionError, OSError) as e:
+            # QUALQUER erro de rede (ConnectionError do transporte padrão, ou um
+            # OSError cru de um transporte injetado) vira False — nunca propaga, senão
+            # a camada de cima o confunde com falha do Supabase (bug real, 24/07).
             _log.warning("envio Telegram falhou (rede) — retry no próximo ciclo", extra={"erro": str(e)})
             return False
         if status != 200:
