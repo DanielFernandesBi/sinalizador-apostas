@@ -84,7 +84,9 @@ def test_enfileira_em_sinais_com_dossie_e_numeros():
     assert isinstance(reg["dossie"]["snapshots"]["ts_fonte_venue"], str)
     # status NÃO é setado aqui — usa o default do schema (aguardando_crivo)
     assert "status" not in reg
-    assert ret["id"] == "sinal-uuid"
+    # identidade única (achado 3): a linha usa o MESMO id do dossiê, não um gerado
+    assert reg["id"] == "s-1" == dossie.sinal_id
+    assert ret["id"] == "s-1"
 
 
 # ---- odd_minima_aceitavel (fronteira do gate edge_min) ----

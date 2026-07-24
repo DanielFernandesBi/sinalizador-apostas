@@ -62,6 +62,12 @@ def enfileirar_sinal(
     """
     m = dossie.matematica
     registro: dict[str, Any] = {
+        # Identidade única (achado 3 da auditoria): a LINHA de `sinais` recebe o
+        # MESMO UUID do dossiê. Sem isto o banco geraria um id próprio e o objeto
+        # que o L2 analisa (dossie.sinal_id) ficaria desligado da linha que ele
+        # transiciona (sinais.id) — quebra de rastreabilidade. O schema aceita id
+        # explícito (o default gen_random_uuid() só age quando o id é omitido).
+        "id": dossie.sinal_id,
         "evento_id": evento_id,
         "casa_venue_id": casa_venue_id,
         "gatilho": dossie.gatilho,

@@ -10,13 +10,15 @@ from sinalizador.l2_crivo.crivo import avaliar_sinal, processar_fila
 from sinalizador.l2_crivo.modelo import RespostaModelo
 
 MANUAL = "Você é o Crivo L2. Responda NADA além do JSON da Seção 8."
-SINAL_ID_INTERNO = "uuid-do-dossie-123"
+# id ÚNICO do sinal: a linha de `sinais` e o dossiê compartilham este UUID
+# (achado 3 da auditoria — sinais.id == dossie.sinal_id).
+SINAL_ID = "row-1"
 ODD_MIN = 1.923
 
 
-def _dossie(*, odd_min=ODD_MIN, tipster=None):
+def _dossie(*, sinal_id=SINAL_ID, odd_min=ODD_MIN, tipster=None):
     return {
-        "sinal_id": SINAL_ID_INTERNO,
+        "sinal_id": sinal_id,
         "caminho": "rapido",
         "matematica": {"odd_minima_aceitavel": odd_min},
         "evento": {"mercado": "1x2", "selecao": "1"},
@@ -24,11 +26,13 @@ def _dossie(*, odd_min=ODD_MIN, tipster=None):
     }
 
 
-def _sinal(dossie, *, id="row-1"):
-    return {"id": id, "status": "aguardando_crivo", "dossie": dossie}
+def _sinal(dossie, *, id=None):
+    # por padrão a linha usa o MESMO id do dossiê (identidade única — achado 3).
+    return {"id": id if id is not None else dossie["sinal_id"],
+            "status": "aguardando_crivo", "dossie": dossie}
 
 
-def _saida_valida(*, verdict="ABORTA", sinal_id=SINAL_ID_INTERNO, odd_min=ODD_MIN):
+def _saida_valida(*, verdict="ABORTA", sinal_id=SINAL_ID, odd_min=ODD_MIN):
     saida = {
         "sinal_id": sinal_id,
         "verdict": verdict,
@@ -144,7 +148,7 @@ def test_json_invalido_vira_erro_nunca_confirma():
 def test_schema_violado_vira_erro():
     banco = BancoFake()
     # campo extra (extra=forbid) + veredicto ausente → fora do schema
-    ruim = json.dumps({"sinal_id": SINAL_ID_INTERNO, "campo_intruso": 1})
+    ruim = json.dumps({"sinal_id": SINAL_ID, "campo_intruso": 1})
     status = avaliar_sinal(banco, ModeloFake(ruim), _sinal(_dossie()), manual=MANUAL)
     assert status == "erro"
     assert banco.por_tabela("crivos") == []
@@ -165,6 +169,19 @@ def test_sinal_id_divergente_vira_erro():
     status = avaliar_sinal(banco, modelo, _sinal(_dossie()), manual=MANUAL)
     assert status == "erro"                              # id trocado não vira CONFIRMA
     assert banco.por_tabela("crivos") == []
+
+
+def test_identidade_quebrada_linha_vs_dossie_vira_erro():
+    """Achado 3: se a linha (sinais.id) carrega o dossiê de OUTRA (dossie.sinal_id
+    diferente), é erro — jamais CONFIRMA. O guard dispara antes de chamar o modelo."""
+    banco = BancoFake()
+    modelo = ModeloFake(_saida_valida(verdict="CONFIRMA", sinal_id="dossie-de-outra"))
+    sinal = _sinal(_dossie(sinal_id="dossie-de-outra"), id="linha-real")
+    status = avaliar_sinal(banco, modelo, sinal, manual=MANUAL)
+    assert status == "erro"
+    assert banco.status_final("linha-real") == "erro"
+    assert banco.por_tabela("crivos") == []
+    assert modelo.chamadas == []                         # nem chegou a consultar o modelo
 
 
 def test_passthrough_divergente_vira_erro():
@@ -222,22 +239,24 @@ def test_injecao_que_produz_confirma_malformado_vira_erro():
 # ---------------- fila ----------------
 
 def test_processar_fila_conta_e_pulsa_heartbeat():
+    # dois sinais DISTINTOS: cada um com seu id, e o dossiê com o MESMO id
+    # (identidade única — achado 3). O modelo decide o veredicto por sinal_id.
     sinais = [
-        _sinal(_dossie(), id="s-ok"),
-        _sinal(_dossie(), id="s-veto"),
+        _sinal(_dossie(sinal_id="s-ok"), id="s-ok"),
+        _sinal(_dossie(sinal_id="s-veto"), id="s-veto"),
     ]
     banco = BancoFake(sinais)
 
     class ModeloPorSinal:
         def avaliar(self, *, system, dossie_json, caminho):
-            d = json.loads(dossie_json)
-            verdict = "CONFIRMA" if d.get("sinal_id") == SINAL_ID_INTERNO else "ABORTA"
-            return RespostaModelo(texto=_saida_valida(verdict=verdict), modelo="fake",
+            sid = json.loads(dossie_json).get("sinal_id")
+            verdict = "CONFIRMA" if sid == "s-ok" else "ABORTA"
+            return RespostaModelo(texto=_saida_valida(verdict=verdict, sinal_id=sid), modelo="fake",
                                   latencia_ms=1, tokens_entrada=1, tokens_saida=1, custo_usd=0.0)
 
-    # ambos usam o mesmo sinal_id interno → ambos CONFIRMA (só valida a contagem/pulso)
     resumo = processar_fila(banco, ModeloPorSinal(), limite=10)
     assert resumo.avaliados == 2
-    assert resumo.confirmados == 2
+    assert resumo.confirmados == 1 and resumo.vetados == 1
+    assert banco.transicoes == [("s-ok", "confirmado"), ("s-veto", "vetado")]
     assert banco.pulsos and banco.pulsos[-1][0] == "l2"
     assert banco.pulsos[-1][1]["avaliados"] == 2

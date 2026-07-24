@@ -114,6 +114,14 @@ def avaliar_sinal(banco: Any, modelo: ModeloCrivo, sinal: dict[str, Any], *, man
     """Avalia um sinal. Devolve o status final ('confirmado'|'vetado'|'erro')."""
     sinal_id = sinal["id"]
     dossie = sinal.get("dossie") or {}
+    # Identidade única (achado 3 da auditoria): a linha e o dossiê que o modelo
+    # analisa têm de ser o MESMO objeto. O L1 insere a linha com id = dossie.sinal_id;
+    # se aqui divergirem, esta linha carrega o dossiê de OUTRA — erro, jamais CONFIRMA.
+    if dossie.get("sinal_id") != sinal_id:
+        _registrar_erro(banco, sinal_id,
+                        f"identidade quebrada: sinais.id ({sinal_id!r}) ≠ "
+                        f"dossie.sinal_id ({dossie.get('sinal_id')!r})")
+        return "erro"
     caminho = dossie.get("caminho", "rapido")
     try:
         resp: RespostaModelo = modelo.avaliar(
@@ -121,7 +129,8 @@ def avaliar_sinal(banco: Any, modelo: ModeloCrivo, sinal: dict[str, Any], *, man
             caminho=caminho,
         )
         dados = extrair_json(resp.texto)
-        saida = validar_saida(dados, sinal_id_esperado=dossie.get("sinal_id"))
+        # Valida a saída contra o ID REAL da linha (== dossie.sinal_id, garantido acima).
+        saida = validar_saida(dados, sinal_id_esperado=sinal_id)
         verificar_passthrough(saida, dossie)
     except SaidaInvalidaError as e:
         _registrar_erro(banco, sinal_id, str(e))
