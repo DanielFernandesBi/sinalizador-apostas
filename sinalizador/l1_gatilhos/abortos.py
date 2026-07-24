@@ -40,9 +40,12 @@ def registrar_aborto(
     dossie_parcial: dict[str, Any],
     evento_id: Optional[str] = None,
     clv_rastrear: bool = False,
+    chave_candidato: Optional[str] = None,
 ) -> dict[str, Any]:
     """INSERT append-only em `abortos_l1` (P7). Registra qual gate matou o sinal
-    e se o quase-sinal será rastreado por CLV (`clv_rastrear`)."""
+    e se o quase-sinal será rastreado por CLV (`clv_rastrear`). `chave_candidato`
+    (achado 7) permite o dedup de abortos na janela — um near-miss persistente não
+    vira um aborto por ciclo."""
     return banco.inserir(
         "abortos_l1",
         {
@@ -51,5 +54,6 @@ def registrar_aborto(
             "gate_reprovado": gate_reprovado,
             "dossie_parcial": dossie_parcial,
             "clv_rastrear": clv_rastrear,
+            "chave_candidato": chave_candidato,
         },
     )

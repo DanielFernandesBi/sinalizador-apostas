@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from sinalizador.l1_gatilhos.devig import devig_shin
 from sinalizador.l1_gatilhos.edge import odd_minima_aceitavel
-from sinalizador.l1_gatilhos.orquestrador import PoliticaVenue, rodar_l1
+from sinalizador.l1_gatilhos.orquestrador import PoliticaVenue, chave_candidato, rodar_l1
 
 AGORA = datetime(2026, 7, 20, 20, 0, 30, tzinfo=timezone.utc)
 T = "2026-07-20T20:00:10Z"   # dentro de sincronia (0s) e idade (20s)
@@ -43,15 +43,23 @@ def _p1():
 
 class BancoFake:
     def __init__(self, snaps, *, banca=1000.0, exposicao=None, banca_papel=None,
-                 kill_switch=False, venues_exec=None):
+                 kill_switch=False, venues_exec=None, abertas=None, abortos=None):
         self._snaps = snaps
         self._banca = banca
         self._exposicao = exposicao or []
         self._banca_papel = banca_papel   # valor (str) da config_sistema, ou None
         self._kill_switch = kill_switch   # espelha vw_banca.kill_switch (P9)
         self._venues_exec = venues_exec   # lista de chaves (allowlist), ou None
+        self._abertas = set(abertas or ())   # chaves de candidato com sinal aberto (achado 7)
+        self._abortos = set(abortos or ())   # chaves de candidato já abortadas na janela
         self.inseridos = []
         self.pulsos = []
+
+    def chaves_sinais_abertos(self):
+        return set(self._abertas)
+
+    def chaves_abortos_desde(self, ts_iso):
+        return set(self._abortos)
 
     def config_vigente(self, chave):
         if chave == "banca_papel" and self._banca_papel is not None:
@@ -259,6 +267,44 @@ def test_ah_mandante_e_visitante_casam_no_mesmo_grupo_geram_sinal():
     sinal = banco.por_tabela("sinais")[0]
     assert sinal["mercado"] == "ah" and sinal["selecao"] == "mandante"
     assert sinal["linha"] == -0.5
+
+
+def test_sinal_carrega_chave_candidato():
+    # achado 7: o sinal grava a chave determinística do candidato (unicidade no banco).
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps)
+    rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    sinal = banco.por_tabela("sinais")[0]
+    assert sinal["chave_candidato"] == chave_candidato("ev1", "1x2", None, "1", "c-bf")
+
+
+def test_nao_reemite_sinal_ja_aberto():
+    # achado 7: se já há um sinal ABERTO para o candidato, o L1 NÃO reemite.
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    chave = chave_candidato("ev1", "1x2", None, "1", "c-bf")
+    banco = BancoFake(snaps, abertas={chave})
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    assert r.sinais == 0
+    assert banco.por_tabela("sinais") == []
+    assert any("já aberto" in m for m in r.pulados)
+
+
+def test_nao_reregistra_aborto_duplicado():
+    # achado 7: near-miss cujo candidato já foi abortado na janela não re-registra.
+    p1 = _p1()
+    odd_baixa = round((odd_minima_aceitavel(p1, 0.065, 0.01)
+                       + odd_minima_aceitavel(p1, 0.065, 0.02)) / 2, 3)  # edge ~1,5% (near-miss)
+    snaps = _ref_snaps() + [_snap("1", odd_baixa, "c-bf", liquidez=100000)]
+    chave = chave_candidato("ev1", "1x2", None, "1", "c-bf")
+    banco = BancoFake(snaps, abortos={chave})
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    assert r.abortos == 0
+    assert banco.por_tabela("abortos_l1") == []
+    assert any("aborto já registrado" in m for m in r.pulados)
 
 
 def test_kill_switch_suspende_emissao():

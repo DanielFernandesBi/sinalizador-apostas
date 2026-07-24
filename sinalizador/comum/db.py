@@ -1,4 +1,4 @@
-"""Cliente Supabase (service role) — ÚNICO ponto de escrita no banco.
+"""Cliente Supabase (service role) — ÚnICO ponto de escrita no banco.
 
 Este módulo NASCE sabendo da imutabilidade (Doutrina P7 / schema 0001): as
 tabelas de log não aceitam UPDATE nem DELETE, e `sinais`/`apostas`/`tips` só
@@ -22,6 +22,7 @@ Operações expostas:
   - gates_vigentes() / config_vigente() / casa_por_nome() / exposicao_aberta()    leituras
   - evento_por_id_externo() / saude_daemons() / clv_global()                       leituras
   - snapshots_desde() / casas_ativas() / eventos_por_ids() / banca_atual()          leituras (L1)
+  - chaves_sinais_abertos() / chaves_abortos_desde()                               anti-duplicidade (L1)
   - sinais_aguardando_crivo()                                                        leitura (L2)
   - sinais_por_status() / crivo_do_sinal() / ultimo_snapshot_venue() /
     notificacoes_do_sinal() / notificacoes_pendentes()                              leituras (L3)
@@ -154,6 +155,29 @@ class Banco:
         resp = self._c.table("vw_banca").select("*").limit(1).execute()
         dados = resp.data or []
         return dados[0] if dados else None
+
+    def chaves_sinais_abertos(self) -> set[str]:
+        """Chaves de candidato dos sinais AINDA ABERTOS (aguardando_crivo|confirmado)
+        — anti-duplicidade do L1 (achado 7): não reemite candidato com sinal aberto.
+        Espelha em leitura o índice único parcial `ux_sinais_candidato_aberto`."""
+        resp = (
+            self._c.table("sinais")
+            .select("chave_candidato")
+            .in_("status", ["aguardando_crivo", "confirmado"])
+            .execute()
+        )
+        return {r["chave_candidato"] for r in (resp.data or []) if r.get("chave_candidato")}
+
+    def chaves_abortos_desde(self, ts_iso: str) -> set[str]:
+        """Chaves de candidato dos abortos registrados desde `ts_iso` — dedup de
+        abortos do L1 (achado 7): não re-registra o mesmo near-miss a cada ciclo."""
+        resp = (
+            self._c.table("abortos_l1")
+            .select("chave_candidato")
+            .gte("ts", ts_iso)
+            .execute()
+        )
+        return {r["chave_candidato"] for r in (resp.data or []) if r.get("chave_candidato")}
 
     def sinais_aguardando_crivo(self, limite: int = 50) -> list[dict[str, Any]]:
         """Fila do L2: sinais com status 'aguardando_crivo' (mais antigos primeiro)."""

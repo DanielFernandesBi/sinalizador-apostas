@@ -53,12 +53,15 @@ def enfileirar_sinal(
     evento_id: str,
     casa_venue_id: str,
     linha: Optional[float] = None,
+    chave_candidato: Optional[str] = None,
 ) -> dict[str, Any]:
     """Enfileira o sinal para o L2: INSERT em `sinais` (status aguardando_crivo).
 
     `evento_id` e `casa_venue_id` são as chaves de `eventos`/`casas` (vêm do L0).
     Os números denormalizados vêm do próprio dossiê; o dossiê completo vai em
-    `sinais.dossie` (jsonb) para auditoria e para o L2.
+    `sinais.dossie` (jsonb) para auditoria e para o L2. `chave_candidato` (achado 7)
+    é a identidade da aposta — o índice único parcial garante um sinal ABERTO por
+    candidato (o L1 não reemite o mesmo sinal a cada ciclo).
     """
     m = dossie.matematica
     registro: dict[str, Any] = {
@@ -68,6 +71,8 @@ def enfileirar_sinal(
         # transiciona (sinais.id) — quebra de rastreabilidade. O schema aceita id
         # explícito (o default gen_random_uuid() só age quando o id é omitido).
         "id": dossie.sinal_id,
+        # Achado 7: identidade do candidato para a unicidade "um sinal aberto por aposta".
+        "chave_candidato": chave_candidato,
         "evento_id": evento_id,
         "casa_venue_id": casa_venue_id,
         "gatilho": dossie.gatilho,

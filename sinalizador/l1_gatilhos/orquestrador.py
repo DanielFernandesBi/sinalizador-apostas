@@ -136,6 +136,27 @@ def _casa_executavel(
     return venues_executaveis is not None and chave in venues_executaveis
 
 
+def chave_candidato(
+    evento_id: str, mercado: str, linha: Optional[float], selecao: str, casa_venue_id: str
+) -> str:
+    """Chave determinística do candidato (achado 7 da auditoria): a identidade da
+    APOSTA — evento|mercado|linha|seleção|casa. Base da unicidade no banco (um sinal
+    ABERTO por candidato, índice `ux_sinais_candidato_aberto`) e do dedup de abortos.
+    Sem ela, o L1 relê a janela de 1h a cada ciclo e reemitiria o mesmo sinal/aborto a
+    cada minuto. `linha` já vem normalizada do grupo (arredondada ou None → '')."""
+    ln = "" if linha is None else str(linha)
+    return f"{evento_id}|{mercado}|{ln}|{selecao}|{casa_venue_id}"
+
+
+def _e_duplicidade(exc: Exception) -> bool:
+    """Reconhece a violação do índice de unicidade do candidato (corrida entre
+    daemons): o banco rejeita o 2º sinal aberto do mesmo candidato. Backstop do
+    dedup de aplicação — é ignorado (o sinal já existe), não é erro real."""
+    txt = f"{getattr(exc, 'code', '')} {exc}".lower()
+    return ("23505" in txt or "duplicate key" in txt
+            or "ux_sinais_candidato" in txt or "chave_candidato" in txt)
+
+
 def avaliar_grupo(
     banco: Any,
     grupo: GrupoMercado,
@@ -148,6 +169,8 @@ def avaliar_grupo(
     agora: datetime,
     politica: PoliticaVenue,
     venues_executaveis: Optional[set[str]],
+    chaves_abertas: set[str],
+    chaves_abortos: set[str],
     resumo: ResumoL1,
 ) -> None:
     """Roda o pipeline para cada seleção do grupo. Escreve sinais/abortos no banco."""
@@ -203,6 +226,14 @@ def avaliar_grupo(
             resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}/{sel}: {motivo}")
             continue
 
+        # Anti-duplicidade (achado 7): se já há um sinal ABERTO para este candidato,
+        # não reprocessa — nem novo sinal, nem novo aborto. Uma oportunidade
+        # persistente não vira um sinal por minuto; a re-checagem/expiração é do L3.
+        chave = chave_candidato(grupo.evento_id, grupo.mercado, grupo.linha, sel, melhor["casa_id"])
+        if chave in chaves_abertas:
+            resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}/{sel}: sinal já aberto (dedup)")
+            continue
+
         casa_row = casas[melhor["casa_id"]]
         comissao = comissao_fracao(casa_row)
         # slippage 0: em varejo de odd fixa é DEFINIÇÃO (Doutrina §-sombra / Sugestão
@@ -249,16 +280,16 @@ def avaliar_grupo(
         }
 
         if not veredito.aprovado:
-            _registrar(banco, grupo, sel, veredito.gate_reprovado, dossie_parcial,
-                       edge, gates, resumo)
+            _abortar_dedup(banco, grupo, sel, veredito.gate_reprovado, dossie_parcial,
+                           edge, gates, resumo, chave=chave, chaves_abortos=chaves_abortos)
             continue
 
         # Gate de exposição em camadas (agregado).
         tetos = tetos_exposicao(gates, banca)
         vexp = avaliar_exposicao(stake_valor, exposto, tetos)
         if not vexp.aprovado:
-            _registrar(banco, grupo, sel, vexp.gate_reprovado, dossie_parcial,
-                       edge, gates, resumo)
+            _abortar_dedup(banco, grupo, sel, vexp.gate_reprovado, dossie_parcial,
+                           edge, gates, resumo, chave=chave, chaves_abortos=chaves_abortos)
             continue
 
         # Aprovado → dossiê completo + fila do L2.
@@ -271,21 +302,44 @@ def avaliar_grupo(
             candidatos_venue=candidatos_venue, exposto=exposto, liquidez_disp=liquidez_disp,
             aplica_liquidez=aplica_liquidez, politica=politica, banca_origem=banca_origem,
         )
-        enfileirar_sinal(banco, dossie, evento_id=grupo.evento_id,
-                         casa_venue_id=melhor["casa_id"], linha=grupo.linha)
+        try:
+            enfileirar_sinal(banco, dossie, evento_id=grupo.evento_id,
+                             casa_venue_id=melhor["casa_id"], linha=grupo.linha,
+                             chave_candidato=chave)
+        except Exception as e:  # backstop de unicidade do banco (corrida entre daemons)
+            if _e_duplicidade(e):
+                resumo.pulados.append(
+                    f"{grupo.evento_id}/{grupo.mercado}/{sel}: sinal duplicado no banco (corrida)")
+                chaves_abertas.add(chave)
+                continue
+            raise
+        chaves_abertas.add(chave)  # dedup intra-ciclo (não reemite no mesmo ciclo)
         resumo.sinais += 1
         _log.info("sinal enfileirado", extra={"evento": grupo.evento_id, "mercado": grupo.mercado,
                                                "selecao": sel, "gatilho": gatilho, "caminho": caminho,
                                                "edge_pct": round(edge * 100, 2)})
 
 
-def _registrar(banco, grupo, sel, gate_reprovado, dossie_parcial, edge, gates, resumo: ResumoL1) -> None:
+def _registrar(banco, grupo, sel, gate_reprovado, dossie_parcial, edge, gates, resumo: ResumoL1,
+               *, chave: Optional[str] = None) -> None:
     rastrear = gate_reprovado == "edge_min_pct" and deve_rastrear_clv(edge, gates)
     registrar_aborto(banco, gatilho=dossie_parcial["gatilho"], gate_reprovado=gate_reprovado or "desconhecido",
-                     dossie_parcial=dossie_parcial, evento_id=grupo.evento_id, clv_rastrear=rastrear)
+                     dossie_parcial=dossie_parcial, evento_id=grupo.evento_id, clv_rastrear=rastrear,
+                     chave_candidato=chave)
     resumo.abortos += 1
     if rastrear:
         resumo.rastreados_clv += 1
+
+
+def _abortar_dedup(banco, grupo, sel, gate_reprovado, dossie_parcial, edge, gates, resumo: ResumoL1,
+                   *, chave: str, chaves_abortos: set[str]) -> None:
+    """Registra o aborto SÓ se este candidato ainda não foi abortado na janela
+    (achado 7): um near-miss persistente não vira um aborto por minuto."""
+    if chave in chaves_abortos:
+        resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}/{sel}: aborto já registrado (dedup)")
+        return
+    _registrar(banco, grupo, sel, gate_reprovado, dossie_parcial, edge, gates, resumo, chave=chave)
+    chaves_abortos.add(chave)
 
 
 def _serie_1h(serie: list[PontoSerie], agora: datetime) -> list[dict[str, Any]]:
@@ -511,6 +565,14 @@ def rodar_l1(
         _log.warning("modo sombra sem allowlist de venues executáveis "
                      "(config_sistema.venues_executaveis) — nenhum sinal será emitido (achado 6)")
 
+    # Anti-duplicidade (achado 7): candidatos com sinal ABERTO (aguardando_crivo|
+    # confirmado) e candidatos já abortados na janela não são reprocessados. Guardas
+    # `getattr` toleram fakes/bancos sem os métodos (degradação: sem dedup, mas roda).
+    _abertas = getattr(banco, "chaves_sinais_abertos", None)
+    chaves_abertas: set[str] = set(_abertas()) if _abertas else set()
+    _abortos = getattr(banco, "chaves_abortos_desde", None)
+    chaves_abortos: set[str] = set(_abortos(desde)) if _abortos else set()
+
     exposicao_aberta = banco.exposicao_aberta()
     grupos = agrupar_snapshots(snaps, casas, eventos)
     for grupo in grupos:
@@ -520,7 +582,8 @@ def rodar_l1(
         exposto = _exposto_do_evento(exposicao_aberta, grupo.evento_id, ev.get("liga", ""), dia)
         avaliar_grupo(banco, grupo, casas, gates, banca=banca, banca_origem=banca_origem,
                       exposto=exposto, agora=agora, politica=politica,
-                      venues_executaveis=venues_executaveis, resumo=resumo)
+                      venues_executaveis=venues_executaveis, chaves_abertas=chaves_abertas,
+                      chaves_abortos=chaves_abortos, resumo=resumo)
 
     banco.pulsar(DAEMON, {"grupos": resumo.grupos, "sinais": resumo.sinais,
                           "abortos": resumo.abortos, "rastreados_clv": resumo.rastreados_clv,
