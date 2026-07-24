@@ -28,6 +28,7 @@ CASAS = [
     {"id": "c-bf", "nome": "betfair_exchange", "tipo": "exchange", "comissao_pct": 6.5, "ativa": True},
     {"id": "c-bf2", "nome": "betfair2", "tipo": "exchange", "comissao_pct": 6.5, "ativa": True},
     {"id": "c-b365", "nome": "bet365_br", "tipo": "varejo", "comissao_pct": 0, "ativa": True},
+    {"id": "c-betano", "nome": "betano", "tipo": "varejo", "comissao_pct": 0, "ativa": True},
 ]
 EVENTOS = [{"id": "ev1", "liga": "Premier League", "mandante": "A", "visitante": "B",
             "inicio_utc": "2026-07-20T21:00:00Z"}]
@@ -41,18 +42,23 @@ def _p1():
 
 
 class BancoFake:
-    def __init__(self, snaps, *, banca=1000.0, exposicao=None, banca_papel=None, kill_switch=False):
+    def __init__(self, snaps, *, banca=1000.0, exposicao=None, banca_papel=None,
+                 kill_switch=False, venues_exec=None):
         self._snaps = snaps
         self._banca = banca
         self._exposicao = exposicao or []
         self._banca_papel = banca_papel   # valor (str) da config_sistema, ou None
         self._kill_switch = kill_switch   # espelha vw_banca.kill_switch (P9)
+        self._venues_exec = venues_exec   # lista de chaves (allowlist), ou None
         self.inseridos = []
         self.pulsos = []
 
     def config_vigente(self, chave):
         if chave == "banca_papel" and self._banca_papel is not None:
             return {"chave": chave, "valor": self._banca_papel, "vigente": True}
+        if chave == "venues_executaveis" and self._venues_exec is not None:
+            import json as _json
+            return {"chave": chave, "valor": _json.dumps(self._venues_exec), "vigente": True}
         return None
 
     def snapshots_desde(self, ts_iso):
@@ -174,7 +180,7 @@ def test_retail_sombra_gera_sinal_e_marca_desvio():
     p1 = _p1()
     odd_venue = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.15, 3)  # varejo comissão 0
     snaps = _ref_snaps() + [_snap("1", odd_venue, "c-b365")]  # varejo, sem liquidez
-    banco = BancoFake(snaps)
+    banco = BancoFake(snaps, venues_exec=["bet365_br"])  # allowlist (achado 6)
     r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
     assert r.sinais == 1  # gate de liquidez inaplicável a varejo
     dossie = banco.por_tabela("sinais")[0]["dossie"]
@@ -183,6 +189,39 @@ def test_retail_sombra_gera_sinal_e_marca_desvio():
     assert dossie["liquidez"]["liquidez_aplicavel"] is False
     assert dossie["liquidez"]["gate_liquidez_ok"] is None
     assert dossie["liquidez"]["sombra_varejo"] is True
+
+
+def test_venue_sombra_so_casa_da_allowlist_vira_cartao():
+    # achado 6: mesmo que uma casa FORA da allowlist tenha preço melhor, o venue do
+    # cartão é a casa da allowlist. As de fora seguem no consenso (venues_comparados
+    # / V-C2), nunca como venue do sinal.
+    p1 = _p1()
+    odd_allow = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.10, 3)  # bet365_br (allowlist)
+    odd_fora = round(odd_allow + 0.30, 3)                             # betano (melhor, fora)
+    snaps = _ref_snaps() + [
+        _snap("1", odd_allow, "c-b365"),      # executável
+        _snap("1", odd_fora, "c-betano"),     # só observação de consenso
+    ]
+    banco = BancoFake(snaps, venues_exec=["bet365_br"])
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+    assert r.sinais == 1
+    sinal = banco.por_tabela("sinais")[0]
+    assert sinal["casa_venue_id"] == "c-b365"                # venue = casa da allowlist, não a melhor
+    # as duas casas alimentam o consenso (line shopping), inclusive a de fora
+    casas_consenso = {v["casa"] for v in sinal["dossie"]["venues_comparados"]}
+    assert casas_consenso == {"bet365_br", "betano"}
+
+
+def test_venue_sombra_sem_allowlist_nao_gera_sinal():
+    # achado 6 (fail-closed): sem allowlist, nenhuma casa de varejo é executável →
+    # nenhum sinal do modo sombra (não se sinaliza o que não se pode apostar).
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-b365")]
+    banco = BancoFake(snaps)  # SEM venues_exec
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+    assert r.sinais == 0 and r.abortos == 0
+    assert any("nenhum executável" in m for m in r.pulados)
 
 
 def test_anomalia_marca_caminho_profundo():
@@ -250,7 +289,7 @@ def test_banca_de_papel_dimensiona_quando_ledger_vazio():
     p1 = _p1()
     odd_venue = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.15, 3)  # varejo comissão 0
     snaps = _ref_snaps() + [_snap("1", odd_venue, "c-b365")]          # venue de varejo
-    banco = BancoFake(snaps, banca=None, banca_papel="1000")
+    banco = BancoFake(snaps, banca=None, banca_papel="1000", venues_exec=["bet365_br"])
     r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
     assert r.sinais == 1
     sinal = banco.por_tabela("sinais")[0]

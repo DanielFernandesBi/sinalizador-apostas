@@ -28,6 +28,7 @@ Política de venue (`PoliticaVenue`):
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -118,6 +119,23 @@ def _casas_venue_da_politica(casas: dict[str, dict], politica: PoliticaVenue) ->
     return {cid for cid, c in casas.items() if c.get("tipo") in tipos}
 
 
+def _casa_executavel(
+    chave: str, politica: PoliticaVenue, venues_executaveis: Optional[set[str]]
+) -> bool:
+    """A casa pode ser o VENUE do cartão (achado 6 da auditoria)?
+
+    O consenso (line shopping / V-C2) usa TODAS as casas capturadas, mas o venue do
+    SINAL só pode ser uma casa onde o Daniel de fato executa. No modo sombra isso é
+    a allowlist confirmada por ele (casas .bet.br) — Doutrina §3 fala em varejo
+    EXECUTÁVEL no ambiente brasileiro, não em qualquer casa europeia da coleta. Sem
+    allowlist configurada, NENHUMA casa é executável (fail-closed: não se sinaliza o
+    que não se pode apostar — P6/utilidade prática). Sob EXCHANGE (doutrina-puro) o
+    venue é a exchange; a executabilidade dela é o gate do E1.2/E7."""
+    if politica is PoliticaVenue.EXCHANGE:
+        return True
+    return venues_executaveis is not None and chave in venues_executaveis
+
+
 def avaliar_grupo(
     banco: Any,
     grupo: GrupoMercado,
@@ -129,6 +147,7 @@ def avaliar_grupo(
     exposto: dict[str, float],
     agora: datetime,
     politica: PoliticaVenue,
+    venues_executaveis: Optional[set[str]],
     resumo: ResumoL1,
 ) -> None:
     """Roda o pipeline para cada seleção do grupo. Escreve sinais/abortos no banco."""
@@ -172,9 +191,16 @@ def avaliar_grupo(
                 {"casa_id": casa_id, "casa": casas[casa_id]["nome"], "tipo": casas[casa_id].get("tipo"),
                  "odd": odd_v, "ts_fonte": ts_v, "liquidez": liq_v}
             )
-        melhor = melhor_preco(candidatos_venue)
+        # Consenso (V-C2 / line shopping) usa TODOS os venues capturados; o VENUE do
+        # cartão só pode ser uma casa EXECUTÁVEL (achado 6). As demais seguem em
+        # `venues_comparados` como observação de consenso, nunca como venue do sinal.
+        executaveis = [c for c in candidatos_venue
+                       if _casa_executavel(c["casa"], politica, venues_executaveis)]
+        melhor = melhor_preco(executaveis)
         if melhor is None:
-            resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}/{sel}: sem venue capturado")
+            motivo = ("sem venue capturado" if not candidatos_venue
+                      else "venues capturados, nenhum executável (allowlist)")
+            resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}/{sel}: {motivo}")
             continue
 
         casa_row = casas[melhor["casa_id"]]
@@ -411,6 +437,29 @@ def _banca_papel(banco: Any) -> Optional[float]:
         return None
 
 
+def _venues_executaveis(banco: Any) -> Optional[set[str]]:
+    """Allowlist das casas onde o Daniel EXECUTA (`config_sistema.venues_executaveis`,
+    lista JSON de chaves de bookmaker — ex.: `[\"bet365_br\", \"betano\"]`). Curada por
+    ele (achado 6, ligada à decisão D3): o L1 nunca inventa que uma casa é executável.
+    None = allowlist ausente/malformada → no modo sombra nenhuma casa vira venue do
+    cartão (fail-closed). Não afeta o consenso (todas as casas seguem no line shopping)."""
+    ler = getattr(banco, "config_vigente", None)
+    if ler is None:
+        return None
+    doc = ler("venues_executaveis")
+    if not doc or not doc.get("valor"):
+        return None
+    try:
+        lista = json.loads(doc["valor"])
+    except (json.JSONDecodeError, TypeError):
+        _log.warning("venues_executaveis na config_sistema não é JSON válido — ignorada")
+        return None
+    if not isinstance(lista, list):
+        _log.warning("venues_executaveis na config_sistema não é uma lista — ignorada")
+        return None
+    return {str(k).strip() for k in lista if str(k).strip()}
+
+
 def rodar_l1(
     banco: Any,
     gates: Any,
@@ -455,6 +504,13 @@ def rodar_l1(
         _log.info("banca de papel em uso (ledger real vazio) — modo sombra",
                   extra={"banca_papel": banca})
 
+    # Allowlist de venues executáveis (achado 6): só casas onde o Daniel aposta
+    # viram o venue do cartão no modo sombra. EXCHANGE não usa (venue = exchange).
+    venues_executaveis = _venues_executaveis(banco)
+    if politica is PoliticaVenue.RETAIL_SOMBRA and not venues_executaveis:
+        _log.warning("modo sombra sem allowlist de venues executáveis "
+                     "(config_sistema.venues_executaveis) — nenhum sinal será emitido (achado 6)")
+
     exposicao_aberta = banco.exposicao_aberta()
     grupos = agrupar_snapshots(snaps, casas, eventos)
     for grupo in grupos:
@@ -463,7 +519,8 @@ def rodar_l1(
         dia = str((_dt(ev.get("inicio_utc")) or agora).date())
         exposto = _exposto_do_evento(exposicao_aberta, grupo.evento_id, ev.get("liga", ""), dia)
         avaliar_grupo(banco, grupo, casas, gates, banca=banca, banca_origem=banca_origem,
-                      exposto=exposto, agora=agora, politica=politica, resumo=resumo)
+                      exposto=exposto, agora=agora, politica=politica,
+                      venues_executaveis=venues_executaveis, resumo=resumo)
 
     banco.pulsar(DAEMON, {"grupos": resumo.grupos, "sinais": resumo.sinais,
                           "abortos": resumo.abortos, "rastreados_clv": resumo.rastreados_clv,
