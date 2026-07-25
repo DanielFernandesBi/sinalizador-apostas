@@ -41,3 +41,46 @@ def e_violacao_unicidade(exc: BaseException) -> bool:
             return True
         e = e.__cause__ or e.__context__
     return False
+
+
+# Nomes de exceção e códigos que caracterizam falha TRANSITÓRIA de provedor. Ficam
+# como texto, e não como `except anthropic.APIError`, para o núcleo não importar o
+# SDK (regra do projeto: SDK só nos `cli.py`).
+_NOMES_TRANSITORIOS = (
+    "apiconnectionerror", "apitimeouterror", "connecttimeout", "connecterror",
+    "ratelimiterror", "internalservererror", "overloadederror", "serviceunavailable",
+    "timeout", "readtimeout", "remotedisconnected", "protocolerror",
+)
+
+
+def e_falha_transitoria(exc: BaseException) -> bool:
+    """A falha é passageira (rede, timeout, 429, 5xx) — vale tentar de novo?
+
+    Serve para NÃO gravar desfecho terminal em problema de infraestrutura. No L2 a
+    distinção é decisiva: com a unicidade por aposta lógica (Sugestão nº 11), um
+    candidato marcado `erro` está morto para sempre — uma indisponibilidade
+    momentânea da API mataria a oportunidade em definitivo. Falha transitória deixa
+    o sinal em `aguardando_crivo` para o próximo ciclo; o retry é naturalmente
+    limitado pelo kickoff, quando o L4 o fecha como `timeout_crivo`.
+
+    Falha PERMANENTE (JSON inválido, schema violado, passthrough quebrado) continua
+    virando `erro` na hora: repetir não conserta, e o sinal precisa de desfecho.
+    """
+    visto: set[int] = set()
+    e: BaseException | None = exc
+    while e is not None and id(e) not in visto:
+        visto.add(id(e))
+        if isinstance(e, (ConnectionError, TimeoutError, OSError)):
+            return True
+        nome = type(e).__name__.lower()
+        if any(marca in nome for marca in _NOMES_TRANSITORIOS):
+            return True
+        codigo = getattr(e, "status_code", None) or getattr(e, "code", None)
+        try:
+            n = int(codigo)          # 429 (rate limit) e 5xx (indisponibilidade)
+            if n == 429 or 500 <= n <= 599:
+                return True
+        except (TypeError, ValueError):
+            pass
+        e = e.__cause__ or e.__context__
+    return False

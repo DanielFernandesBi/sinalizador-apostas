@@ -60,11 +60,14 @@ class ModeloFake:
 
 
 class BancoFake:
-    def __init__(self, sinais=None):
+    def __init__(self, sinais=None, *, kickoff_passou=False, status_ja_mudou=False):
         self._sinais = sinais or []
         self.inseridos = []
         self.transicoes = []
         self.pulsos = []
+        # P0.2: cenários de corrida entre a chamada ao modelo e a conclusão.
+        self.kickoff_passou = kickoff_passou
+        self.status_ja_mudou = status_ja_mudou
 
     def config_vigente(self, chave):
         assert chave == "manual_crivo_l2"
@@ -79,6 +82,18 @@ class BancoFake:
     def inserir(self, tabela, registro):
         self.inseridos.append((tabela, registro))
         return {"id": f"{tabela}-{len(self.inseridos)}", **registro}
+
+    def concluir_crivo(self, sinal_id, crivo, novo_status):
+        """Espelha fn_concluir_crivo: parecer + transição numa transação só."""
+        if self.kickoff_passou:
+            self.transicoes.append((sinal_id, "timeout_crivo"))
+            return {"aplicado": False, "motivo": "kickoff_ultrapassado",
+                    "status": "timeout_crivo"}
+        if self.status_ja_mudou:
+            return {"aplicado": False, "motivo": "status_ja_mudou", "status": "vetado"}
+        self.inseridos.append(("crivos", {"sinal_id": sinal_id, **crivo}))
+        self.transicoes.append((sinal_id, novo_status))
+        return {"aplicado": True, "status": novo_status}
 
     def transicionar_status_sinal(self, sinal_id, novo_status):
         self.transicoes.append((sinal_id, novo_status))
@@ -263,3 +278,74 @@ def test_processar_fila_conta_e_pulsa_heartbeat():
     assert banco.transicoes == [("s-ok", "confirmado"), ("s-veto", "vetado")]
     assert banco.pulsos and banco.pulsos[-1][0] == "l2"
     assert banco.pulsos[-1][1]["avaliados"] == 2
+
+
+# ---------------- P0.2: conclusão atômica e falha transitória ----------------
+
+
+class ModeloQueFalha:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def avaliar(self, *, system, dossie_json, caminho):
+        raise self._exc
+
+
+class RateLimitError(Exception):
+    """Nome espelha o do SDK — o classificador não importa o SDK (núcleo sem SDK)."""
+
+
+class APIStatusError(Exception):
+    def __init__(self, status_code):
+        super().__init__(f"status {status_code}")
+        self.status_code = status_code
+
+
+def test_falha_transitoria_nao_vira_erro_e_segue_na_fila():
+    # Com a unicidade por aposta lógica (Sugestão nº 11), marcar `erro` mataria o
+    # candidato PARA SEMPRE por causa de uma indisponibilidade momentânea da API.
+    for exc in (RateLimitError("slow down"), APIStatusError(503),
+                ConnectionError("connection reset")):
+        banco = BancoFake()
+        status = avaliar_sinal(banco, ModeloQueFalha(exc), _sinal(_dossie()), manual=MANUAL)
+        assert status == "adiado", exc
+        assert banco.transicoes == []                   # NÃO mudou de status
+        assert banco.por_tabela("notificacoes") == []   # nem alertou como erro
+        assert banco.por_tabela("crivos") == []
+
+
+def test_falha_permanente_continua_virando_erro():
+    # 4xx que não é 429, e erro de programação: repetir não conserta.
+    for exc in (APIStatusError(400), TypeError("bug")):
+        banco = BancoFake()
+        status = avaliar_sinal(banco, ModeloQueFalha(exc), _sinal(_dossie()), manual=MANUAL)
+        assert status == "erro", exc
+        assert banco.status_final("row-1") == "erro"
+
+
+def test_kickoff_durante_a_chamada_vira_timeout_sem_gravar_parecer():
+    # A chamada profunda começou antes e terminou depois do apito. O veredicto perdeu
+    # validade: o sinal fecha como timeout_crivo e NENHUM parecer é gravado —
+    # opinião sobre aposta inexistente sujaria a auditoria do crivo.
+    banco = BancoFake(kickoff_passou=True)
+    modelo = ModeloFake(_saida_valida(verdict="CONFIRMA"))
+    status = avaliar_sinal(banco, modelo, _sinal(_dossie()), manual=MANUAL)
+    assert status == "timeout_crivo"
+    assert banco.por_tabela("crivos") == []
+    assert banco.transicoes == [("row-1", "timeout_crivo")]
+
+
+def test_status_ja_mudou_nao_regrava_nem_confirma():
+    # Outra instância do L2 (ou o L4) chegou antes: nada a fazer, e não é erro.
+    banco = BancoFake(status_ja_mudou=True)
+    modelo = ModeloFake(_saida_valida(verdict="CONFIRMA"))
+    status = avaliar_sinal(banco, modelo, _sinal(_dossie()), manual=MANUAL)
+    assert status == "vetado"                    # o status que já estava lá
+    assert banco.por_tabela("crivos") == []
+
+
+def test_resumo_separa_adiado_de_erro():
+    banco = BancoFake(sinais=[_sinal(_dossie())])
+    r = processar_fila(banco, ModeloQueFalha(RateLimitError("429")), limite=10)
+    assert r.adiados == 1 and r.erros == 0 and r.avaliados == 1
+    assert banco.pulsos[-1][1]["adiados"] == 1

@@ -515,6 +515,21 @@ class Banco:
         resp = self._c.rpc(funcao, params).execute()
         return resp.data if isinstance(resp.data, list) else []
 
+    def concluir_crivo(self, sinal_id: str, crivo: dict[str, Any],
+                       novo_status: str) -> dict[str, Any]:
+        """Grava o parecer do crivo E transiciona o sinal numa ÚNICA transação
+        (`fn_concluir_crivo`, migration 0013).
+
+        Antes eram duas operações soltas, e entre elas o L4 podia rodar
+        `fn_timeout_crivo` — deixando parecer gravado com o sinal em `timeout_crivo`,
+        ou o status mudando depois do apito. Devolve `aplicado=False` com o motivo
+        (`status_ja_mudou`, `kickoff_ultrapassado`, `crivo_ja_existe`) em vez de
+        levantar: são conflitos esperados, não falhas.
+        """
+        return self._rpc("fn_concluir_crivo", {
+            "p_sinal_id": sinal_id, "p_crivo": crivo, "p_status": novo_status,
+        })
+
     def registrar_sinal(self, registro: dict[str, Any]) -> dict[str, Any]:
         """Cria um sinal com as travas do banco (`fn_registrar_sinal`, migration 0012).
 

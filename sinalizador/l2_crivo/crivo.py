@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from pydantic import ValidationError
 
+from sinalizador.comum.erros import e_falha_transitoria
 from sinalizador.comum.modelos import CrivoSaida
 
 from .modelo import ModeloCrivo, RespostaModelo
@@ -95,6 +96,8 @@ class ResumoCrivo:
     confirmados: int = 0
     vetados: int = 0
     erros: int = 0
+    adiados: int = 0        # falha transitória: segue na fila, NÃO vira erro (P0.2)
+    perdidos_kickoff: int = 0   # a partida começou durante a chamada ao modelo
 
 
 def _registrar_erro(banco: Any, sinal_id: str, motivo: str) -> None:
@@ -134,15 +137,26 @@ def avaliar_sinal(banco: Any, modelo: ModeloCrivo, sinal: dict[str, Any], *, man
         saida = validar_saida(dados, sinal_id_esperado=sinal_id)
         verificar_passthrough(saida, dossie)
     except SaidaInvalidaError as e:
+        # PERMANENTE: repetir não conserta (JSON inválido, schema, passthrough).
         _registrar_erro(banco, sinal_id, str(e))
         return "erro"
-    except Exception as e:  # qualquer falha (rede, SDK, etc.) → erro, jamais CONFIRMA
+    except Exception as e:
+        if e_falha_transitoria(e):
+            # TRANSITÓRIA (rede, 429, 5xx): NÃO vira desfecho. Com a unicidade por
+            # aposta lógica (Sugestão nº 11), marcar `erro` mataria o candidato para
+            # sempre por causa de uma indisponibilidade momentânea. Fica na fila; o
+            # retry é limitado pelo kickoff, quando o L4 fecha como timeout_crivo.
+            _log.warning("falha transitória no crivo — sinal segue na fila",
+                         extra={"sinal_id": sinal_id, "erro": f"{type(e).__name__}: {e}"})
+            return "adiado"
         _registrar_erro(banco, sinal_id, f"exceção inesperada: {e}")
         return "erro"
 
-    # Saída válida → grava crivo e transiciona (CONFIRMA→confirmado, ABORTA→vetado).
-    banco.inserir("crivos", {
-        "sinal_id": sinal_id,
+    # Saída válida → grava crivo E transiciona numa ÚNICA transação (P0.2). Antes
+    # eram duas operações soltas: entre elas o L4 podia rodar `fn_timeout_crivo`,
+    # deixando parecer gravado com sinal em timeout, ou status mudado após o apito.
+    novo_status = "confirmado" if saida.verdict == "CONFIRMA" else "vetado"
+    r = banco.concluir_crivo(sinal_id, {
         "verdict": saida.verdict,
         "caminho_executado": saida.caminho_executado,
         "fatores": [f.model_dump(mode="json") for f in saida.fatores],
@@ -154,9 +168,18 @@ def avaliar_sinal(banco: Any, modelo: ModeloCrivo, sinal: dict[str, Any], *, man
         "tokens_entrada": resp.tokens_entrada,
         "tokens_saida": resp.tokens_saida,
         "custo_usd": resp.custo_usd,
-    })
-    novo_status = "confirmado" if saida.verdict == "CONFIRMA" else "vetado"
-    banco.transicionar_status_sinal(sinal_id, novo_status)
+    }, novo_status)
+
+    if not r.get("aplicado"):
+        motivo = r.get("motivo")
+        _log.warning("crivo não aplicado", extra={"sinal_id": sinal_id, "motivo": motivo,
+                                                  "status": r.get("status")})
+        # `kickoff_ultrapassado`: a partida começou DURANTE a chamada ao modelo. O
+        # veredicto perdeu validade e o banco já fechou o sinal como timeout_crivo,
+        # sem gravar parecer — registrar opinião sobre aposta inexistente sujaria a
+        # auditoria do crivo (vw_clv_por_veto).
+        return str(r.get("status") or "erro")
+
     _log.info("crivo concluído", extra={"sinal_id": sinal_id, "verdict": saida.verdict,
                                         "status": novo_status, "custo_usd": resp.custo_usd})
     return novo_status
@@ -178,10 +201,16 @@ def processar_fila(banco: Any, modelo: ModeloCrivo, *, limite: int = 50,
             resumo.confirmados += 1
         elif status == "vetado":
             resumo.vetados += 1
+        elif status == "adiado":
+            resumo.adiados += 1
+        elif status == "timeout_crivo":
+            resumo.perdidos_kickoff += 1
         else:
             resumo.erros += 1
     banco.pulsar(DAEMON, {"avaliados": resumo.avaliados, "confirmados": resumo.confirmados,
-                          "vetados": resumo.vetados, "erros": resumo.erros})
+                          "vetados": resumo.vetados, "erros": resumo.erros,
+                          "adiados": resumo.adiados,
+                          "perdidos_kickoff": resumo.perdidos_kickoff})
     _log.info("ciclo L2 concluído", extra={"avaliados": resumo.avaliados,
                                            "confirmados": resumo.confirmados,
                                            "vetados": resumo.vetados, "erros": resumo.erros})
