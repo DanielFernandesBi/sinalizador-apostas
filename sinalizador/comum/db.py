@@ -515,6 +515,21 @@ class Banco:
         resp = self._c.rpc(funcao, params).execute()
         return resp.data if isinstance(resp.data, list) else []
 
+    def registrar_sinal(self, registro: dict[str, Any]) -> dict[str, Any]:
+        """Cria um sinal com as travas do banco (`fn_registrar_sinal`, migration 0012).
+
+        A função TRAVA a linha do evento e recusa se a partida já começou ou se o L4
+        já finalizou o CLV do evento — a checagem e o INSERT ficam na mesma transação,
+        porque entre o `if` do Python e o INSERT o relógio anda (P0.1). Devolve
+        `criado=False` quando o candidato já existe (P0.5), sem erro.
+        """
+        return self._rpc("fn_registrar_sinal", {"p_dados": registro})
+
+    def registrar_aborto(self, registro: dict[str, Any]) -> dict[str, Any]:
+        """Cria um aborto/candidato_sombra com as mesmas travas (`fn_registrar_aborto`).
+        `criado=False` quando o candidato já foi registrado no evento (P0.6)."""
+        return self._rpc("fn_registrar_aborto", {"p_dados": registro})
+
     def inserir(self, tabela: str, registro: dict[str, Any]) -> dict[str, Any]:
         """INSERT append-only. Não há update/delete equivalente por desenho."""
         resp = self._c.table(tabela).insert(registro).execute()

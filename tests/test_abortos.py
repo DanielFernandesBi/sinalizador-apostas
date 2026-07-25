@@ -21,6 +21,9 @@ class BancoFake:
     def __init__(self):
         self.inseridos = []
 
+    def registrar_aborto(self, registro):
+        return self.inserir("abortos_l1", registro)
+
     def inserir(self, tabela, registro):
         self.inseridos.append((tabela, registro))
         return {"id": "aborto-uuid", **registro}

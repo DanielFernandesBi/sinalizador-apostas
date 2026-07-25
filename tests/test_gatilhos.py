@@ -9,8 +9,13 @@ from sinalizador.l1_gatilhos.gatilhos import (
     detectar_anomalia,
     detectar_odds_drop,
     melhor_preco,
+    Movimento,
     variacao_pct,
 )
+
+
+def _mov(pct):
+    return Movimento(mensuravel=True, variacao_pct=pct, revisoes=2)
 from sinalizador.l1_gatilhos.motor_gates import avaliar_exposicao, tetos_exposicao
 
 UTC = timezone.utc
@@ -38,18 +43,42 @@ class GatesFake:
 
 def test_variacao_pct_queda():
     serie = [(T0 - timedelta(seconds=600), 2.10), (T0, 2.00)]
-    assert variacao_pct(serie, 900, T0) == pytest.approx((2.00 - 2.10) / 2.10 * 100)
+    mov = variacao_pct(serie, 900, T0)
+    assert mov.mensuravel is True and mov.revisoes == 2
+    assert mov.pct == pytest.approx((2.00 - 2.10) / 2.10 * 100)
 
 
-def test_variacao_pct_menos_de_dois_pontos_e_zero():
-    assert variacao_pct([(T0, 2.0)], 900, T0) == 0.0
-    assert variacao_pct([], 900, T0) == 0.0
+def test_variacao_pct_sem_historico_e_INDETERMINADA_nao_zero():
+    # P0.4: `0.0` significava ao mesmo tempo "não se moveu" e "não dá para saber".
+    # A segunda leitura virava `referencia_estavel=True` — dado ausente confirmando
+    # condição positiva, o oposto de P6.
+    for serie in ([(T0, 2.0)], []):
+        mov = variacao_pct(serie, 900, T0)
+        assert mov.mensuravel is False
+        assert mov.variacao_pct is None          # NÃO é 0.0
+        assert mov.pct == 0.0                    # só o atalho explícito devolve 0
+
+
+def test_variacao_pct_recaptura_da_mesma_revisao_nao_cria_historico():
+    # P0.4: a unidade é a REVISÃO DISTINTA. O mesmo carimbo capturado três vezes é
+    # um estado de mercado só — tratá-lo como três pontos fabricaria uma medição.
+    serie = [(T0, 2.0), (T0, 2.0), (T0, 2.0)]
+    mov = variacao_pct(serie, 900, T0)
+    assert mov.mensuravel is False and mov.revisoes == 1
 
 
 def test_variacao_pct_ignora_fora_da_janela():
     serie = [(T0 - timedelta(seconds=5000), 3.0), (T0 - timedelta(seconds=100), 2.10), (T0, 2.00)]
     # ponto de 5000s atrás fica fora da janela de 900s
-    assert variacao_pct(serie, 900, T0) == pytest.approx((2.00 - 2.10) / 2.10 * 100)
+    mov = variacao_pct(serie, 900, T0)
+    assert mov.mensuravel is True and mov.revisoes == 2
+    assert mov.pct == pytest.approx((2.00 - 2.10) / 2.10 * 100)
+
+
+def test_odds_drop_sem_historico_nao_dispara():
+    # sem revisão anterior não há queda COMPROVADA (P6).
+    disparou, queda = detectar_odds_drop([(T0, 2.0)], GatesFake(), T0)
+    assert disparou is False and queda == 0.0
 
 
 # ---- odds_drop ----
@@ -78,15 +107,22 @@ def test_odds_drop_subida_nao_dispara():
 # ---- anomalia (gatilho_anomalo) ----
 
 def test_anomalia_venue_move_referencia_parada():
-    assert detectar_anomalia(move_ref_pct=0.5, move_venue_pct=4.0, gates=GatesFake()) is True
+    assert detectar_anomalia(_mov(0.5), _mov(4.0), gates=GatesFake()) is True
 
 
 def test_anomalia_nao_quando_referencia_tambem_move():
-    assert detectar_anomalia(move_ref_pct=4.0, move_venue_pct=4.0, gates=GatesFake()) is False
+    assert detectar_anomalia(_mov(4.0), _mov(4.0), gates=GatesFake()) is False
 
 
 def test_anomalia_nao_quando_venue_move_pouco():
-    assert detectar_anomalia(move_ref_pct=0.5, move_venue_pct=2.0, gates=GatesFake()) is False
+    assert detectar_anomalia(_mov(0.5), _mov(2.0), gates=GatesFake()) is False
+
+
+def test_anomalia_exige_movimento_mensuravel_nos_dois_lados():
+    # "referência parada" só é afirmável com histórico que o demonstre.
+    indet = Movimento(mensuravel=False, variacao_pct=None, revisoes=1)
+    assert detectar_anomalia(indet, _mov(4.0), gates=GatesFake()) is False
+    assert detectar_anomalia(_mov(0.5), indet, gates=GatesFake()) is False
 
 
 # ---- line_shopping ----

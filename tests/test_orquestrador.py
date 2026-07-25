@@ -1,12 +1,17 @@
 """Testes do wiring L0→L1 (orquestrador): snapshots reais → sinal/aborto."""
 from datetime import datetime, timedelta, timezone
 
+from sinalizador.comum.tempo import para_datetime as _dt_iso
+
+import pytest
+
 from sinalizador.l1_gatilhos.devig import devig_shin
 from sinalizador.l1_gatilhos.edge import odd_minima_aceitavel
 from sinalizador.l1_gatilhos.orquestrador import PoliticaVenue, chave_candidato, rodar_l1
 
 AGORA = datetime(2026, 7, 20, 20, 0, 30, tzinfo=timezone.utc)
 T = "2026-07-20T20:00:10Z"   # dentro de sincronia (0s) e idade (20s)
+T_ANT = "2026-07-20T19:50:10Z"  # revisão ANTERIOR da referência (dentro de janela_drop)
 
 _GATES = {
     "janela_sincronia_s": 60, "snapshot_idade_max_s": 600, "odd_teto": 3.30,
@@ -66,6 +71,8 @@ class BancoFake:
         self._homologados = HOMOLOG_PADRAO if homologados is None else homologados
         self.inseridos = []
         self.pulsos = []
+        self._chaves_usadas = set()
+        self.agora_rpc = AGORA          # "now()" do banco, para a trava de kickoff
 
     def chaves_sinais_abertos(self):
         return set(self._abertas)
@@ -104,6 +111,27 @@ class BancoFake:
         self.inseridos.append((tabela, registro))
         return {"id": f"{tabela}-{len(self.inseridos)}", **registro}
 
+    # RPCs guardadas (migration 0012). O fake espelha o essencial: recusa após o
+    # apito e uma unidade por chave_candidato na vida do evento.
+    def _guarda(self, registro, tabela):
+        ev = next((e for e in EVENTOS if e["id"] == registro.get("evento_id")), None)
+        inicio = _dt_iso(ev["inicio_utc"]) if ev else None
+        if inicio is None or inicio <= self.agora_rpc:
+            raise RuntimeError("partida já iniciada — nada é criado após o apito")
+        chave = registro.get("chave_candidato")
+        if chave and chave in self._chaves_usadas:
+            return {"id": None, "criado": False, "motivo": "candidato_ja_registrado"}
+        if chave:
+            self._chaves_usadas.add(chave)
+        self.inseridos.append((tabela, registro))
+        return {"id": f"{tabela}-{len(self.inseridos)}", "criado": True, **registro}
+
+    def registrar_sinal(self, registro):
+        return self._guarda(registro, "sinais")
+
+    def registrar_aborto(self, registro):
+        return self._guarda(registro, "abortos_l1")
+
     def pulsar(self, daemon, detalhe=None):
         self.pulsos.append((daemon, detalhe))
 
@@ -116,8 +144,11 @@ def _snap(sel, odd, casa_id, *, liquidez=None, ts=T, linha=None, mercado="1x2"):
             "linha": linha, "odd": odd, "liquidez": liquidez, "ts_fonte": ts, "ts_captura": ts}
 
 
-def _ref_snaps():
-    return [_snap(sel, odd, "c-pin") for sel, odd in REF_1X2]
+def _ref_snaps(ts=(T_ANT, T)):
+    """Referência com N revisões DISTINTAS e mesmas odds: movimento mensurável e
+    nulo → referência comprovadamente parada. Uma revisão só (P0.4) não permite
+    afirmar estabilidade e o candidato aborta como indeterminado."""
+    return [_snap(sel, odd, "c-pin", ts=t) for t in ts for sel, odd in REF_1X2]
 
 
 def test_sinal_ponta_a_ponta_exchange():
@@ -166,12 +197,13 @@ def test_referencia_incompleta_e_pulada():
     p1 = _p1()
     odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
     # falta a seleção "2" na referência → sem devig
-    snaps = [_snap("1", 2.0, "c-pin"), _snap("X", 3.5, "c-pin"),
-             _snap("1", odd_venue, "c-bf", liquidez=100000)]
+    snaps = [_snap("1", 2.0, "c-pin", ts=t) for t in (T_ANT, T)] + \
+            [_snap("X", 3.5, "c-pin", ts=t) for t in (T_ANT, T)] + \
+            [_snap("1", odd_venue, "c-bf", liquidez=100000)]
     banco = BancoFake(snaps)
     r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
     assert r.sinais == 0 and r.abortos == 0
-    assert any("referência incompleta" in m for m in r.pulados)
+    assert any("sem revisão completa" in m for m in r.pulados)
 
 
 def test_line_shopping_escolhe_o_maior_preco():
@@ -270,15 +302,15 @@ def test_ah_mandante_e_visitante_casam_no_mesmo_grupo_geram_sinal():
     # separado, e o book nunca fechava (86/91 incompletos na auditoria).
     p_mand = devig_shin([1.90, 1.95])[0][0]              # (probs, z) → prob do mandante
     odd_venue = round(odd_minima_aceitavel(p_mand, 0.065, 0.02) + 0.15, 3)  # edge > 2%
-    snaps = [
-        _snap("mandante", 1.90, "c-pin", linha=-0.5, mercado="ah"),
-        _snap("visitante", 1.95, "c-pin", linha=-0.5, mercado="ah"),   # canônica (fonte dava +0.5)
+    snaps = [_snap(sel, odd, "c-pin", linha=-0.5, mercado="ah", ts=t)
+             for t in (T_ANT, T)
+             for sel, odd in (("mandante", 1.90), ("visitante", 1.95))] + [
         _snap("mandante", odd_venue, "c-bf", liquidez=100000, linha=-0.5, mercado="ah"),
     ]
     banco = BancoFake(snaps)
     r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
     assert r.sinais == 1                                  # o book fechou (senão seria 0)
-    assert not any("referência incompleta" in m for m in r.pulados)
+    assert not any("sem revisão completa" in m for m in r.pulados)
     sinal = banco.por_tabela("sinais")[0]
     assert sinal["mercado"] == "ah" and sinal["selecao"] == "mandante"
     assert sinal["linha"] == -0.5
@@ -426,3 +458,103 @@ def test_candidato_sombra_deduplicado_na_janela():
     assert r.candidatos_sombra == 0 and r.abortos == 0
     assert banco.por_tabela("abortos_l1") == []
     assert any("candidato_sombra já registrado" in m for m in r.pulados)
+
+
+# ---- P0.1: nada nasce depois do apito ----
+
+def test_partida_ja_iniciada_nao_gera_nada():
+    # O L1 lê a janela de lookback e uma revisão pré-jogo continua "fresca" pelo gate
+    # de idade por até 600 s: sem a trava, minutos após o início ainda nasciam sinal,
+    # aborto e candidato_sombra — e o L4 pode já ter finalizado o evento.
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps)
+    depois = _dt_iso("2026-07-20T21:00:01Z")      # 1 s após o kickoff
+    banco.agora_rpc = depois
+    r = rodar_l1(banco, GatesFake(), agora=depois, politica=PoliticaVenue.EXCHANGE)
+
+    assert r.sinais == 0 and r.abortos == 0 and r.candidatos_sombra == 0
+    assert r.pos_kickoff == 1
+    assert banco.inseridos == []                   # nem sinal, nem aborto
+    assert any("já iniciada" in m for m in r.pulados)
+
+
+def test_no_exato_instante_do_kickoff_ja_nao_cria():
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps)
+    kickoff = _dt_iso("2026-07-20T21:00:00Z")
+    banco.agora_rpc = kickoff
+    r = rodar_l1(banco, GatesFake(), agora=kickoff, politica=PoliticaVenue.EXCHANGE)
+    assert r.pos_kickoff == 1 and banco.inseridos == []
+
+
+# ---- P0.3: o book da EMISSÃO também é uma revisão indivisível ----
+
+def test_revisao_incompleta_nao_e_completada_com_a_anterior():
+    # Às 20h00:20 a seleção "2" saiu do payload (suspensa) e "X" mudou de 3.50 para
+    # 3.90. O p_justa NÃO pode sair de "1"/"X" dessa revisão parcial casados com o
+    # "2" da anterior — book que nunca existiu. Vale a última revisão COMPLETA,
+    # inteira. Se o de-vig tivesse usado X=3.90, o p_justa seria outro.
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    t_pos = "2026-07-20T20:00:20Z"
+    snaps = _ref_snaps() + [                       # completas em T_ANT e T
+        _snap("1", 2.0, "c-pin", ts=t_pos),        # parcial: sem "2", com X alterado
+        _snap("X", 3.90, "c-pin", ts=t_pos),
+        _snap("1", odd_venue, "c-bf", liquidez=100000),
+    ]
+    banco = BancoFake(snaps)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+
+    assert r.sinais == 1, banco.por_tabela("abortos_l1")
+    sinal = banco.por_tabela("sinais")[0]
+    assert sinal["p_justa"] == pytest.approx(p1)   # veio da revisão completa
+    assert sinal["odd_referencia"] == 2.0
+
+
+def test_sem_revisao_completa_nao_emite():
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = [_snap("1", 2.0, "c-pin"), _snap("X", 3.5, "c-pin"),   # nunca teve "2"
+             _snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    assert r.sinais == 0 and banco.por_tabela("sinais") == []
+    assert any("sem revisão completa" in m for m in r.pulados)
+
+
+# ---- P0.4: estabilidade é afirmação, não default ----
+
+def test_uma_revisao_so_aborta_por_estabilidade_indeterminada():
+    # Antes: sem histórico → variação 0.0 → "referência estável" → sinal emitido.
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps(ts=(T,)) + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+
+    assert r.sinais == 0 and r.abortos == 1
+    aborto = banco.por_tabela("abortos_l1")[0]
+    assert aborto["gate_reprovado"] == "referencia_estabilidade_indeterminada"
+    assert aborto["clv_rastrear"] is False     # não é near-miss: é dado insuficiente
+    assert aborto["dossie_parcial"]["revisoes_na_janela"] == 1
+
+
+# ---- P0.5 / P0.6: uma unidade estatística por aposta lógica ----
+
+def test_candidato_ja_registrado_nao_reemite_mesmo_apos_veto():
+    # A RPC devolve criado=False (o índice global recusou). O L1 não pode contar
+    # isso como sinal novo — seria a mesma aposta entrando duas vezes na amostra.
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps)
+    chave = chave_candidato("ev1", "1x2", None, "1", "c-bf")
+    banco._chaves_usadas.add(chave)             # já existiu (vetado num ciclo anterior)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+
+    assert r.sinais == 0
+    assert banco.por_tabela("sinais") == []

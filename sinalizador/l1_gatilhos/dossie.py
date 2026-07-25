@@ -30,7 +30,7 @@ class DossieIncompletoError(ValueError):
 
 
 class _Inseridor(Protocol):
-    def inserir(self, tabela: str, registro: dict[str, Any]) -> dict[str, Any]: ...
+    def registrar_sinal(self, registro: dict[str, Any]) -> dict[str, Any]: ...
 
 
 def construir_dossie(dados: dict[str, Any]) -> Dossie:
@@ -90,4 +90,7 @@ def enfileirar_sinal(
         "dossie": dossie.model_dump(mode="json"),        # datetimes → ISO (jsonb)
         # status usa o default do schema: 'aguardando_crivo'
     }
-    return banco.inserir("sinais", registro)
+    # Via RPC guardada (migration 0012): o banco trava a linha do evento e recusa
+    # criação após o apito ou em evento já finalizado no L4 (P0.1), e devolve
+    # `criado=False` se o candidato já existe (P0.5) — sem levantar.
+    return banco.registrar_sinal(registro)

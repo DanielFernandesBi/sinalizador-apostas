@@ -50,10 +50,10 @@ from sinalizador.comum.erros import e_violacao_unicidade
 from sinalizador.comum.modelos import Dossie
 
 from .abortos import deve_rastrear_clv, registrar_aborto
-from .devig import devig_shin
 from .dossie import construir_dossie, enfileirar_sinal
 from .edge import comissao_fracao, edge_liquido, odd_minima_aceitavel
 from .gatilhos import detectar_anomalia, detectar_odds_drop, melhor_preco, variacao_pct
+from .revisao import ORDEM_SELECAO, linha_key, ultima_revisao_completa
 from .motor_gates import (
     ContextoAvaliacao,
     avaliar,
@@ -66,13 +66,10 @@ _log = logging.getLogger(__name__)
 
 DAEMON = "l1"
 
-# Ordem canônica das seleções por mercado (para o vetor de-vigado do Shin) e
-# conjunto obrigatório: book de referência sem TODAS as seleções → sem devig (P6).
-ORDEM_SELECAO: dict[str, tuple[str, ...]] = {
-    "1x2": ("1", "X", "2"),
-    "ou": ("over", "under"),
-    "ah": ("mandante", "visitante"),
-}
+# ORDEM_SELECAO e a montagem de revisão vivem em `revisao.py` — definição ÚNICA,
+# compartilhada com o L4. Reexportada aqui por compatibilidade de import.
+__all__ = ["ORDEM_SELECAO", "PoliticaVenue", "chave_candidato", "rodar_l1",
+           "agrupar_snapshots", "avaliar_grupo", "ResumoL1", "GrupoMercado"]
 
 
 class PoliticaVenue(str, Enum):
@@ -90,6 +87,7 @@ class ResumoL1:
     abortos: int = 0
     rastreados_clv: int = 0
     candidatos_sombra: int = 0   # achado 8: passou tudo, mercado não homologado (só CLV)
+    pos_kickoff: int = 0         # P0.1: grupos recusados por partida já iniciada
     nao_autorizados: int = 0     # achado 8: grupo pulado (suspenso/caducado ou sem config)
     pulados: list[str] = field(default_factory=list)  # motivos de skip (P6)
 
@@ -120,6 +118,10 @@ class GrupoMercado:
     linha: Optional[float]
     ref: dict[str, list[PontoSerie]]                         # selecao → série (ts, odd)
     venue: dict[str, dict[str, list[tuple[datetime, float, Optional[float]]]]]  # sel → casa_id → série
+    # Linhas CRUAS da referência deste grupo: é delas que sai a revisão indivisível
+    # (P0.3). As séries acima seguem servindo aos gatilhos (movimento no tempo).
+    snaps_ref: list[dict[str, Any]] = field(default_factory=list)
+    inicio_utc: Optional[datetime] = None                    # kickoff (trava do P0.1)
 
 
 def _casas_venue_da_politica(casas: dict[str, dict], politica: PoliticaVenue) -> set[str]:
@@ -192,6 +194,18 @@ def avaliar_grupo(
         resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}: mercado fora do escopo")
         return
 
+    # P0.1 — NADA é criado depois do apito. O L1 lê a janela de lookback e uma
+    # revisão pré-jogo continua "fresca" pelo gate de idade por até 600 s: sem esta
+    # trava, minutos APÓS o início ainda nasciam sinal, aborto e candidato_sombra.
+    # Pior: o L4 pode já ter finalizado o evento (`clv_eventos_finalizados`), e item
+    # criado depois disso não reabre a finalização — ficaria sem CLV para sempre.
+    # A trava de aplicação é a primeira barreira; a segunda é do banco, na RPC.
+    if grupo.inicio_utc is None or grupo.inicio_utc <= agora:
+        resumo.pulados.append(
+            f"{grupo.evento_id}/{grupo.mercado}: partida já iniciada (ou sem início) — nada é criado")
+        resumo.pos_kickoff += 1
+        return
+
     # Gate de homologação de mercado (Doutrina P2 / achado 8) — decisão de GRUPO
     # (liga, mercado). Só 'homologado' segue o caminho normal (L2/L3); 'backtest' (a
     # fase de calibração) vira `candidato_sombra` mais abaixo — POR SELEÇÃO, e só após
@@ -207,20 +221,25 @@ def avaliar_grupo(
         return
     modo_sombra_homolog = status_homolog != "homologado"  # backtest/calibração → candidato_sombra
 
-    # Referência: última odd de cada seleção. Falta alguma → sem devig (P6).
-    ref_atual: dict[str, PontoSerie] = {}
-    for sel in ordem:
-        ult = _ultimo(grupo.ref.get(sel, []))
-        if ult is None or ult[1] <= 1.0:
-            resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}: referência incompleta ({sel})")
-            return
-        ref_atual[sel] = ult
+    # Referência: a última REVISÃO COMPLETA (P0.3). Antes pegava-se o último preço de
+    # CADA seleção independentemente, o que monta um book que nunca existiu sempre que
+    # a revisão mais recente omite uma seleção. Aqui é pior que no fechamento: este
+    # book vira a `p_justa`, logo o edge, logo a existência do sinal.
+    rev = ultima_revisao_completa(grupo.snaps_ref, mercado=grupo.mercado,
+                                  linha=grupo.linha, ate=agora)
+    if rev is None:
+        resumo.pulados.append(
+            f"{grupo.evento_id}/{grupo.mercado}: sem revisão completa da referência")
+        return
+    if any(rev.odds[sel] <= 1.0 for sel in ordem):
+        resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}: odd de referência inválida")
+        return
     try:
-        probs, _z = devig_shin([ref_atual[sel][1] for sel in ordem])
+        p_por_sel = rev.probs()
     except ValueError as e:
         resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}: devig falhou ({e})")
         return
-    p_por_sel = dict(zip(ordem, probs))
+    ts_revisao = rev.ts_fonte
 
     casas_venue = _casas_venue_da_politica(casas, politica)
     janela_sinc = float(gates.get("janela_sincronia_s"))
@@ -230,7 +249,8 @@ def avaliar_grupo(
 
     for sel in ordem:
         p_justa = p_por_sel[sel]
-        ts_ref, odd_ref = ref_atual[sel]
+        # Carimbo e odd vêm da MESMA revisão — não de pontos avulsos por seleção.
+        ts_ref, odd_ref = ts_revisao, rev.odds[sel]
 
         # Venues capturados para esta seleção (line shopping): última odd por casa.
         candidatos_venue: list[dict[str, Any]] = []
@@ -277,9 +297,22 @@ def avaliar_grupo(
         anomalo = detectar_anomalia(move_ref, move_venue, gates)
         gatilho = "odds_drop" if drop_disparou else "value_bet"
         caminho = "profundo" if anomalo else "rapido"
-        # Estabilidade da referência: derivada (referência parada = não se moveu
-        # ≥ anomalia_move_pct na janela). Reutiliza o gate, não cria um novo.
-        referencia_estavel = abs(move_ref) < anomalia_lim
+
+        # P0.4 — estabilidade da referência é AFIRMAÇÃO, não default. Sem duas
+        # revisões distintas na janela não há como dizer que a referência está
+        # parada: antes, `variacao_pct` devolvia 0.0 sem histórico e `abs(0.0) <
+        # limiar` declarava "estável". Dado ausente virava confirmação positiva —
+        # o oposto de P6. Agora a indeterminação ABORTA o candidato.
+        if not move_ref.mensuravel:
+            _abortar_dedup(banco, grupo, sel, "referencia_estabilidade_indeterminada",
+                           {"evento_id": grupo.evento_id, "mercado": grupo.mercado,
+                            "selecao": sel, "linha": grupo.linha,
+                            "gatilho": "value_bet",
+                            "revisoes_na_janela": move_ref.revisoes},
+                           0.0, gates, resumo, chave=chave, chaves_abortos=chaves_abortos,
+                           rastrear_forcado=False)
+            continue
+        referencia_estavel = abs(move_ref.pct) < anomalia_lim
 
         stake_frac = stake_kelly_fracao(p_justa, melhor["odd"], gates)
         stake_valor = stake_frac * banca
@@ -340,9 +373,9 @@ def avaliar_grupo(
             aplica_liquidez=aplica_liquidez, politica=politica, banca_origem=banca_origem,
         )
         try:
-            enfileirar_sinal(banco, dossie, evento_id=grupo.evento_id,
-                             casa_venue_id=melhor["casa_id"], linha=grupo.linha,
-                             chave_candidato=chave)
+            ret = enfileirar_sinal(banco, dossie, evento_id=grupo.evento_id,
+                                   casa_venue_id=melhor["casa_id"], linha=grupo.linha,
+                                   chave_candidato=chave)
         except Exception as e:  # backstop de unicidade do banco (corrida entre daemons)
             if _e_duplicidade(e):
                 resumo.pulados.append(
@@ -350,6 +383,14 @@ def avaliar_grupo(
                 chaves_abertas.add(chave)
                 continue
             raise
+        # P0.5: a RPC recusa SEM levantar quando o candidato já foi registrado no
+        # evento (mesmo já vetado/expirado). Contar isso como sinal novo colocaria a
+        # MESMA aposta duas vezes na amostra — o erro que a unicidade global corrige.
+        if isinstance(ret, dict) and ret.get("criado") is False:
+            resumo.pulados.append(
+                f"{grupo.evento_id}/{grupo.mercado}/{sel}: candidato já registrado no evento")
+            chaves_abertas.add(chave)
+            continue
         chaves_abertas.add(chave)  # dedup intra-ciclo (não reemite no mesmo ciclo)
         resumo.sinais += 1
         _log.info("sinal enfileirado", extra={"evento": grupo.evento_id, "mercado": grupo.mercado,
@@ -366,9 +407,13 @@ def _registrar(banco, grupo, sel, gate_reprovado, dossie_parcial, edge, gates, r
         rastrear = gate_reprovado == "edge_min_pct" and deve_rastrear_clv(edge, gates)
     else:
         rastrear = rastrear_forcado
-    registrar_aborto(banco, gatilho=dossie_parcial["gatilho"], gate_reprovado=gate_reprovado or "desconhecido",
-                     dossie_parcial=dossie_parcial, evento_id=grupo.evento_id, clv_rastrear=rastrear,
-                     chave_candidato=chave)
+    ret = registrar_aborto(banco, gatilho=dossie_parcial["gatilho"],
+                           gate_reprovado=gate_reprovado or "desconhecido",
+                           dossie_parcial=dossie_parcial, evento_id=grupo.evento_id,
+                           clv_rastrear=rastrear, chave_candidato=chave)
+    # P0.6: idem para abortos/candidato_sombra — uma unidade por aposta lógica.
+    if isinstance(ret, dict) and ret.get("criado") is False:
+        return
     resumo.abortos += 1
     if rastrear:
         resumo.rastreados_clv += 1
@@ -514,12 +559,6 @@ def _montar_dossie(
 # ------------------------- carregamento (banco → grupos) -------------------------
 
 
-def _linha_key(linha: Any) -> Optional[float]:
-    if linha is None:
-        return None
-    return round(float(linha), 2)
-
-
 def agrupar_snapshots(
     snaps: list[dict[str, Any]], casas: dict[str, dict], eventos: dict[str, dict]
 ) -> list[GrupoMercado]:
@@ -530,12 +569,13 @@ def agrupar_snapshots(
         casa = casas.get(s.get("casa_id"))
         if ts is None or casa is None or s.get("odd") is None:
             continue
-        chave = (s["evento_id"], s["mercado"], _linha_key(s.get("linha")))
-        g = tmp.setdefault(chave, {"ref": {}, "venue": {}})
+        chave = (s["evento_id"], s["mercado"], linha_key(s.get("linha")))
+        g = tmp.setdefault(chave, {"ref": {}, "venue": {}, "snaps_ref": []})
         sel = s["selecao"]
         odd = float(s["odd"])
         if casa.get("tipo") == "referencia":
             g["ref"].setdefault(sel, []).append((ts, odd))
+            g["snaps_ref"].append(s)          # cru: base da revisão indivisível (P0.3)
         else:
             liq = s.get("liquidez")
             g["venue"].setdefault(sel, {}).setdefault(s["casa_id"], []).append(
@@ -551,6 +591,7 @@ def agrupar_snapshots(
             evento={"liga": ev.get("liga", ""), "partida": partida,
                     "data_hora_utc": ev.get("inicio_utc")},
             mercado=mercado, linha=linha, ref=g["ref"], venue=g["venue"],
+            snaps_ref=g["snaps_ref"], inicio_utc=_dt(ev.get("inicio_utc")),
         ))
     return grupos
 

@@ -21,21 +21,17 @@ from typing import Any, Optional
 
 from sinalizador.comum.erros import e_violacao_unicidade
 from sinalizador.comum.tempo import para_datetime
-from sinalizador.l1_gatilhos.devig import devig_shin
-from sinalizador.l1_gatilhos.orquestrador import ORDEM_SELECAO
+from sinalizador.l1_gatilhos.revisao import (
+    ORDEM_SELECAO,
+    Revisao,
+    agrupar_por_revisao,
+    linha_key,
+    revisoes_completas,
+)
 
 _log = logging.getLogger(__name__)
 
 DAEMON = "l4"
-
-
-def _linha_key(linha: Any) -> Optional[float]:
-    if linha is None:
-        return None
-    try:
-        return round(float(linha), 2)
-    except (TypeError, ValueError):
-        return None
 
 
 def prob_implicita(odd: float) -> float:
@@ -70,27 +66,6 @@ class FechamentoIndisponivel:
     idade_s: Optional[float] = None
 
 
-def _agrupar_por_revisao(
-    snaps_ref: list[dict[str, Any]]
-) -> dict[tuple, dict[str, float]]:
-    """Agrupa os snapshots pela unidade INDIVISÍVEL da revisão:
-    `(casa_id, mercado, linha canônica, ts_fonte)` → {seleção: odd}.
-
-    `casa_id` entra na chave de propósito: se houver mais de uma casa de referência,
-    o book jamais pode ser montado juntando seleções de referências distintas.
-    """
-    revisoes: dict[tuple, dict[str, float]] = {}
-    for s in snaps_ref:
-        if s.get("odd") is None:
-            continue
-        ts = para_datetime(s.get("ts_fonte"))
-        if ts is None:
-            continue  # sem carimbo não há revisão a que pertencer (P6)
-        chave = (s.get("casa_id"), s["mercado"], _linha_key(s.get("linha")), ts)
-        revisoes.setdefault(chave, {})[s["selecao"]] = float(s["odd"])
-    return revisoes
-
-
 def revisoes_de_fechamento(
     snaps_ref: list[dict[str, Any]], *, inicio: datetime, limite_idade_s: float
 ) -> tuple[dict[tuple, RevisaoFechamento], list[FechamentoIndisponivel]]:
@@ -107,56 +82,49 @@ def revisoes_de_fechamento(
     Devolve (fechamentos, indisponíveis). Mercado fora do escopo (`ORDEM_SELECAO`)
     não entra em nenhuma das duas listas — não é dado faltando, é fora de escopo.
     """
-    revisoes = _agrupar_por_revisao(snaps_ref)
+    # A montagem da revisão é COMPARTILHADA com o L1 (`l1_gatilhos/revisao.py`).
+    # Ter duas implementações do mesmo conceito foi o que permitiu corrigir o book
+    # sintético aqui e deixá-lo na emissão (P0.3) — uma definição só impede a
+    # divergência de voltar.
+    completas = revisoes_completas(snaps_ref, ate=inicio)
+    por_chave: dict[tuple, list[Revisao]] = {}
+    for rev in completas:
+        por_chave.setdefault((rev.mercado, rev.linha), []).append(rev)
 
-    # Candidatas por (mercado, linha): completas e anteriores/iguais ao início.
-    completas: dict[tuple, list[tuple[datetime, str, dict[str, float]]]] = {}
-    vistos: set[tuple] = set()          # (mercado, linha) que existem nos snapshots
-    for (casa_id, mercado, linha, ts), odds_por_sel in revisoes.items():
-        ordem = ORDEM_SELECAO.get(mercado)
-        if ordem is None:
-            continue                     # fora do escopo — silencioso, não é falta de dado
-        vistos.add((mercado, linha))
-        if ts > inicio:
-            continue                     # revisão posterior ao início não é fechamento
-        if any(sel not in odds_por_sel for sel in ordem):
-            continue                     # incompleta: descartada INTEIRA (nunca completada)
-        completas.setdefault((mercado, linha), []).append((ts, casa_id, odds_por_sel))
+    # (mercado, linha) que EXISTEM nos snapshots — inclusive os que não fecharam.
+    vistos: set[tuple] = set()
+    for (_casa, mercado, linha, _ts) in agrupar_por_revisao(snaps_ref):
+        if ORDEM_SELECAO.get(mercado) is not None:
+            vistos.add((mercado, linha))
 
     fechamentos: dict[tuple, RevisaoFechamento] = {}
     indisponiveis: list[FechamentoIndisponivel] = []
 
     for chave in sorted(vistos):
         mercado, linha = chave
-        candidatas = completas.get(chave)
+        candidatas = por_chave.get(chave)
         if not candidatas:
             indisponiveis.append(FechamentoIndisponivel(
                 mercado=mercado, linha=linha, motivo="sem_revisao_completa",
                 limite_s=limite_idade_s))
             continue
-
-        # Mais recente; empate entre casas de referência resolvido por casa_id
-        # (determinismo). Com mais de uma referência, a PRIORIDADE é decisão de
-        # rito — ver PC-REFERENCIA-MULTIPLA; hoje só a Pinnacle é referência.
-        ts, casa_id, odds_por_sel = max(candidatas, key=lambda c: (c[0], c[1]))
-        idade_s = (inicio - ts).total_seconds()
+        rev = candidatas[0]          # `revisoes_completas` já ordena: mais recente primeiro
+        idade_s = (inicio - rev.ts_fonte).total_seconds()
         if idade_s > limite_idade_s:
             indisponiveis.append(FechamentoIndisponivel(
                 mercado=mercado, linha=linha, motivo="revisao_completa_defasada",
                 limite_s=limite_idade_s, idade_s=idade_s))
             continue
-
-        ordem = ORDEM_SELECAO[mercado]
         try:
-            probs, _z = devig_shin([odds_por_sel[sel] for sel in ordem])
+            probs = rev.probs()
         except ValueError:
             indisponiveis.append(FechamentoIndisponivel(
                 mercado=mercado, linha=linha, motivo="sem_revisao_completa",
                 limite_s=limite_idade_s))
             continue
         fechamentos[chave] = RevisaoFechamento(
-            casa_id=casa_id, mercado=mercado, linha=linha, ts_fonte=ts,
-            idade_s=idade_s, probs=dict(zip(ordem, probs)),
+            casa_id=rev.casa_id, mercado=mercado, linha=linha, ts_fonte=rev.ts_fonte,
+            idade_s=idade_s, probs=probs,
         )
     return fechamentos, indisponiveis
 
@@ -237,7 +205,7 @@ def _itens_do_evento(banco: Any, evento_id: str) -> list[ItemFechamento]:
         itens.append(ItemFechamento(
             sinal_id=s["id"], aborto_id=None,
             categoria=CATEGORIA_POR_STATUS[s["status"]],
-            mercado=s["mercado"], selecao=s["selecao"], linha=_linha_key(s.get("linha")),
+            mercado=s["mercado"], selecao=s["selecao"], linha=linha_key(s.get("linha")),
             odd_emissao=float(s["odd_venue"]), p_emissao=float(s["p_justa"]),
             contrafactual=(s["status"] != "confirmado"),
             motivo_origem=MOTIVO_POR_STATUS.get(s["status"]),
@@ -251,7 +219,7 @@ def _itens_do_evento(banco: Any, evento_id: str) -> list[ItemFechamento]:
             itens.append(ItemFechamento(
                 sinal_id=None, aborto_id=a["id"], categoria="contrafactual_l1",
                 mercado=str(dp.get("mercado") or "?"), selecao=str(sel or "?"),
-                linha=_linha_key(dp.get("linha")), odd_emissao=0.0, p_emissao=0.0,
+                linha=linha_key(dp.get("linha")), odd_emissao=0.0, p_emissao=0.0,
                 contrafactual=True, motivo_origem="dossie_parcial_incompleto",
             ))
             continue
@@ -260,7 +228,7 @@ def _itens_do_evento(banco: Any, evento_id: str) -> list[ItemFechamento]:
         itens.append(ItemFechamento(
             sinal_id=None, aborto_id=a["id"],
             categoria="calibracao" if calibracao else "contrafactual_l1",
-            mercado=dp["mercado"], selecao=sel, linha=_linha_key(dp.get("linha")),
+            mercado=dp["mercado"], selecao=sel, linha=linha_key(dp.get("linha")),
             odd_emissao=float(odd),
             p_emissao=float(dp.get("p_justa") or prob_implicita(float(odd))),
             contrafactual=True,

@@ -38,9 +38,9 @@ class BancoFake:
     def __init__(self):
         self.inseridos = []
 
-    def inserir(self, tabela, registro):
-        self.inseridos.append((tabela, registro))
-        return {"id": "sinal-uuid", **registro}
+    def registrar_sinal(self, registro):
+        self.inseridos.append(("sinais", registro))
+        return {"id": registro.get("id", "sinal-uuid"), "criado": True, **registro}
 
 
 # ---- construir_dossie ----

@@ -11,7 +11,7 @@ from typing import Any, Optional, Protocol
 
 
 class _Inseridor(Protocol):
-    def inserir(self, tabela: str, registro: dict[str, Any]) -> dict[str, Any]: ...
+    def registrar_aborto(self, registro: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class ProvedorGates(Protocol):
@@ -46,8 +46,9 @@ def registrar_aborto(
     e se o quase-sinal será rastreado por CLV (`clv_rastrear`). `chave_candidato`
     (achado 7) permite o dedup de abortos na janela — um near-miss persistente não
     vira um aborto por ciclo."""
-    return banco.inserir(
-        "abortos_l1",
+    # Via RPC guardada (migration 0012): mesmas travas de kickoff/finalização do
+    # sinal, e uma unidade estatística por aposta lógica na vida do evento (P0.6).
+    return banco.registrar_aborto(
         {
             "gatilho": gatilho,
             "evento_id": evento_id,
@@ -55,5 +56,5 @@ def registrar_aborto(
             "dossie_parcial": dossie_parcial,
             "clv_rastrear": clv_rastrear,
             "chave_candidato": chave_candidato,
-        },
+        }
     )
