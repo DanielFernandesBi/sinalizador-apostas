@@ -50,7 +50,17 @@ def _cmd_fechar(banco: Banco, args) -> int:
 
 
 def _cmd_relatorio(banco: Banco, args) -> int:
-    texto = formatar_relatorio(banco.clv_global(), banco.banca_atual(), banco.saude_daemons())
+    gates = CarregadorGates(banco)
+    gates.validar_integridade()
+    # `amostra_minima` vem do gate pétreo (regra 6), não de constante no código.
+    amostra_minima = int(gates.get("amostra_minima"))
+    dia = args.dia or datetime.now(timezone.utc).date().isoformat()
+    texto = formatar_relatorio(
+        banco.clv_por_categoria(), banco.banca_atual(), banco.saude_daemons(),
+        amostra_minima=amostra_minima, dia=dia,
+        clv_do_dia=banco.clv_do_dia(dia),
+        perda_do_dia=banco.clv_perda_amostra_do_dia(dia),
+    )
     print(texto)
     if args.enviar:
         from sinalizador.l3_notifica.bot import BotTelegram
@@ -95,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
 
     pr = sub.add_parser("relatorio", help="E5.5 — relatório diário")
     pr.add_argument("--enviar", action="store_true", help="envia ao Telegram além de imprimir")
+    pr.add_argument("--dia", help="data das partidas (AAAA-MM-DD); padrão: hoje (UTC)")
 
     pa = sub.add_parser("apostei", help="E5.3 — registra execução humana")
     pa.add_argument("--sinal", required=True)

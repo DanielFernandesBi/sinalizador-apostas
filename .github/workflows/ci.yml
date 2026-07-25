@@ -1,0 +1,51 @@
+# CI — a suíte roda a cada push/PR (Tier 3 do 2º ciclo de auditoria).
+#
+# A suíte é 100% de fakes: sem rede, sem Supabase, sem token do Telegram, sem chave
+# da Anthropic. Por isso a CI não precisa de NENHUM segredo — e é por isso que ela
+# pode rodar em PR de qualquer origem sem expor credencial.
+#
+# Dois jobs de propósito:
+#   `testes`      — instala do LOCK. É o portão: reprodutível, tem de passar.
+#   `deps-soltas` — instala das faixas de `requirements.txt`. Avisa cedo quando uma
+#                   versão nova de upstream quebra o projeto, SEM bloquear o merge
+#                   (`continue-on-error`): a quebra é do mundo lá fora, não do PR.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  testes:
+    name: testes (lock, 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar dependências fixadas
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock.txt
+      - name: Suíte
+        run: python -m pytest -q
+
+  deps-soltas:
+    name: testes (faixas de requirements.txt) — alerta, não portão
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Instalar dependências pelas faixas declaradas
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Suíte
+        run: python -m pytest -q

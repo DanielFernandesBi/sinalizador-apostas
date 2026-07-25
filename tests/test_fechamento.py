@@ -422,23 +422,80 @@ def test_rodar_fechamento_marca_timeout_crivo_e_pulsa():
     assert banco.por_ref(sinal_id="s1")["p_categoria"] == "contrafactual_operacional"
 
 
-# ---------------- relatório ----------------
+# ---------------- relatório (Tier 3) ----------------
 
-def test_relatorio_avisa_amostra_pequena():
-    clv = [{"contrafactual": False, "n": 12, "clv_medio": 1.3, "desvio": 4.0},
-           {"contrafactual": True, "n": 30, "clv_medio": -0.5, "desvio": 3.0}]
-    banca = {"saldo": 980, "pico": 1000, "drawdown_pct": 2.0, "kill_switch": False}
-    saude = [{"daemon": "l0_referencia", "segundos_em_silencio": 30},
-             {"daemon": "l1", "segundos_em_silencio": 7200}]
-    txt = formatar_relatorio(clv, banca, saude)
-    assert "CLV real" in txt and "amostra < 200" in txt
-    assert "contrafactual" in txt
-    assert "l1" in txt and "l0_referencia" not in txt.split("Daemons mudos:")[1]
+def _cat(categoria, n, medio=1.0):
+    return {"categoria": categoria, "n": n, "clv_medio": medio, "desvio": 3.0}
+
+
+def test_relatorio_separa_categorias_e_nunca_as_soma():
+    # Doutrina §3 (v0.1.7): veto do crivo, near-miss e perda operacional são coisas
+    # distintas. Antes viravam uma linha "contrafactual" só.
+    acum = [_cat("real", 12, 0.8), _cat("contrafactual_l2", 5, -1.2),
+            _cat("contrafactual_l1", 7, 0.3), _cat("contrafactual_operacional", 2, 2.1),
+            _cat("calibracao", 40, 0.5)]
+    txt = formatar_relatorio(acum, None, [], amostra_minima=200)
+    assert "CLV real (confirmados): 0.800% · n=12" in txt
+    assert "vetados pelo crivo: -1.200% · n=5" in txt
+    assert "near-miss do L1: 0.300% · n=7" in txt
+    assert "perdas operacionais: 2.100% · n=2" in txt
+    assert "mercados não homologados: 0.500% · n=40" in txt
+
+
+def test_relatorio_avisa_amostra_pequena_so_no_kpi():
+    acum = [_cat("real", 12), _cat("contrafactual_l2", 5)]
+    txt = formatar_relatorio(acum, None, [], amostra_minima=200)
+    linha_real = [l for l in txt.split("\n") if "CLV real" in l][0]
+    linha_veto = [l for l in txt.split("\n") if "vetados pelo crivo" in l][0]
+    assert "amostra < 200" in linha_real       # o KPI soberano avisa
+    assert "amostra <" not in linha_veto       # as diagnósticas, não
+
+
+def test_amostra_minima_vem_do_gate_nao_de_constante():
+    # regra 6: o número é do gate. Com o gate em 50, uma amostra de 60 não avisa.
+    acum = [_cat("real", 60)]
+    assert "amostra <" not in formatar_relatorio(acum, None, [], amostra_minima=50)
+    assert "amostra < 200" in formatar_relatorio(acum, None, [], amostra_minima=200)
+    assert "amostra < 500" in formatar_relatorio(acum, None, [], amostra_minima=500)
+
+
+def test_relatorio_tem_secao_do_dia_e_acumulado():
+    # o relatório dizia "diário" e mostrava só o acumulado desde o início.
+    txt = formatar_relatorio([_cat("real", 300, 0.9)], None, [], amostra_minima=200,
+                             dia="2026-07-25", clv_do_dia=[_cat("real", 4, -0.5)])
+    assert "· 2026-07-25" in txt
+    assert "HOJE (2026-07-25, partidas do dia)" in txt and "ACUMULADO" in txt
+    assert "n=4" in txt and "n=300" in txt      # o dia não some dentro do acumulado
+
+
+def test_relatorio_mostra_perda_de_amostra_do_dia():
+    perda = [{"dia": "2026-07-25", "mercado": "1x2",
+              "motivo": "indisponivel_sem_revisao_completa", "n": 2},
+             {"dia": "2026-07-25", "mercado": "ou",
+              "motivo": "indisponivel_revisao_defasada", "n": 1}]
+    txt = formatar_relatorio([], None, [], amostra_minima=200, dia="2026-07-25",
+                             clv_do_dia=[], perda_do_dia=perda)
+    assert "Sem CLV: 3" in txt
+    assert "sem book completo: 2" in txt and "book defasado: 1" in txt
+
+
+def test_relatorio_dia_sem_clv_e_explicito():
+    txt = formatar_relatorio([], None, [], amostra_minima=200, dia="2026-07-25")
+    assert "sem CLV fechado no dia" in txt
 
 
 def test_relatorio_kill_switch_e_sem_ledger():
-    clv = [{"contrafactual": False, "n": 250, "clv_medio": 0.8, "desvio": 3.0}]
-    txt = formatar_relatorio(clv, {"saldo": 800, "pico": 1000, "drawdown_pct": 20.0, "kill_switch": True}, [])
-    assert "KILL SWITCH" in txt and "amostra < 200" not in txt
-    txt2 = formatar_relatorio([], None, [])
+    txt = formatar_relatorio([_cat("real", 250, 0.8)],
+                             {"saldo": 800, "pico": 1000, "drawdown_pct": 20.0,
+                              "kill_switch": True}, [], amostra_minima=200)
+    assert "KILL SWITCH" in txt and "amostra <" not in txt
+    txt2 = formatar_relatorio([], None, [], amostra_minima=200)
     assert "sem ledger" in txt2 and "sem dados" in txt2
+
+
+def test_relatorio_lista_daemons_mudos():
+    saude = [{"daemon": "l0_referencia", "segundos_em_silencio": 30},
+             {"daemon": "l1", "segundos_em_silencio": 7200}]
+    txt = formatar_relatorio([], None, saude, amostra_minima=200)
+    assert "l1" in txt.split("Daemons mudos:")[1]
+    assert "l0_referencia" not in txt.split("Daemons mudos:")[1]

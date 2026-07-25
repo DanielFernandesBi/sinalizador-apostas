@@ -1,0 +1,58 @@
+# LOCKFILE — versões EXATAS com que a suíte passou (Tier 3 do 2º ciclo de auditoria).
+#
+# `requirements.txt` declara INTENÇÃO (faixas amplas: `supabase>=2.4,<3`). Isso deixa
+# a instalação à mercê do dia: dois `pip install` na mesma faixa podem resolver
+# versões diferentes, e uma quebra de upstream chega sem aviso — num sistema que move
+# dinheiro, "funcionou na minha máquina" não é reprodutibilidade.
+#
+# Este arquivo fixa o que foi de fato testado. A CI instala DAQUI.
+#
+# COMO REGERAR (depois de mudar requirements.txt):
+#     pip install -r requirements.txt && pip freeze > requirements.lock.txt
+#
+# RESSALVA DE PLATAFORMA: este lock foi gerado em Linux/CPython 3.11. O alvo do
+# projeto é 3.12 (e o Daniel roda Windows). São todos pacotes puros/wheels amplos, e
+# a CI valida o lock em 3.12 a cada push — mas se algum dia houver divergência de
+# plataforma, o comando acima, rodado no ambiente de destino, é a fonte da verdade.
+annotated-types==0.8.0
+anthropic==0.120.0
+anyio==4.14.2
+certifi==2026.7.22
+cffi==2.1.0
+cryptography==49.0.0
+deprecation==2.1.0
+distro==1.9.0
+docstring_parser==0.18.0
+h11==0.16.0
+h2==4.4.0
+hpack==4.2.0
+httpcore==1.0.9
+httpx==0.28.1
+hyperframe==6.1.0
+idna==3.18
+iniconfig==2.3.0
+jiter==0.16.0
+multidict==6.7.1
+packaging==26.2
+pluggy==1.6.0
+postgrest==2.31.0
+propcache==0.5.2
+pycparser==3.0
+pydantic==2.13.4
+pydantic-settings==2.14.2
+pydantic_core==2.46.4
+Pygments==2.20.0
+PyJWT==2.13.0
+pytest==9.1.1
+python-dotenv==1.2.2
+realtime==2.31.0
+sniffio==1.3.1
+storage3==2.31.0
+StrEnum==0.4.15
+supabase==2.31.0
+supabase-auth==2.31.0
+supabase-functions==2.31.0
+typing-inspection==0.4.2
+typing_extensions==4.16.0
+websockets==15.0.1
+yarl==1.24.5

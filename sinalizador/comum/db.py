@@ -119,8 +119,28 @@ class Banco:
         return resp.data or []
 
     def clv_global(self) -> list[dict[str, Any]]:
-        """Linhas de `vw_clv_global` (n, clv_medio, desvio por real/contrafactual)."""
+        """Linhas de `vw_clv_global` (n, clv_medio, desvio por real/contrafactual).
+
+        Mantida para auditoria histórica. O RELATÓRIO usa `clv_por_categoria`: o
+        booleano `contrafactual` fundiria veto do crivo, near-miss e falha
+        operacional numa média só, o que a Doutrina §3 (v0.1.7) proíbe.
+        """
         resp = self._c.table("vw_clv_global").select("*").execute()
+        return resp.data or []
+
+    def clv_por_categoria(self) -> list[dict[str, Any]]:
+        """`vw_clv_por_categoria` — CLV acumulado por categoria de desfecho."""
+        resp = self._c.table("vw_clv_por_categoria").select("*").execute()
+        return resp.data or []
+
+    def clv_do_dia(self, dia: str) -> list[dict[str, Any]]:
+        """`vw_clv_diario` de um dia (data das PARTIDAS, não do cálculo)."""
+        resp = self._c.table("vw_clv_diario").select("*").eq("dia", dia).execute()
+        return resp.data or []
+
+    def clv_perda_amostra_do_dia(self, dia: str) -> list[dict[str, Any]]:
+        """`vw_clv_perda_amostra` de um dia — o que não virou CLV, e por quê."""
+        resp = self._c.table("vw_clv_perda_amostra").select("*").eq("dia", dia).execute()
         return resp.data or []
 
     def snapshots_desde(self, ts_iso: str) -> list[dict[str, Any]]:
