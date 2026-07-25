@@ -1,13 +1,13 @@
 """Testes do L4 (fechamento/CLV) e do relatório diário."""
 import pytest
 
-from sinalizador.comum.erros import e_violacao_unicidade
 from sinalizador.comum.tempo import para_datetime
 from sinalizador.l1_gatilhos.devig import devig_shin
 from sinalizador.l4_fechamento.clv import (
+    STATUS_AUDITAVEIS,
     clv_pct,
-    fechar_evento,
     prob_implicita,
+    processar_evento,
     revisoes_de_fechamento,
     rodar_fechamento,
 )
@@ -20,8 +20,9 @@ REF_1X2 = [("1", 2.0), ("X", 3.5), ("2", 4.0)]
 
 
 class GatesFake:
-    def __init__(self, fechamento_idade_max_s=600.0):
-        self._v = {"fechamento_idade_max_s": fechamento_idade_max_s}
+    def __init__(self, fechamento_idade_max_s=600.0, fechamento_assentamento_s=600.0):
+        self._v = {"fechamento_idade_max_s": fechamento_idade_max_s,
+                   "fechamento_assentamento_s": fechamento_assentamento_s}
 
     def get(self, nome):
         return self._v[nome]
@@ -162,29 +163,38 @@ def test_mercado_fora_de_escopo_nao_vira_indisponibilidade():
     assert fech == {} and ind == []
 
 
-class ErroUnicidade(RuntimeError):
-    """Equivale ao 23505 que o banco levanta em ux_clv_sinal / ux_clv_aborto."""
+
+# ---------------- desfecho terminal por item (achado #4) ----------------
+
+
+class ErroInfra(RuntimeError):
+    """Rede/banco fora — NÃO é desfecho: o item fica pendente."""
 
 
 class BancoFake:
-    def __init__(self, *, snaps_ref, sinais=None, abortos=None, com_clv=(set(), set()),
-                 clv_ja_no_banco=(), erro_no_insert=None):
-        self._snaps = snaps_ref
+    """Simula a semântica das funções SQL da 0007 (não é o Postgres — a fidelidade
+    da SQL real foi verificada contra o banco, com rollback)."""
+
+    def __init__(self, *, snaps_ref=(), sinais=None, abortos=None, casas=None,
+                 desfechos=(), erro_ao_registrar=None):
+        self._snaps = list(snaps_ref)
         self._sinais = sinais or []
         self._abortos = abortos or []
-        self._com_clv = com_clv
-        # achado #2: linhas que JÁ existem no banco mas que o dedup em código NÃO viu
-        # (a corrida: outro processo gravou entre a leitura e o INSERT).
-        self._clv_ja_no_banco = set(clv_ja_no_banco)
-        self._erro_no_insert = erro_no_insert
-        self.inseridos = []
-        self.encerrados = []
+        self._casas = casas if casas is not None else [
+            {"id": "c-pin", "nome": "pinnacle", "tipo": "referencia"},
+            {"id": "c-b365", "nome": "bet365_br", "tipo": "varejo"}]
+        # desfechos JÁ existentes no banco (invisíveis ao caminho rápido do app)
+        self._desfechos: dict = {k: True for k in desfechos}
+        self._erro_ao_registrar = erro_ao_registrar
+        self.resultados = []          # linhas de clv_resultados
+        self.clv_log = []             # linhas de clv_log
+        self.finalizados = []
         self.pulsos = []
-        self.consultas_clv = []   # (sinal_ids, aborto_ids) perguntados por evento
+        self.timeouts_marcados = 0
 
+    # -- leituras --
     def casas_ativas(self):
-        return [{"id": "c-pin", "nome": "pinnacle", "tipo": "referencia"},
-                {"id": "c-b365", "nome": "bet365_br", "tipo": "varejo"}]
+        return self._casas
 
     def snapshots_do_evento(self, evento_id, casa_ids=None, ate_iso=None):
         return [s for s in self._snaps if casa_ids is None or s["casa_id"] in casa_ids]
@@ -195,240 +205,221 @@ class BancoFake:
     def abortos_rastreados_do_evento(self, evento_id):
         return self._abortos
 
-    def clv_ids_registrados(self, *, sinal_ids=(), aborto_ids=()):
-        # achado #2.1: a consulta é FILTRADA pelos ids do evento em fechamento.
-        # Guarda o que foi perguntado para os testes de isolamento e devolve só a
-        # interseção — é o que o `in_` faria no banco.
-        self.consultas_clv.append((list(sinal_ids), list(aborto_ids)))
-        com_s, com_a = self._com_clv
-        return (com_s & set(sinal_ids)), (com_a & set(aborto_ids))
+    def itens_com_desfecho(self, evento_id):
+        return ({k[1] for k in self._desfechos if k[0] == "s"},
+                {k[1] for k in self._desfechos if k[0] == "a"})
 
-    def inserir(self, tabela, registro):
-        if tabela == "clv_log":
-            if self._erro_no_insert is not None:
-                raise self._erro_no_insert
-            # simula ux_clv_sinal / ux_clv_aborto (migration 0005)
-            chave = ("s", registro["sinal_id"]) if registro.get("sinal_id") \
-                else ("a", registro["aborto_l1_id"])
-            if chave in self._clv_ja_no_banco:
-                raise ErroUnicidade(
-                    'duplicate key value violates unique constraint "ux_clv_sinal"')
-            self._clv_ja_no_banco.add(chave)
-        row = {"id": len(self.inseridos) + 1, **registro}
-        self.inseridos.append((tabela, row))
-        return row
+    # -- escritas (espelham as RPCs) --
+    def registrar_resultado_clv(self, **c):
+        if self._erro_ao_registrar is not None:
+            raise self._erro_ao_registrar
+        chave = ("s", c["p_sinal_id"]) if c.get("p_sinal_id") else ("a", c["p_aborto_id"])
+        if chave in self._desfechos:                     # ux_clv_resultado_*
+            return {"registrado": False, "motivo": "ja_registrado"}
+        self._desfechos[chave] = True
+        clv_id = None
+        if c["p_resultado"] == "calculado":              # atômico com o desfecho
+            clv_id = len(self.clv_log) + 1
+            self.clv_log.append({"id": clv_id, "sinal_id": c.get("p_sinal_id"),
+                                 "aborto_l1_id": c.get("p_aborto_id"),
+                                 "clv_pct": c.get("p_clv_pct"),
+                                 "contrafactual": c.get("p_contrafactual"),
+                                 "ts_fechamento": c.get("p_ts_fechamento")})
+        self.resultados.append({**c, "clv_log_id": clv_id})
+        return {"registrado": True, "clv_log_id": clv_id}
 
-    def marcar_evento_encerrado(self, evento_id):
-        self.encerrados.append(evento_id)
+    def finalizar_evento_clv(self, evento_id, detalhe=None):
+        # espelha fn_finalizar_evento_clv: recusa se sobrar item sem desfecho
+        s_ok, a_ok = self.itens_com_desfecho(evento_id)
+        pend = [s for s in self._sinais if s["status"] in STATUS_AUDITAVEIS
+                and s["id"] not in s_ok]
+        pend += [a for a in self._abortos if a["id"] not in a_ok]
+        if pend:
+            raise ErroInfra(f"{len(pend)} item(ns) sem desfecho — não finaliza")
+        self.finalizados.append(evento_id)
+        return {"finalizado": True}
 
-    def eventos_iniciados_sem_status_final(self, ate_iso, limite=200):
+    def fila_fechamento(self, agora_iso, assentamento_s, limite=200):
         return [{"id": "ev1", "inicio_utc": INICIO}]
+
+    def marcar_timeout_crivo(self, agora_iso):
+        n = 0
+        for s in self._sinais:
+            if s["status"] == "aguardando_crivo":
+                s["status"] = "timeout_crivo"
+                n += 1
+        self.timeouts_marcados = n
+        return n
 
     def pulsar(self, daemon, detalhe=None):
         self.pulsos.append((daemon, detalhe))
 
-    def clv(self):
-        return [r for (t, r) in self.inseridos if t == "clv_log"]
+    # -- helpers de asserção --
+    def por_ref(self, sinal_id=None, aborto_id=None):
+        for r in self.resultados:
+            if sinal_id and r["p_sinal_id"] == sinal_id:
+                return r
+            if aborto_id and r["p_aborto_id"] == aborto_id:
+                return r
+        return None
 
 
 def _snaps_completos():
     return [_snap_ref(sel, odd, TS_FECH) for sel, odd in REF_1X2]
 
 
-def test_fechar_evento_sinal_confirmado_gera_clv_real():
-    sinal = {"id": "s1", "status": "confirmado", "mercado": "1x2", "selecao": "1",
-             "linha": None, "odd_venue": 2.20, "p_justa": _p_fech()["1"]}
-    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[sinal])
-    n = fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
-    assert n == 1
-    clv = banco.clv()[0]
-    assert clv["sinal_id"] == "s1" and clv["contrafactual"] is False
-    # odd_venue 2.20 > odd justa (~2.0) → CLV positivo
-    assert clv["clv_pct"] > 0
-    assert banco.encerrados == ["ev1"]
-
-
-def test_fechar_evento_vetado_e_contrafactual():
-    sinal = {"id": "s2", "status": "vetado", "mercado": "1x2", "selecao": "1",
-             "linha": None, "odd_venue": 2.20, "p_justa": _p_fech()["1"]}
-    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[sinal])
-    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
-    assert banco.clv()[0]["contrafactual"] is True
-
-
-def test_fechar_evento_aborto_rastreado():
-    aborto = {"id": 7, "dossie_parcial": {"mercado": "1x2", "selecao": "1", "linha": None,
-                                          "odd_venue": 2.20, "p_justa": _p_fech()["1"]}}
-    banco = BancoFake(snaps_ref=_snaps_completos(), abortos=[aborto])
-    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
-    clv = banco.clv()[0]
-    assert clv["aborto_l1_id"] == 7 and clv["contrafactual"] is True
-
-
-def test_fechar_evento_nao_duplica_clv():
-    sinal = {"id": "s1", "status": "confirmado", "mercado": "1x2", "selecao": "1",
-             "linha": None, "odd_venue": 2.2, "p_justa": _p_fech()["1"]}
-    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[sinal], com_clv=({"s1"}, set()))
-    assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake()) == 0
-
-
-# ---- achado #2: idempotência do CLV garantida pelo banco ----
-
-def _sinal(id_, odd=2.2):
-    return {"id": id_, "status": "confirmado", "mercado": "1x2", "selecao": "1",
+def _sinal(id_, status="confirmado", mercado="1x2", selecao="1", odd=2.20):
+    return {"id": id_, "status": status, "mercado": mercado, "selecao": selecao,
             "linha": None, "odd_venue": odd, "p_justa": _p_fech()["1"]}
 
 
-def test_corrida_de_clv_nao_duplica_nem_derruba_o_ciclo():
-    # O dedup em código NÃO viu s1 (outro processo gravou entre a leitura e o INSERT):
-    # o banco recusa por ux_clv_sinal. O fechamento tem de ABSORVER a recusa e seguir
-    # gravando os demais — perder o CLV de s2 por causa da duplicata de s1 seria
-    # perder amostra do KPI soberano.
-    banco = BancoFake(snaps_ref=_snaps_completos(),
-                      sinais=[_sinal("s1"), _sinal("s2")],
-                      clv_ja_no_banco={("s", "s1")})   # já existe no banco, invisível ao dedup
-    n = fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
-
-    assert n == 1                                       # só s2 contou como gravado
-    gravados = {r["sinal_id"] for r in banco.clv()}
-    assert gravados == {"s2"}                           # s1 não duplicou
-    assert banco.encerrados == ["ev1"]                  # o ciclo terminou normalmente
+def _evento():
+    return {"id": "ev1", "inicio_utc": INICIO}
 
 
-def test_corrida_de_clv_em_aborto_tambem_e_absorvida():
-    aborto = {"id": 7, "dossie_parcial": {"mercado": "1x2", "selecao": "1", "linha": None,
-                                          "odd_venue": 2.20, "p_justa": _p_fech()["1"]}}
-    banco = BancoFake(snaps_ref=_snaps_completos(), abortos=[aborto],
-                      clv_ja_no_banco={("a", 7)})
-    assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake()) == 0
-    assert banco.clv() == []
+def _gates():
+    return GatesFake()
 
 
-def test_consulta_de_clv_e_filtrada_pelos_ids_do_evento():
-    # achado #2.1: pergunta SÓ pelos ids deste evento — não varre clv_log inteira.
-    aborto = {"id": 7, "dossie_parcial": {"mercado": "1x2", "selecao": "1", "linha": None,
-                                          "odd_venue": 2.20, "p_justa": _p_fech()["1"]}}
-    banco = BancoFake(snaps_ref=_snaps_completos(),
-                      sinais=[_sinal("s1"), _sinal("s2")], abortos=[aborto])
-    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
+# ---- desfecho calculado ----
 
-    assert banco.consultas_clv == [(["s1", "s2"], [7])]   # uma consulta, só estes ids
+def test_sinal_confirmado_gera_clv_real_e_desfecho_calculado():
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")])
+    r = processar_evento(banco, _evento(), _gates())
 
-
-def test_evento_sem_sinais_nem_abortos_nao_consulta_clv():
-    # lista vazia não vira consulta (nem ida à rede) — nem para sinais, nem para abortos.
-    banco = BancoFake(snaps_ref=_snaps_completos())
-    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
-    assert banco.consultas_clv == [([], [])]
-    assert banco.clv() == []
+    assert r["calculados"] == 1 and r["indisponiveis"] == 0
+    res = banco.por_ref(sinal_id="s1")
+    assert res["p_categoria"] == "real" and res["p_resultado"] == "calculado"
+    assert banco.clv_log[0]["clv_pct"] > 0          # odd 2.20 > justa (~2.0)
+    assert banco.clv_log[0]["contrafactual"] is False
+    # ts_fechamento é o da revisão (Sugestão nº 9), não o kickoff
+    assert banco.clv_log[0]["ts_fechamento"] == para_datetime(TS_FECH).isoformat()
+    assert banco.finalizados == ["ev1"]
 
 
-def test_clv_de_outro_evento_nao_suprime_este():
-    # ISOLAMENTO: um CLV já registrado para o sinal de OUTRO evento não pode fazer o
-    # fechamento deste pular o seu próprio sinal. Com a varredura global antiga isso
-    # era "seguro por acidente" (o conjunto era grande demais); agora é por construção.
-    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s-deste-evento")],
-                      com_clv=({"s-de-outro-evento"}, {999}))
-    n = fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
-
-    assert n == 1
-    assert {r["sinal_id"] for r in banco.clv()} == {"s-deste-evento"}
-    assert banco.consultas_clv == [(["s-deste-evento"], [])]  # nem perguntou pelo alheio
+def test_vetado_e_contrafactual_l2():
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s2", "vetado")])
+    processar_evento(banco, _evento(), _gates())
+    assert banco.por_ref(sinal_id="s2")["p_categoria"] == "contrafactual_l2"
+    assert banco.clv_log[0]["contrafactual"] is True
 
 
-class _ClienteConsultaFake:
-    """Grava a cadeia de chamadas do supabase-py para inspecionar a consulta montada."""
-
-    def __init__(self, linhas_por_coluna):
-        self._linhas = linhas_por_coluna     # {'sinal_id': [...], 'aborto_l1_id': [...]}
-        self.consultas = []                  # (tabela, coluna, valores)
-        self._atual = None
-
-    def table(self, tabela):
-        self._tabela = tabela
-        return self
-
-    def select(self, colunas):
-        self._coluna = colunas
-        return self
-
-    def in_(self, coluna, valores):
-        self._atual = (self._tabela, coluna, list(valores))
-        return self
-
-    def execute(self):
-        assert self._atual is not None, "consulta sem filtro in_ — varreria a tabela"
-        tabela, coluna, valores = self._atual
-        self.consultas.append((tabela, coluna, valores))
-        self._atual = None
-        return type("R", (), {"data": [{coluna: v} for v in self._linhas.get(coluna, [])
-                                       if v in valores]})()
+@pytest.mark.parametrize("status,motivo", [
+    ("expirado", "preco_deixou_de_ser_executavel"),
+    ("erro", "falha_tecnica_no_crivo"),
+    ("timeout_crivo", "crivo_nao_concluido_antes_do_kickoff"),
+])
+def test_status_operacionais_recebem_clv_em_categoria_propria(status, motivo):
+    # Defeito C: antes esses sinais nunca recebiam CLV e o evento encerrava por cima.
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s3", status)])
+    r = processar_evento(banco, _evento(), _gates())
+    res = banco.por_ref(sinal_id="s3")
+    assert r["calculados"] == 1
+    assert res["p_categoria"] == "contrafactual_operacional"
+    assert res["p_motivo"] == motivo
+    assert banco.clv_log[0]["contrafactual"] is True
 
 
-def test_banco_clv_ids_registrados_consulta_filtrada():
-    # A consulta REAL (não o fake do fechamento): filtra por `in_` nos dois lados e
-    # devolve só o que existe. Antes lia `clv_log` inteira, ignorando o parâmetro.
-    from sinalizador.comum.db import Banco
-
-    cli = _ClienteConsultaFake({"sinal_id": ["s1", "s9"], "aborto_l1_id": [7]})
-    banco = Banco(client=cli)
-    com_s, com_a = banco.clv_ids_registrados(sinal_ids=["s1", "s2"], aborto_ids=[7, 8])
-
-    assert com_s == {"s1"} and com_a == {7}
-    assert cli.consultas == [
-        ("clv_log", "sinal_id", ["s1", "s2"]),
-        ("clv_log", "aborto_l1_id", [7, 8]),
-    ]
+def test_aborto_near_miss_e_candidato_sombra_tem_categorias_distintas():
+    dp = {"mercado": "1x2", "selecao": "1", "linha": None, "odd_venue": 2.20,
+          "p_justa": _p_fech()["1"]}
+    banco = BancoFake(snaps_ref=_snaps_completos(), abortos=[
+        {"id": 7, "gate_reprovado": "edge_min_pct", "dossie_parcial": dp},
+        {"id": 8, "gate_reprovado": "mercado_nao_homologado", "dossie_parcial": dp},
+    ])
+    processar_evento(banco, _evento(), _gates())
+    assert banco.por_ref(aborto_id=7)["p_categoria"] == "contrafactual_l1"
+    assert banco.por_ref(aborto_id=8)["p_categoria"] == "calibracao"
 
 
-def test_banco_clv_ids_registrados_nao_consulta_com_lista_vazia():
-    # Lista vazia não vira consulta — nem ida à rede. (O fake levantaria se `execute`
-    # fosse chamado sem `in_`.)
-    from sinalizador.comum.db import Banco
+# ---- Defeito A: sucesso parcial não encerra o evento ----
 
-    cli = _ClienteConsultaFake({})
-    banco = Banco(client=cli)
-    assert banco.clv_ids_registrados(sinal_ids=[], aborto_ids=[]) == (set(), set())
-    assert banco.clv_ids_registrados() == (set(), set())
-    assert cli.consultas == []
+def test_mercado_sem_book_nao_impede_o_outro_e_ambos_tem_desfecho():
+    # 1x2 tem book; `ou` não. Antes: evento encerrava e `ou` sumia para sempre.
+    banco = BancoFake(
+        snaps_ref=_snaps_completos() + [
+            _snap_ref("over", 1.9, TS_FECH, mercado="ou")],   # book de `ou` incompleto
+        sinais=[_sinal("s1"), _sinal("s2", mercado="ou", selecao="over")])
+    r = processar_evento(banco, _evento(), _gates())
+
+    assert r["calculados"] == 1 and r["indisponiveis"] == 1
+    assert banco.por_ref(sinal_id="s1")["p_resultado"] == "calculado"
+    perdido = banco.por_ref(sinal_id="s2")
+    assert perdido["p_resultado"] == "indisponivel_sem_revisao_completa"
+    assert perdido["clv_log_id"] is None            # indisponível não gera medição
+    assert banco.finalizados == ["ev1"]             # todos os itens têm desfecho
 
 
-def test_erro_que_nao_e_unicidade_sobe():
-    # Só a violação de unicidade é engolida. Um erro real (rede, coluna faltando)
-    # NÃO pode ser confundido com "já existe" — isso esconderia perda de CLV.
+def test_revisao_defasada_vira_desfecho_nomeado_com_idade():
+    banco = BancoFake(snaps_ref=_revisao_completa("2026-07-20T20:30:00Z"),  # 1800 s
+                      sinais=[_sinal("s1")])
+    r = processar_evento(banco, _evento(), _gates())
+    res = banco.por_ref(sinal_id="s1")
+    assert r["indisponiveis"] == 1
+    assert res["p_resultado"] == "indisponivel_revisao_defasada"
+    assert res["p_idade_s"] == 1800.0
+
+
+def test_sem_casa_de_referencia_vira_desfecho_nomeado_nao_retry_eterno():
+    # Defeito B: antes retornava sem encerrar e o evento voltava para sempre.
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")], casas=[])
+    r = processar_evento(banco, _evento(), _gates())
+    assert r["indisponiveis"] == 1
+    assert banco.por_ref(sinal_id="s1")["p_resultado"] == "indisponivel_sem_referencia"
+    assert banco.finalizados == ["ev1"]
+
+
+def test_evento_sem_book_algum_finaliza_com_todos_indisponiveis():
+    # Defeito B (o caso puro): nenhum snapshot de referência.
+    banco = BancoFake(snaps_ref=[], sinais=[_sinal("s1"), _sinal("s2")])
+    r = processar_evento(banco, _evento(), _gates())
+    assert r["calculados"] == 0 and r["indisponiveis"] == 2
+    assert banco.finalizados == ["ev1"]             # não fica na fila para sempre
+
+
+# ---- falha de infraestrutura NÃO é desfecho ----
+
+def test_falha_de_infra_deixa_item_pendente_e_nao_finaliza():
     banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
-                      erro_no_insert=RuntimeError("connection reset by peer"))
-    with pytest.raises(RuntimeError, match="connection reset"):
-        fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
+                      erro_ao_registrar=ErroInfra("connection reset by peer"))
+    r = processar_evento(banco, _evento(), _gates())
+
+    assert r["pendentes"] == 1
+    assert r["calculados"] == 0 and r["indisponiveis"] == 0
+    assert banco.resultados == []                   # NADA gravado como desfecho
+    assert banco.finalizados == []                  # evento segue pendente
 
 
-def test_reconhece_violacao_de_unicidade():
-    assert e_violacao_unicidade(ErroUnicidade(
-        'duplicate key value violates unique constraint "ux_clv_sinal"'))
-    assert e_violacao_unicidade(RuntimeError("23505"))
-    # embrulhado (o supabase-py re-levanta o erro original como causa)
-    interno = ErroUnicidade("23505")
-    externo = RuntimeError("falha ao inserir")
-    externo.__cause__ = interno
-    assert e_violacao_unicidade(externo)
-    # não confunde outros erros
-    assert not e_violacao_unicidade(RuntimeError("connection reset by peer"))
-    assert not e_violacao_unicidade(ValueError("odd inválida"))
+# ---- idempotência ----
+
+def test_item_com_desfecho_nao_e_reprocessado():
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
+                      desfechos=[("s", "s1")])
+    r = processar_evento(banco, _evento(), _gates())
+    assert r["calculados"] == 0 and banco.resultados == []
+    assert banco.finalizados == ["ev1"]             # já estava tudo resolvido
 
 
-def test_fechar_evento_sem_book_completo_nao_gera_clv():
-    # referência só com "1" → sem de-vig → sem CLV, mas encerra o evento
-    banco = BancoFake(snaps_ref=[_snap_ref("1", 2.0, TS_FECH)],
-                      sinais=[{"id": "s1", "status": "confirmado", "mercado": "1x2",
-                               "selecao": "1", "linha": None, "odd_venue": 2.2, "p_justa": 0.5}])
-    assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake()) == 0
+def test_corrida_no_desfecho_nao_duplica():
+    # o desfecho já existe no banco, invisível ao caminho rápido: a RPC recusa.
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")])
+    banco._desfechos[("s", "s1")] = True            # gravado por outro processo
+    r = processar_evento(banco, _evento(), _gates())
+    assert r["calculados"] == 0
+    assert banco.clv_log == [] and banco.resultados == []
 
 
-def test_rodar_fechamento_pulsa_l4():
-    banco = BancoFake(snaps_ref=_snaps_completos())
-    r = rodar_fechamento(banco, GatesFake(), "2026-07-20T23:00:00Z")
-    assert r["eventos"] == 1
-    assert banco.pulsos and banco.pulsos[-1][0] == "l4"
+# ---- ciclo ----
+
+def test_rodar_fechamento_marca_timeout_crivo_e_pulsa():
+    banco = BancoFake(snaps_ref=_snaps_completos(),
+                      sinais=[_sinal("s1", "aguardando_crivo")])
+    r = rodar_fechamento(banco, _gates(), "2026-07-20T23:00:00Z")
+
+    assert r["timeout_crivo"] == 1                  # não sobreviveu ao kickoff
+    assert banco.pulsos[-1][0] == "l4"
+    # e o sinal convertido recebeu desfecho operacional no mesmo ciclo
+    assert banco.por_ref(sinal_id="s1")["p_categoria"] == "contrafactual_operacional"
 
 
 # ---------------- relatório ----------------

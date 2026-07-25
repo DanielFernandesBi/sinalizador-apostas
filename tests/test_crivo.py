@@ -70,7 +70,10 @@ class BancoFake:
         assert chave == "manual_crivo_l2"
         return {"chave": chave, "valor": MANUAL, "vigente": True}
 
-    def sinais_aguardando_crivo(self, limite=50):
+    def sinais_aguardando_crivo(self, limite=50, agora_iso=None):
+        # Sugestão nº 10: com `agora_iso` a fila real (fn_fila_crivo) exclui sinais de
+        # partidas já iniciadas. O fake registra o que foi pedido.
+        self.agora_pedido = agora_iso
         return self._sinais[:limite]
 
     def inserir(self, tabela, registro):

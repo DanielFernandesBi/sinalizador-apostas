@@ -8,7 +8,7 @@ Doutrina §4 — usadas como tripwire de integridade, não como valores de opera
 "Dado ausente = abortar" (Doutrina P6) vale para configuração: em
 `validar_integridade()` — chamada na inicialização de todo processo — qualquer
 um dos casos abaixo levanta `GateInvalidoError` e o processo NÃO sobe:
-  - um dos 17 gates nomeados ausente;
+  - um dos 18 gates nomeados ausente;
   - flag `petreo` ou `direcao_endurecer` divergente do esperado;
   - um pétreo AFROUXADO abaixo da baseline (proibido pela Doutrina — pétreo só endurece).
 
@@ -76,6 +76,10 @@ METADADOS_GATES: dict[str, MetaGate] = {
     # Contrato DIFERENTE de snapshot_idade_max_s (frescor para EMITIR): aqui é a
     # proximidade mínima aceitável do book para MEDIR o CLV.
     "fechamento_idade_max_s":  MetaGate(petreo=False, direcao="menor"),
+    # Sugestão nº 10 — espera após o kickoff para a persistência assentar antes de
+    # declarar indisponibilidade. Endurecer aqui é ESPERAR MAIS ('maior'): mais espera
+    # = menos risco de gravar "sem book" para um book que só chegou atrasado.
+    "fechamento_assentamento_s": MetaGate(petreo=False, direcao="maior"),
     "stake_max_pct":           MetaGate(petreo=True,  direcao="menor", baseline_petreo=Decimal("2.0")),
     "kelly_fracao":            MetaGate(petreo=True,  direcao="menor", baseline_petreo=Decimal("0.25")),
     "drawdown_suspensao_pct":  MetaGate(petreo=True,  direcao="menor", baseline_petreo=Decimal("20")),

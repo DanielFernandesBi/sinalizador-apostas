@@ -35,7 +35,9 @@ def _cmd_fechar(banco: Banco, args) -> int:
 
     def rodar() -> None:
         r = rodar_fechamento(banco, gates, datetime.now(timezone.utc).isoformat())
-        print(f"[l4] eventos_fechados={r['eventos']} clv_gravadas={r['clv']}")
+        print(f"[l4] eventos={r['eventos']} clv={r['clv']} "
+              f"indisponiveis={r['indisponiveis']} pendentes={r['pendentes']} "
+              f"timeout_crivo={r['timeout_crivo']}")
 
     while True:
         try:

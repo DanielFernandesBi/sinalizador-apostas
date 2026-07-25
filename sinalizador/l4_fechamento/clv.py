@@ -178,117 +178,241 @@ def _linha_clv(
     }
 
 
-def _gravar_clv(banco: Any, linha: dict[str, Any], ref: str) -> bool:
-    """Grava uma linha de `clv_log`. Devolve False (sem erro) se o CLV já existia.
+# Categoria do desfecho por origem do item (Doutrina §3 / Sugestão nº 10). Nunca se
+# somam na mesma média: CLV real, decisório, operacional e de calibração respondem
+# perguntas diferentes.
+CATEGORIA_POR_STATUS: dict[str, str] = {
+    "confirmado": "real",
+    "vetado": "contrafactual_l2",
+    "expirado": "contrafactual_operacional",
+    "erro": "contrafactual_operacional",
+    "timeout_crivo": "contrafactual_operacional",
+}
+STATUS_AUDITAVEIS = tuple(CATEGORIA_POR_STATUS)
 
-    A unicidade real é do BANCO (`ux_clv_sinal`/`ux_clv_aborto`, migration 0005): o
-    dedup em código é caminho rápido, não garantia — entre a leitura dos ids já
-    registrados e este INSERT, outro processo do L4 pode ter gravado o mesmo CLV.
-    Nesse caso o banco recusa, e a recusa é o resultado desejado (o CLV existe).
+MOTIVO_POR_STATUS: dict[str, str] = {
+    "expirado": "preco_deixou_de_ser_executavel",
+    "erro": "falha_tecnica_no_crivo",
+    "timeout_crivo": "crivo_nao_concluido_antes_do_kickoff",
+}
 
-    Engolir SÓ a violação de unicidade é essencial: sem isso a corrida derrubaria o
-    fechamento do evento inteiro, deixando SEM CLV os demais sinais — perder amostra
-    do KPI soberano por causa de uma duplicata evitada. Qualquer outro erro sobe.
+
+@dataclass(frozen=True)
+class ItemFechamento:
+    """Um item auditável do evento: sinal OU aborto rastreado (inclui candidato_sombra)."""
+    sinal_id: Optional[str]
+    aborto_id: Optional[int]
+    categoria: str
+    mercado: str
+    selecao: str
+    linha: Optional[float]
+    odd_emissao: float
+    p_emissao: float
+    contrafactual: bool
+    motivo_origem: Optional[str] = None
+
+    @property
+    def ref(self) -> str:
+        return f"sinal={self.sinal_id}" if self.sinal_id else f"aborto={self.aborto_id}"
+
+
+# `_gravar_clv` (INSERT direto em `clv_log`) foi REMOVIDO pela migration 0007: a
+# gravação passou a ser a RPC `fn_registrar_resultado_clv`, que grava a medição e o
+# desfecho terminal na MESMA transação. Uma medição sem desfecho reabriria o buraco
+# do achado #4 (item medido que o evento nunca contabiliza). A absorção da corrida
+# continua — agora dentro da própria função SQL, que devolve `registrado=false`.
+
+
+
+def _itens_do_evento(banco: Any, evento_id: str) -> list[ItemFechamento]:
+    """Todos os itens auditáveis do evento (Sugestão nº 10).
+
+    Sinais em QUALQUER status já resolvido — não só confirmado/vetado: `expirado`,
+    `erro` e `timeout_crivo` também merecem desfecho, senão o evento nunca finaliza e
+    a amostra some sem registro. Mais os abortos rastreados (near-miss do L1 e
+    candidatos_sombra de mercado não homologado, distinguidos pela categoria).
     """
-    try:
-        banco.inserir("clv_log", linha)
-        return True
-    except Exception as e:
-        if e_violacao_unicidade(e):
-            _log.info("CLV já registrado por outro processo (corrida) — ignorado",
-                      extra={"ref": ref})
-            return False
-        raise
+    itens: list[ItemFechamento] = []
+    for s in banco.sinais_do_evento(evento_id, status=list(STATUS_AUDITAVEIS)):
+        itens.append(ItemFechamento(
+            sinal_id=s["id"], aborto_id=None,
+            categoria=CATEGORIA_POR_STATUS[s["status"]],
+            mercado=s["mercado"], selecao=s["selecao"], linha=_linha_key(s.get("linha")),
+            odd_emissao=float(s["odd_venue"]), p_emissao=float(s["p_justa"]),
+            contrafactual=(s["status"] != "confirmado"),
+            motivo_origem=MOTIVO_POR_STATUS.get(s["status"]),
+        ))
+    for a in banco.abortos_rastreados_do_evento(evento_id):
+        dp = a.get("dossie_parcial") or {}
+        sel, odd = dp.get("selecao"), dp.get("odd_venue")
+        if sel is None or odd is None or dp.get("mercado") is None:
+            # Dossiê parcial sem o mínimo para medir CLV: desfecho terminal próprio,
+            # nunca um item eternamente pendente travando o evento.
+            itens.append(ItemFechamento(
+                sinal_id=None, aborto_id=a["id"], categoria="contrafactual_l1",
+                mercado=str(dp.get("mercado") or "?"), selecao=str(sel or "?"),
+                linha=_linha_key(dp.get("linha")), odd_emissao=0.0, p_emissao=0.0,
+                contrafactual=True, motivo_origem="dossie_parcial_incompleto",
+            ))
+            continue
+        # candidato_sombra (achado 8) é um aborto com este gate — categoria calibração.
+        calibracao = a.get("gate_reprovado") == "mercado_nao_homologado"
+        itens.append(ItemFechamento(
+            sinal_id=None, aborto_id=a["id"],
+            categoria="calibracao" if calibracao else "contrafactual_l1",
+            mercado=dp["mercado"], selecao=sel, linha=_linha_key(dp.get("linha")),
+            odd_emissao=float(odd),
+            p_emissao=float(dp.get("p_justa") or prob_implicita(float(odd))),
+            contrafactual=True,
+        ))
+    return itens
 
 
-def fechar_evento(banco: Any, evento: dict[str, Any], gates: Any) -> int:
-    """Fecha o CLV de um evento já iniciado. Devolve quantas linhas de `clv_log`
-    gravou. Marca o evento 'encerrado' ao fim (sai da fila do L4)."""
-    inicio_iso = evento.get("inicio_utc")
-    inicio = para_datetime(inicio_iso)
+def processar_evento(banco: Any, evento: dict[str, Any], gates: Any) -> dict[str, int]:
+    """Dá desfecho terminal a cada item do evento e, se todos terminarem, finaliza.
+
+    Substitui `fechar_evento` (achado #4). O evento NÃO é mais marcado 'encerrado'
+    por conta própria: quem decide é `fn_finalizar_evento_clv`, que recusa enquanto
+    houver item sem desfecho — o app não declara sozinho que acabou.
+
+    FALHA DE INFRAESTRUTURA NÃO É DESFECHO (Doutrina §3): erro de rede/banco deixa o
+    item PENDENTE para o próximo ciclo. Gravar 'sem book' por causa de um timeout do
+    Supabase seria mentir sobre o dado — e o registro é append-only, indesdizível.
+    """
+    resumo = {"itens": 0, "calculados": 0, "indisponiveis": 0, "pendentes": 0}
+    inicio = para_datetime(evento.get("inicio_utc"))
     if inicio is None:
-        return 0
+        return resumo
+
+    itens = _itens_do_evento(banco, evento["id"])
+    resumo["itens"] = len(itens)
+    if not itens:
+        return resumo
+
+    com_desfecho_sinais, com_desfecho_abortos = banco.itens_com_desfecho(evento["id"])
+    pendentes = [i for i in itens
+                 if (i.sinal_id not in com_desfecho_sinais if i.sinal_id
+                     else i.aborto_id not in com_desfecho_abortos)]
+    if not pendentes:
+        _finalizar_se_completo(banco, evento["id"], resumo)
+        return resumo
+
     ref_ids = [c["id"] for c in banco.casas_ativas() if c.get("tipo") == "referencia"]
     if not ref_ids:
-        _log.warning("sem casa de referência ativa — fechamento impossível (P6)")
-        return 0
+        # Sem referência ativa é INDISPONIBILIDADE nomeada, não silêncio nem retry
+        # eterno: o CLV daquele evento não existe e isso fica registrado.
+        _log.warning("sem casa de referência ativa — itens ficam sem CLV (P6)",
+                     extra={"evento_id": evento["id"]})
+        for item in pendentes:
+            _registrar(banco, evento["id"], item, "indisponivel_sem_referencia",
+                       motivo="nenhuma_casa_referencia_ativa", resumo=resumo)
+        _finalizar_se_completo(banco, evento["id"], resumo)
+        return resumo
+
     limite_idade_s = float(gates.get("fechamento_idade_max_s"))
-    snaps_ref = banco.snapshots_do_evento(evento["id"], casa_ids=ref_ids, ate_iso=inicio_iso)
+    snaps_ref = banco.snapshots_do_evento(
+        evento["id"], casa_ids=ref_ids, ate_iso=evento["inicio_utc"])
     fechamentos, indisponiveis = revisoes_de_fechamento(
         snaps_ref, inicio=inicio, limite_idade_s=limite_idade_s)
+    por_mercado = {(i.mercado, i.linha): i for i in indisponiveis}
 
-    # Perda de amostra NUNCA é silenciosa (Sugestão nº 9): registra mercado, motivo,
-    # idade e limite — é o que responde depois "quantos CLVs deixaram de ser
-    # calculados, em quais mercados, e se o gate está cortando amostra demais".
-    for ind in indisponiveis:
-        _log.warning("sem linha de fechamento — CLV não calculado", extra={
-            "evento_id": evento["id"], "mercado": ind.mercado, "linha": ind.linha,
-            "motivo": ind.motivo, "idade_s": ind.idade_s, "limite_s": ind.limite_s,
+    for item in pendentes:
+        chave = (item.mercado, item.linha)
+        rev = fechamentos.get(chave)
+        if rev is not None and item.odd_emissao > 0:
+            p = rev.probs.get(item.selecao)
+            if p is not None:
+                _registrar(banco, evento["id"], item, "calculado",
+                           motivo=item.motivo_origem, rev=rev, p_fechamento=p,
+                           resumo=resumo)
+                continue
+        # Sem fechamento utilizável: nomeia o porquê (nunca perda silenciosa).
+        ind = por_mercado.get(chave)
+        if item.odd_emissao <= 0:
+            resultado, motivo, rev_ind = ("indisponivel_evento_inconsistente",
+                                          item.motivo_origem, None)
+        elif ind is not None and ind.motivo == "revisao_completa_defasada":
+            resultado, motivo, rev_ind = "indisponivel_revisao_defasada", None, ind
+        else:
+            resultado, motivo, rev_ind = "indisponivel_sem_revisao_completa", None, ind
+        _registrar(banco, evento["id"], item, resultado, motivo=motivo,
+                   idade_s=getattr(rev_ind, "idade_s", None), resumo=resumo)
+
+    _finalizar_se_completo(banco, evento["id"], resumo)
+    return resumo
+
+
+def _registrar(banco: Any, evento_id: str, item: ItemFechamento, resultado: str, *,
+               motivo: Optional[str] = None, rev: Optional[RevisaoFechamento] = None,
+               p_fechamento: Optional[float] = None, idade_s: Optional[float] = None,
+               resumo: dict[str, int]) -> None:
+    """Grava o desfecho terminal do item (RPC atômica). Falha de infraestrutura deixa
+    o item PENDENTE — não vira desfecho."""
+    campos: dict[str, Any] = {
+        "p_evento_id": evento_id, "p_sinal_id": item.sinal_id, "p_aborto_id": item.aborto_id,
+        "p_categoria": item.categoria, "p_resultado": resultado, "p_motivo": motivo,
+        "p_mercado": item.mercado, "p_selecao": item.selecao, "p_linha": item.linha,
+        "p_idade_s": (rev.idade_s if rev else idade_s),
+        "p_ts_fechamento": (rev.ts_fonte.isoformat() if rev else None),
+    }
+    if resultado == "calculado" and rev is not None and p_fechamento is not None:
+        campos.update({
+            "p_contrafactual": item.contrafactual,
+            "p_odd_emissao": item.odd_emissao,
+            "p_odd_fechamento_ref": round(1.0 / p_fechamento, 4),
+            "p_p_emissao": item.p_emissao,
+            "p_p_fechamento": round(p_fechamento, 6),
+            "p_clv_pct": round(clv_pct(item.odd_emissao, p_fechamento), 3),
         })
-    if not fechamentos:
-        return 0
-
-    # Achado #2.1: pergunta ao banco só pelos ids DESTE evento (`in_`), em vez de
-    # varrer `clv_log` inteira. Por isso sinais e abortos são carregados ANTES — é
-    # deles que saem os ids da consulta. Caminho rápido; a garantia é o índice único.
-    sinais = banco.sinais_do_evento(evento["id"], status=["confirmado", "vetado"])
-    abortos = banco.abortos_rastreados_do_evento(evento["id"])
-    sinal_ids_com_clv, aborto_ids_com_clv = banco.clv_ids_registrados(
-        sinal_ids=[s["id"] for s in sinais],
-        aborto_ids=[a["id"] for a in abortos],
-    )
-    gravadas = 0
-
-    for sinal in sinais:
-        if sinal["id"] in sinal_ids_com_clv:
-            continue
-        rev = fechamentos.get((sinal["mercado"], _linha_key(sinal.get("linha"))))
-        p = rev.probs.get(sinal["selecao"]) if rev else None
-        if p is None:
-            continue
-        # ts_fechamento = carimbo REAL da revisão usada (Sugestão nº 9), não o
-        # kickoff: o início segue em `eventos.inicio_utc` e a defasagem sai do join.
-        if _gravar_clv(banco, _linha_clv(
-            sinal_id=sinal["id"], aborto_id=None, odd_emissao=float(sinal["odd_venue"]),
-            p_emissao=float(sinal["p_justa"]), p_fechamento=p,
-            contrafactual=(sinal["status"] == "vetado"),
-            ts_fechamento=rev.ts_fonte.isoformat(),
-        ), ref=f"sinal={sinal['id']}"):
-            gravadas += 1
-
-    for aborto in abortos:
-        if aborto["id"] in aborto_ids_com_clv:
-            continue
-        dp = aborto.get("dossie_parcial") or {}
-        sel, odd_venue = dp.get("selecao"), dp.get("odd_venue")
-        if sel is None or odd_venue is None:
-            continue
-        rev = fechamentos.get((dp.get("mercado"), _linha_key(dp.get("linha"))))
-        p = rev.probs.get(sel) if rev else None
-        if p is None:
-            continue
-        if _gravar_clv(banco, _linha_clv(
-            sinal_id=None, aborto_id=aborto["id"], odd_emissao=float(odd_venue),
-            p_emissao=float(dp.get("p_justa") or prob_implicita(odd_venue)),
-            p_fechamento=p, contrafactual=True,
-            ts_fechamento=rev.ts_fonte.isoformat(),
-        ), ref=f"aborto={aborto['id']}"):
-            gravadas += 1
-
-    banco.marcar_evento_encerrado(evento["id"])
-    _log.info("evento fechado", extra={"evento_id": evento["id"], "clv_gravadas": gravadas})
-    return gravadas
+    try:
+        r = banco.registrar_resultado_clv(**campos)
+    except Exception:
+        # Rede/banco fora: NÃO é desfecho. Fica pendente para o próximo ciclo.
+        _log.exception("falha ao registrar desfecho — item segue pendente",
+                       extra={"evento_id": evento_id, "ref": item.ref})
+        resumo["pendentes"] += 1
+        return
+    if not r.get("registrado"):
+        return                                   # já tinha desfecho (corrida)
+    if resultado == "calculado":
+        resumo["calculados"] += 1
+    else:
+        resumo["indisponiveis"] += 1
+        _log.warning("item sem CLV — desfecho registrado", extra={
+            "evento_id": evento_id, "ref": item.ref, "mercado": item.mercado,
+            "resultado": resultado, "motivo": motivo, "idade_s": idade_s,
+        })
 
 
-def rodar_fechamento(banco: Any, gates: Any, agora_iso: str, *, limite: int = 200) -> dict[str, int]:
-    """Fecha todos os eventos já iniciados e ainda abertos. Pulsa heartbeat `l4`."""
-    eventos = banco.eventos_iniciados_sem_status_final(agora_iso, limite)
-    total_eventos = 0
-    total_clv = 0
+def _finalizar_se_completo(banco: Any, evento_id: str, resumo: dict[str, int]) -> None:
+    """Pede a finalização do evento. O BANCO recusa se ainda houver item pendente —
+    a recusa é esperada e não é erro."""
+    if resumo["pendentes"]:
+        return
+    try:
+        banco.finalizar_evento_clv(evento_id)
+    except Exception as e:
+        _log.info("evento ainda não finalizável", extra={"evento_id": evento_id,
+                                                         "detalhe": str(e)})
+
+
+def rodar_fechamento(banco: Any, gates: Any, agora_iso: str, *,
+                     limite: int = 200) -> dict[str, int]:
+    """Um ciclo do L4. Pulsa heartbeat `l4`."""
+    # Nenhum sinal sobrevive ao kickoff em 'aguardando_crivo' (Sugestão nº 10):
+    # senão o item nunca teria desfecho e o evento nunca finalizaria.
+    timeouts = banco.marcar_timeout_crivo(agora_iso)
+
+    assentamento_s = float(gates.get("fechamento_assentamento_s"))
+    eventos = banco.fila_fechamento(agora_iso, assentamento_s, limite)
+    total = {"eventos": 0, "clv": 0, "indisponiveis": 0, "pendentes": 0,
+             "timeout_crivo": timeouts}
     for evento in eventos:
-        n = fechar_evento(banco, evento, gates)
-        total_eventos += 1
-        total_clv += n
-    banco.pulsar(DAEMON, {"eventos_fechados": total_eventos, "clv_gravadas": total_clv})
-    _log.info("ciclo L4 concluído", extra={"eventos": total_eventos, "clv": total_clv})
-    return {"eventos": total_eventos, "clv": total_clv}
+        r = processar_evento(banco, evento, gates)
+        total["eventos"] += 1
+        total["clv"] += r["calculados"]
+        total["indisponiveis"] += r["indisponiveis"]
+        total["pendentes"] += r["pendentes"]
+    banco.pulsar(DAEMON, dict(total))
+    _log.info("ciclo L4 concluído", extra=dict(total))
+    return total

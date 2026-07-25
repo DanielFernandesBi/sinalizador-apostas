@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import ValidationError
 
@@ -161,11 +161,16 @@ def avaliar_sinal(banco: Any, modelo: ModeloCrivo, sinal: dict[str, Any], *, man
     return novo_status
 
 
-def processar_fila(banco: Any, modelo: ModeloCrivo, *, limite: int = 50) -> ResumoCrivo:
-    """Processa a fila do L2 (sinais aguardando crivo). Pulsa o heartbeat `l2`."""
+def processar_fila(banco: Any, modelo: ModeloCrivo, *, limite: int = 50,
+                   agora_iso: Optional[str] = None) -> ResumoCrivo:
+    """Processa a fila do L2 (sinais aguardando crivo). Pulsa o heartbeat `l2`.
+
+    Com `agora_iso`, a fila exclui sinais de partidas JÁ INICIADAS (Sugestão nº 10):
+    o crivo não confirma aposta depois do apito — esses viram `timeout_crivo` no L4.
+    """
     manual = carregar_manual(banco)  # falha alto se o Manual não estiver vigente
     resumo = ResumoCrivo()
-    for sinal in banco.sinais_aguardando_crivo(limite):
+    for sinal in banco.sinais_aguardando_crivo(limite, agora_iso):
         status = avaliar_sinal(banco, modelo, sinal, manual=manual)
         resumo.avaliados += 1
         if status == "confirmado":

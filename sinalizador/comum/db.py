@@ -205,8 +205,19 @@ class Banco:
             out[(str(liga), str(mercado))] = status
         return out
 
-    def sinais_aguardando_crivo(self, limite: int = 50) -> list[dict[str, Any]]:
-        """Fila do L2: sinais com status 'aguardando_crivo' (mais antigos primeiro)."""
+    def sinais_aguardando_crivo(self, limite: int = 50,
+                                agora_iso: Optional[str] = None) -> list[dict[str, Any]]:
+        """Fila do L2: sinais 'aguardando_crivo' de partidas que AINDA NÃO começaram.
+
+        Com `agora_iso`, usa `fn_fila_crivo` (migration 0008), que exclui no banco os
+        sinais cujo evento já iniciou: confirmar depois do apito produziria cartão de
+        uma aposta que não existe mais, e disputaria com o `fn_timeout_crivo` do L4
+        pelo mesmo sinal. Sem `agora_iso`, mantém o comportamento antigo (usado pela
+        varredura de frescor do L3, que precisa ver toda a fila).
+        """
+        if agora_iso is not None:
+            return self._rpc_lista("fn_fila_crivo",
+                                   {"p_agora": agora_iso, "p_limite": limite})
         resp = (
             self._c.table("sinais")
             .select("*")
@@ -352,6 +363,59 @@ class Banco:
             com_aborto = {r["aborto_l1_id"] for r in (resp.data or []) if r.get("aborto_l1_id")}
         return com_sinal, com_aborto
 
+    # ---------------- L4: desfecho terminal por item (Sugestão nº 10) ----------------
+
+    def fila_fechamento(self, agora_iso: str, assentamento_s: float,
+                        limite: int = 200) -> list[dict[str, Any]]:
+        """Eventos com item de CLV AINDA sem desfecho, cujo início + assentamento já
+        passou (`fn_fila_fechamento`, migration 0007).
+
+        Substitui "todo evento iniciado com status <> encerrado", que sofria de dois
+        males: evento sem book nenhum voltava para sempre (retry infinito) e partidas
+        sem item algum ocupavam o `limit`, expulsando eventos novos (starvation).
+        """
+        return self._rpc_lista("fn_fila_fechamento", {
+            "p_agora": agora_iso, "p_assentamento_s": assentamento_s, "p_limite": limite,
+        })
+
+    def marcar_timeout_crivo(self, agora_iso: str) -> int:
+        """Sinais ainda em `aguardando_crivo` com a partida já iniciada viram
+        `timeout_crivo` (`fn_timeout_crivo`). Nenhum sinal pode sobreviver ao kickoff
+        sem desfecho: senão o item nunca termina e o evento nunca finaliza."""
+        r = self._rpc("fn_timeout_crivo", {"p_agora": agora_iso})
+        return int(r.get("retorno") or 0)
+
+    def itens_com_desfecho(self, evento_id: str) -> tuple[set, set]:
+        """(sinal_ids, aborto_ids) do evento que JÁ têm desfecho terminal — caminho
+        rápido; a garantia é `ux_clv_resultado_*`."""
+        resp = (
+            self._c.table("clv_resultados")
+            .select("sinal_id,aborto_l1_id")
+            .eq("evento_id", evento_id)
+            .execute()
+        )
+        linhas = resp.data or []
+        return ({r["sinal_id"] for r in linhas if r.get("sinal_id")},
+                {r["aborto_l1_id"] for r in linhas if r.get("aborto_l1_id")})
+
+    def registrar_resultado_clv(self, **campos: Any) -> dict[str, Any]:
+        """Desfecho terminal de UM item, atômico (`fn_registrar_resultado_clv`).
+
+        Quando `calculado`, grava a medição em `clv_log` e o desfecho em
+        `clv_resultados` na MESMA transação — medição sem desfecho (ou o contrário)
+        reabriria o buraco que este item fecha. Devolve `registrado=False` se o item
+        já tinha desfecho (corrida entre processos do L4), sem erro.
+        """
+        return self._rpc("fn_registrar_resultado_clv", campos)
+
+    def finalizar_evento_clv(self, evento_id: str,
+                             detalhe: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Finaliza o evento no L4 (`fn_finalizar_evento_clv`). O BANCO recusa se
+        ainda houver item esperado sem desfecho — o app não decide sozinho que acabou."""
+        return self._rpc("fn_finalizar_evento_clv", {
+            "p_evento_id": evento_id, "p_detalhe": detalhe or {},
+        })
+
     def marcar_evento_encerrado(self, evento_id: str) -> None:
         """`eventos.status` não é imutável no schema — o fechamento marca 'encerrado'
         para o evento sair da fila do L4."""
@@ -404,6 +468,11 @@ class Banco:
         desfaz a transação e sobe como exceção aqui."""
         resp = self._c.rpc(funcao, params).execute()
         return resp.data if isinstance(resp.data, dict) else {"retorno": resp.data}
+
+    def _rpc_lista(self, funcao: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """RPC que devolve CONJUNTO de linhas (`returns setof`)."""
+        resp = self._c.rpc(funcao, params).execute()
+        return resp.data if isinstance(resp.data, list) else []
 
     def inserir(self, tabela: str, registro: dict[str, Any]) -> dict[str, Any]:
         """INSERT append-only. Não há update/delete equivalente por desenho."""

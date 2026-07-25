@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from datetime import datetime, timezone
 
 from sinalizador.comum.config import carregar_config
 from sinalizador.comum.db import Banco
@@ -38,7 +39,9 @@ def main(argv: list[str] | None = None) -> int:
     modelo = ModeloAnthropic(cfg.exigir("anthropic_api_key"))
 
     def rodar() -> None:
-        r = processar_fila(banco, modelo, limite=args.limite)
+        # `agora` exclui da fila sinais de partidas já iniciadas (Sugestão nº 10).
+        r = processar_fila(banco, modelo, limite=args.limite,
+                           agora_iso=datetime.now(timezone.utc).isoformat())
         print(f"[l2] avaliados={r.avaliados} confirmados={r.confirmados} "
               f"vetados={r.vetados} erros={r.erros}")
 
