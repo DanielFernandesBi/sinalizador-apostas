@@ -176,7 +176,7 @@ class BancoFake:
     da SQL real foi verificada contra o banco, com rollback)."""
 
     def __init__(self, *, snaps_ref=(), sinais=None, abortos=None, casas=None,
-                 desfechos=(), erro_ao_registrar=None):
+                 desfechos=(), erro_ao_registrar=None, notificacoes=None):
         self._snaps = list(snaps_ref)
         self._sinais = sinais or []
         self._abortos = abortos or []
@@ -186,6 +186,8 @@ class BancoFake:
         # desfechos JÁ existentes no banco (invisíveis ao caminho rápido do app)
         self._desfechos: dict = {k: True for k in desfechos}
         self._erro_ao_registrar = erro_ao_registrar
+        # P0.7: notificações por sinal — é delas que sai a categoria do confirmado.
+        self._notificacoes = notificacoes or {}
         self.resultados = []          # linhas de clv_resultados
         self.clv_log = []             # linhas de clv_log
         self.finalizados = []
@@ -204,6 +206,9 @@ class BancoFake:
 
     def abortos_rastreados_do_evento(self, evento_id):
         return self._abortos
+
+    def notificacoes_de_sinais(self, sinal_ids):
+        return {k: v for k, v in self._notificacoes.items() if k in set(sinal_ids)}
 
     def itens_com_desfecho(self, evento_id):
         return ({k[1] for k in self._desfechos if k[0] == "s"},
@@ -277,19 +282,34 @@ def _evento():
     return {"id": "ev1", "inicio_utc": INICIO}
 
 
+ENTREGUE_A_TEMPO = "2026-07-20T20:58:00Z"        # antes do kickoff (21h00)
+ENTREGUE_TARDE = "2026-07-20T21:03:00Z"          # depois do apito
+
+
+def _cartao(status="entregue", entregue_em=ENTREGUE_A_TEMPO):
+    return {"tipo": "sinal", "status": status, "entregue_em": entregue_em,
+            "conteudo": "cartão"}
+
+
+def _supressao():
+    return {"tipo": "administrativo", "status": "interno",
+            "conteudo": "[expirado-no-envio] sinal s1: odd atual 1.8 < mínima 1.9"}
+
+
 def _gates():
     return GatesFake()
 
 
 # ---- desfecho calculado ----
 
-def test_sinal_confirmado_gera_clv_real_e_desfecho_calculado():
-    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")])
+def test_sinal_confirmado_ENTREGUE_gera_clv_real():
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
+                      notificacoes={"s1": [_cartao()]})
     r = processar_evento(banco, _evento(), _gates())
 
     assert r["calculados"] == 1 and r["indisponiveis"] == 0
     res = banco.por_ref(sinal_id="s1")
-    assert res["p_categoria"] == "real" and res["p_resultado"] == "calculado"
+    assert res["p_categoria"] == "real_entregue" and res["p_resultado"] == "calculado"
     assert banco.clv_log[0]["clv_pct"] > 0          # odd 2.20 > justa (~2.0)
     assert banco.clv_log[0]["contrafactual"] is False
     # ts_fechamento é o da revisão (Sugestão nº 9), não o kickoff
@@ -330,6 +350,55 @@ def test_aborto_near_miss_e_candidato_sombra_tem_categorias_distintas():
     processar_evento(banco, _evento(), _gates())
     assert banco.por_ref(aborto_id=7)["p_categoria"] == "contrafactual_l1"
     assert banco.por_ref(aborto_id=8)["p_categoria"] == "calibracao"
+
+
+# ---- P0.7: "CLV real" exige ENTREGA EFETIVA ----
+
+def test_confirmado_suprimido_pelo_l3_nao_e_clv_real():
+    # O L2 confirmou, mas a janela fechou antes do envio: o cartão nunca existiu
+    # para o operador. Contar como "real" inflaria o KPI que autoriza dinheiro real.
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
+                      notificacoes={"s1": [_supressao()]})
+    processar_evento(banco, _evento(), _gates())
+    res = banco.por_ref(sinal_id="s1")
+    assert res["p_categoria"] == "confirmado_suprimido"
+    assert res["p_motivo"] == "janela_fechou_antes_do_envio"
+    assert banco.clv_log[0]["contrafactual"] is True    # não foi oportunidade real
+
+
+@pytest.mark.parametrize("notifs,motivo", [
+    ([], "cartao_nunca_enfileirado"),
+    ([_cartao(status="pendente", entregue_em=None)], "cartao_pendente"),
+    ([_cartao(status="enviando", entregue_em=None)], "cartao_enviando"),
+    ([_cartao(entregue_em=ENTREGUE_TARDE)], "entregue_apos_o_inicio"),
+])
+def test_confirmado_nao_entregue_tem_motivo_proprio(notifs, motivo):
+    # Telegram fora, outbox presa, ou entrega depois do apito: falha OPERACIONAL.
+    # Separada da supressão por preço, que é falha de MERCADO — perguntas diferentes.
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
+                      notificacoes={"s1": notifs})
+    processar_evento(banco, _evento(), _gates())
+    res = banco.por_ref(sinal_id="s1")
+    assert res["p_categoria"] == "confirmado_nao_entregue"
+    assert res["p_motivo"] == motivo
+
+
+def test_entrega_no_limite_antes_do_apito_conta_como_real():
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
+                      notificacoes={"s1": [_cartao(entregue_em="2026-07-20T20:59:59Z")]})
+    processar_evento(banco, _evento(), _gates())
+    assert banco.por_ref(sinal_id="s1")["p_categoria"] == "real_entregue"
+    assert banco.clv_log[0]["contrafactual"] is False
+
+
+def test_categorias_de_confirmado_nao_se_confundem_com_veto():
+    # O veto do crivo continua sendo contrafactual_l2: é decisão, não falha de entrega.
+    banco = BancoFake(snaps_ref=_snaps_completos(),
+                      sinais=[_sinal("s1"), _sinal("s2", "vetado")],
+                      notificacoes={"s1": [_cartao()]})
+    processar_evento(banco, _evento(), _gates())
+    assert banco.por_ref(sinal_id="s1")["p_categoria"] == "real_entregue"
+    assert banco.por_ref(sinal_id="s2")["p_categoria"] == "contrafactual_l2"
 
 
 # ---- Defeito A: sucesso parcial não encerra o evento ----
@@ -431,11 +500,11 @@ def _cat(categoria, n, medio=1.0):
 def test_relatorio_separa_categorias_e_nunca_as_soma():
     # Doutrina §3 (v0.1.7): veto do crivo, near-miss e perda operacional são coisas
     # distintas. Antes viravam uma linha "contrafactual" só.
-    acum = [_cat("real", 12, 0.8), _cat("contrafactual_l2", 5, -1.2),
+    acum = [_cat("real_entregue", 12, 0.8), _cat("contrafactual_l2", 5, -1.2),
             _cat("contrafactual_l1", 7, 0.3), _cat("contrafactual_operacional", 2, 2.1),
             _cat("calibracao", 40, 0.5)]
     txt = formatar_relatorio(acum, None, [], amostra_minima=200)
-    assert "CLV real (confirmados): 0.800% · n=12" in txt
+    assert "CLV real (cartão ENTREGUE antes do apito): 0.800% · n=12" in txt
     assert "vetados pelo crivo: -1.200% · n=5" in txt
     assert "near-miss do L1: 0.300% · n=7" in txt
     assert "perdas operacionais: 2.100% · n=2" in txt
@@ -443,7 +512,7 @@ def test_relatorio_separa_categorias_e_nunca_as_soma():
 
 
 def test_relatorio_avisa_amostra_pequena_so_no_kpi():
-    acum = [_cat("real", 12), _cat("contrafactual_l2", 5)]
+    acum = [_cat("real_entregue", 12), _cat("contrafactual_l2", 5)]
     txt = formatar_relatorio(acum, None, [], amostra_minima=200)
     linha_real = [l for l in txt.split("\n") if "CLV real" in l][0]
     linha_veto = [l for l in txt.split("\n") if "vetados pelo crivo" in l][0]
@@ -453,7 +522,7 @@ def test_relatorio_avisa_amostra_pequena_so_no_kpi():
 
 def test_amostra_minima_vem_do_gate_nao_de_constante():
     # regra 6: o número é do gate. Com o gate em 50, uma amostra de 60 não avisa.
-    acum = [_cat("real", 60)]
+    acum = [_cat("real_entregue", 60)]
     assert "amostra <" not in formatar_relatorio(acum, None, [], amostra_minima=50)
     assert "amostra < 200" in formatar_relatorio(acum, None, [], amostra_minima=200)
     assert "amostra < 500" in formatar_relatorio(acum, None, [], amostra_minima=500)
@@ -461,8 +530,8 @@ def test_amostra_minima_vem_do_gate_nao_de_constante():
 
 def test_relatorio_tem_secao_do_dia_e_acumulado():
     # o relatório dizia "diário" e mostrava só o acumulado desde o início.
-    txt = formatar_relatorio([_cat("real", 300, 0.9)], None, [], amostra_minima=200,
-                             dia="2026-07-25", clv_do_dia=[_cat("real", 4, -0.5)])
+    txt = formatar_relatorio([_cat("real_entregue", 300, 0.9)], None, [], amostra_minima=200,
+                             dia="2026-07-25", clv_do_dia=[_cat("real_entregue", 4, -0.5)])
     assert "· 2026-07-25" in txt
     assert "HOJE (2026-07-25, partidas do dia)" in txt and "ACUMULADO" in txt
     assert "n=4" in txt and "n=300" in txt      # o dia não some dentro do acumulado
@@ -485,7 +554,7 @@ def test_relatorio_dia_sem_clv_e_explicito():
 
 
 def test_relatorio_kill_switch_e_sem_ledger():
-    txt = formatar_relatorio([_cat("real", 250, 0.8)],
+    txt = formatar_relatorio([_cat("real_entregue", 250, 0.8)],
                              {"saldo": 800, "pico": 1000, "drawdown_pct": 20.0,
                               "kill_switch": True}, [], amostra_minima=200)
     assert "KILL SWITCH" in txt and "amostra <" not in txt

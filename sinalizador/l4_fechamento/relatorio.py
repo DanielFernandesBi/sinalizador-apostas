@@ -25,15 +25,24 @@ from typing import Any, Optional
 
 # Rótulos legíveis por categoria de desfecho (Doutrina §3 / Sugestão nº 10).
 ROTULO_CATEGORIA: dict[str, str] = {
-    "real": "CLV real (confirmados)",
+    "real_entregue": "CLV real (cartão ENTREGUE antes do apito)",
+    "confirmado_suprimido": "Confirmados suprimidos (preço fechou antes do envio)",
+    "confirmado_nao_entregue": "Confirmados NÃO entregues (falha operacional)",
+    "execucao": "CLV de execução (odd realmente apostada)",
     "contrafactual_l2": "CLV contrafactual — vetados pelo crivo",
     "contrafactual_l1": "CLV contrafactual — near-miss do L1",
     "contrafactual_operacional": "CLV contrafactual — perdas operacionais",
     "calibracao": "CLV de calibração — mercados não homologados",
 }
-# Ordem de exibição: o real primeiro (é o KPI), depois o que explica o processo.
-ORDEM_CATEGORIA = ("real", "contrafactual_l2", "contrafactual_l1",
+# Ordem de exibição: o KPI primeiro; logo abaixo o que ele DEIXOU de ser (supressão e
+# falha de entrega), porque essas duas linhas medem o custo do próprio pipeline.
+ORDEM_CATEGORIA = ("real_entregue", "confirmado_suprimido", "confirmado_nao_entregue",
+                   "execucao", "contrafactual_l2", "contrafactual_l1",
                    "contrafactual_operacional", "calibracao")
+
+# Só o CLV de oportunidade EFETIVAMENTE recebida carrega o aviso de amostra: é ele
+# que autoriza homologar mercado e liberar dinheiro real (P0.7).
+CATEGORIA_KPI = "real_entregue"
 
 ROTULO_MOTIVO: dict[str, str] = {
     "indisponivel_sem_referencia": "sem referência",
@@ -64,7 +73,7 @@ def _linhas_clv(linhas: list[dict[str, Any]], *, amostra_minima: int,
         # O aviso de ruído vale para o KPI soberano; nas demais categorias a amostra
         # é diagnóstica, não decisória.
         aviso = (f"  ⚠️ amostra < {amostra_minima} (ruído, P12)"
-                 if cat == "real" and n < amostra_minima else "")
+                 if cat == CATEGORIA_KPI and n < amostra_minima else "")
         saida.append(f"{pre}{ROTULO_CATEGORIA[cat]}: {_num(r.get('clv_medio'), 3)}%"
                      f" · n={n}{aviso}")
     return saida

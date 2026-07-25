@@ -290,6 +290,26 @@ class Banco:
             q = q.eq("tipo", tipo)
         return q.execute().data or []
 
+    def notificacoes_de_sinais(self, sinal_ids: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
+        """Notificações agrupadas por sinal — base da categoria por ENTREGA (P0.7).
+
+        O L4 precisa saber se o cartão de cada `confirmado` chegou ao operador antes
+        do apito: sem isso, "CLV real" mede oportunidade que talvez nunca tenha
+        existido para quem apostaria.
+        """
+        if not sinal_ids:
+            return {}
+        resp = (
+            self._c.table("notificacoes")
+            .select("sinal_id,tipo,status,conteudo,entregue_em")
+            .in_("sinal_id", list(sinal_ids))
+            .execute()
+        )
+        out: dict[str, list[dict[str, Any]]] = {}
+        for r in (resp.data or []):
+            out.setdefault(r["sinal_id"], []).append(r)
+        return out
+
     def notificacoes_pendentes(self, limite: int = 200) -> list[dict[str, Any]]:
         """Notificações ainda NÃO entregues — leitura, sem reservar (usada só para
         o anti-spam do alerta de drawdown). Quem vai ENVIAR usa

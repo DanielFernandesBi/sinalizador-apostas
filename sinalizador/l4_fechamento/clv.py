@@ -150,13 +150,47 @@ def _linha_clv(
 # somam na mesma média: CLV real, decisório, operacional e de calibração respondem
 # perguntas diferentes.
 CATEGORIA_POR_STATUS: dict[str, str] = {
-    "confirmado": "real",
+    # `confirmado` NÃO tem categoria fixa (P0.7): depende de o cartão ter sido
+    # ENTREGUE antes do apito — ver `categoria_do_confirmado`. Um confirmado que o
+    # L3 suprimiu, ou que nunca saiu, jamais existiu como oportunidade para o
+    # operador, e contá-lo como "real" inflaria o KPI que autoriza dinheiro real.
     "vetado": "contrafactual_l2",
     "expirado": "contrafactual_operacional",
     "erro": "contrafactual_operacional",
     "timeout_crivo": "contrafactual_operacional",
 }
-STATUS_AUDITAVEIS = tuple(CATEGORIA_POR_STATUS)
+STATUS_AUDITAVEIS = ("confirmado",) + tuple(CATEGORIA_POR_STATUS)
+
+
+def categoria_do_confirmado(
+    notificacoes: list[dict[str, Any]], inicio: Optional[datetime]
+) -> tuple[str, Optional[str]]:
+    """Categoria de um sinal `confirmado`, pela ENTREGA EFETIVA (P0.7).
+
+    Devolve (categoria, motivo). O frescor do preço no momento do cartão já é
+    garantido a montante: o L3 só enfileira depois de re-checar a odd contra a
+    mínima E a idade do snapshot. Aqui resta a pergunta que faltava — o cartão
+    chegou ao operador ANTES do apito?
+    """
+    cartao = next((n for n in notificacoes if n.get("tipo") == "sinal"), None)
+    if cartao is None:
+        # Sem cartão: ou o L3 suprimiu (registro interno), ou nem chegou a processar.
+        suprimido = any(
+            n.get("tipo") == "administrativo" and "expirado-no-envio" in (n.get("conteudo") or "")
+            for n in notificacoes
+        )
+        if suprimido:
+            return "confirmado_suprimido", "janela_fechou_antes_do_envio"
+        return "confirmado_nao_entregue", "cartao_nunca_enfileirado"
+
+    if cartao.get("status") != "entregue":
+        # Preso na outbox: pendente, ou reservado por um envio que não concluiu.
+        return "confirmado_nao_entregue", f"cartao_{cartao.get('status')}"
+
+    entregue_em = para_datetime(cartao.get("entregue_em"))
+    if entregue_em is None or (inicio is not None and entregue_em >= inicio):
+        return "confirmado_nao_entregue", "entregue_apos_o_inicio"
+    return "real_entregue", None
 
 MOTIVO_POR_STATUS: dict[str, str] = {
     "expirado": "preco_deixou_de_ser_executavel",
@@ -192,7 +226,8 @@ class ItemFechamento:
 
 
 
-def _itens_do_evento(banco: Any, evento_id: str) -> list[ItemFechamento]:
+def _itens_do_evento(banco: Any, evento_id: str,
+                     inicio: Optional[datetime] = None) -> list[ItemFechamento]:
     """Todos os itens auditáveis do evento (Sugestão nº 10).
 
     Sinais em QUALQUER status já resolvido — não só confirmado/vetado: `expirado`,
@@ -201,14 +236,26 @@ def _itens_do_evento(banco: Any, evento_id: str) -> list[ItemFechamento]:
     candidatos_sombra de mercado não homologado, distinguidos pela categoria).
     """
     itens: list[ItemFechamento] = []
-    for s in banco.sinais_do_evento(evento_id, status=list(STATUS_AUDITAVEIS)):
+    sinais = banco.sinais_do_evento(evento_id, status=list(STATUS_AUDITAVEIS))
+    # P0.7: para os confirmados é preciso saber se o cartão saiu de fato.
+    ler_notifs = getattr(banco, "notificacoes_de_sinais", None)
+    notifs_por_sinal = (ler_notifs([s["id"] for s in sinais]) if ler_notifs else {})
+    for s in sinais:
+        if s["status"] == "confirmado":
+            categoria, motivo = categoria_do_confirmado(
+                notifs_por_sinal.get(s["id"], []), inicio)
+        else:
+            categoria = CATEGORIA_POR_STATUS[s["status"]]
+            motivo = MOTIVO_POR_STATUS.get(s["status"])
         itens.append(ItemFechamento(
             sinal_id=s["id"], aborto_id=None,
-            categoria=CATEGORIA_POR_STATUS[s["status"]],
+            categoria=categoria,
             mercado=s["mercado"], selecao=s["selecao"], linha=linha_key(s.get("linha")),
             odd_emissao=float(s["odd_venue"]), p_emissao=float(s["p_justa"]),
-            contrafactual=(s["status"] != "confirmado"),
-            motivo_origem=MOTIVO_POR_STATUS.get(s["status"]),
+            # `contrafactual` no clv_log continua marcando "não foi aposta real".
+            # Só o cartão ENTREGUE conta como oportunidade que existiu de fato.
+            contrafactual=(categoria != "real_entregue"),
+            motivo_origem=motivo,
         ))
     for a in banco.abortos_rastreados_do_evento(evento_id):
         dp = a.get("dossie_parcial") or {}
@@ -252,7 +299,7 @@ def processar_evento(banco: Any, evento: dict[str, Any], gates: Any) -> dict[str
     if inicio is None:
         return resumo
 
-    itens = _itens_do_evento(banco, evento["id"])
+    itens = _itens_do_evento(banco, evento["id"], inicio)
     resumo["itens"] = len(itens)
     if not itens:
         return resumo
