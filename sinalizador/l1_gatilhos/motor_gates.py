@@ -13,7 +13,8 @@ Gates avaliados aqui (todos definidos na Doutrina §4 / seed do schema):
   - liquidez_multiplo_stake  liquidez disponível vs. stake
 
 Exposição (tetos por jogo/liga/dia) é avaliada por `avaliar_exposicao`, à parte,
-porque depende de dados agregados (vw_exposicao_aberta). Os tetos absolutos vêm
+porque depende de dados agregados (`vw_exposicao_total`: dinheiro real em risco +
+posição de papel + sinal em voo — Sugestão nº 13). Os tetos absolutos vêm
 dos gates exposicao_max_jogo/liga_dia/dia_pct (Sugestão nº 3) via `tetos_exposicao`.
 """
 from __future__ import annotations
@@ -148,7 +149,7 @@ def avaliar_exposicao(
     exposto: dict[str, float],
     tetos: dict[str, float],
 ) -> ResultadoGate:
-    """Avalia a exposição AGREGADA por jogo/liga-dia/dia (vw_exposicao_aberta).
+    """Avalia a exposição AGREGADA por jogo/liga-dia/dia (`vw_exposicao_total`).
 
     `exposto` e `tetos` mapeiam níveis ('jogo', 'liga_dia', 'dia') → valor. Monte
     `tetos` com `tetos_exposicao(gates, banca)`. Só os níveis presentes em `tetos`

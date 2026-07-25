@@ -18,6 +18,7 @@ Operações expostas:
   - marcar_notificacao_entregue(id)        `notificacoes` aceita UPDATE (não é append-only)
   - marcar_evento_encerrado(id)            `eventos.status` (L4: sai da fila de fechamento)
   - publicar_config(chave, valor)          publica nova versão vigente de governança (rito)
+  - reservar_exposicao_papel(sinal_id) / baixar_exposicao_papel(...)  posição de papel (P0.8)
   - gates_vigentes() / config_vigente() / casa_por_nome() / exposicao_aberta()    leituras
   - evento_por_id_externo() / saude_daemons() / clv_global()                       leituras
   - snapshots_desde() / casas_ativas() / eventos_por_ids() / banca_atual()          leituras (L1)
@@ -97,8 +98,16 @@ class Banco:
         return dados[0] if dados else None
 
     def exposicao_aberta(self) -> list[dict[str, Any]]:
-        """Linhas de `vw_exposicao_aberta` (exposto por jogo/liga-dia/dia)."""
-        resp = self._c.table("vw_exposicao_aberta").select("*").execute()
+        """Linhas de `vw_exposicao_total` (exposto por jogo/liga-dia/dia).
+
+        Sugestão nº 13 (P0.8): a view antiga (`vw_exposicao_aberta`) só via `apostas`
+        pendentes — no regime de papel, zero para sempre, e os três tetos de exposição
+        nunca reprovavam nada. Esta soma dinheiro real em risco, posição de papel e
+        sinal em voo, com as parcelas discriminadas em `exposto_real` / `exposto_papel`
+        / `exposto_em_voo`. `vw_exposicao_aberta` continua existindo para auditar o
+        recorte só-dinheiro.
+        """
+        resp = self._c.table("vw_exposicao_total").select("*").execute()
         return resp.data or []
 
     def evento_por_id_externo(self, fonte: str, valor: str) -> Optional[dict[str, Any]]:
@@ -583,6 +592,31 @@ class Banco:
     def pulsar(self, daemon: str, detalhe: Optional[dict[str, Any]] = None) -> None:
         """Heartbeat do daemon (E1.5). É apenas um INSERT em `heartbeats`."""
         self.inserir("heartbeats", {"daemon": daemon, "detalhe": detalhe})
+
+    # ---------------- EXPOSIÇÃO DE PAPEL (Sugestão nº 13 / P0.8) ----------------
+
+    def reservar_exposicao_papel(self, sinal_id: str,
+                                 agora_iso: Optional[str] = None) -> dict[str, Any]:
+        """Abre a posição de papel do sinal (`fn_reservar_exposicao_papel`).
+
+        Chamada na ENTREGA CONFIRMADA do cartão — o análogo exato de "a aposta foi
+        feita". O banco recusa (sem levantar) quando o regime é real, quando o apito
+        já soou, quando já existe posição, ou quando o dossiê não traz o nocional.
+        """
+        return self._rpc("fn_reservar_exposicao_papel", {
+            "p_sinal_id": sinal_id, "p_agora": agora_iso or _agora_utc_iso(),
+        })
+
+    def baixar_exposicao_papel(self, sinal_id: str, status: str,
+                               motivo: Optional[str] = None,
+                               agora_iso: Optional[str] = None) -> dict[str, Any]:
+        """Fecha a posição (`liquidada` | `substituida` | `liberada`). A baixa
+        automática pelo fechamento do evento é do banco (`fn_finalizar_evento_clv`);
+        este método existe para a baixa explícita."""
+        return self._rpc("fn_baixar_exposicao_papel", {
+            "p_sinal_id": sinal_id, "p_status": status, "p_motivo": motivo,
+            "p_agora": agora_iso or _agora_utc_iso(),
+        })
 
     def marcar_notificacao_entregue(self, notif_id: int,
                                     agora_iso: Optional[str] = None) -> bool:

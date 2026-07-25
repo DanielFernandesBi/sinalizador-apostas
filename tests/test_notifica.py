@@ -65,7 +65,8 @@ class ErroUnicidade(RuntimeError):
 
 class BancoFake:
     def __init__(self, *, confirmados=None, aguardando=None, snaps=None, crivos=None,
-                 eventos=None, notif_por_sinal=None, pendentes=None, banca=None):
+                 eventos=None, notif_por_sinal=None, pendentes=None, banca=None,
+                 reserva=None, reserva_levanta=False):
         self._confirmados = confirmados or []
         self._aguardando = aguardando or []
         self._snaps = snaps or {}
@@ -81,6 +82,10 @@ class BancoFake:
         self.ordem = []                     # ordem real das fases (achado da ordem)
         self._fila = list(pendentes or [])  # linhas em pendente/enviando
         self._prox_id = 100
+        # P0.8 — posição de papel (fn_reservar_exposicao_papel, verificada no banco real)
+        self.reservas = []
+        self._reserva = reserva if reserva is not None else {"reservado": True}
+        self._reserva_levanta = reserva_levanta
 
     # -- leituras --
     def sinais_por_status(self, status, limite=200):
@@ -150,6 +155,12 @@ class BancoFake:
             if n["id"] == notif_id and n["status"] == "enviando":
                 n["status"] = "pendente"
         return True
+
+    def reservar_exposicao_papel(self, sinal_id, agora_iso=None):
+        self.reservas.append(sinal_id)
+        if self._reserva_levanta:
+            raise RuntimeError("banco fora do ar")
+        return self._reserva
 
     def pulsar(self, daemon, detalhe=None):
         self.pulsos.append((daemon, detalhe))
@@ -256,7 +267,7 @@ def test_envio_confirmado_marca_entregue():
     banco = BancoFake(pendentes=[{"id": 10, "tipo": "alerta_daemon",
                                   "conteudo": "daemon l0 mudo", "status": "pendente"}])
     bot = BotFake()
-    entregues, falhas, cartoes = entregar_pendentes(banco, bot, agora_iso=AGORA_ISO)
+    entregues, falhas, cartoes, _ = entregar_pendentes(banco, bot, agora_iso=AGORA_ISO)
     assert (entregues, falhas, cartoes) == (1, 0, 0)
     assert banco.entregues == [10] and bot.enviados == ["daemon l0 mudo"]
 
@@ -266,7 +277,7 @@ def test_falha_de_envio_nao_conta_como_enviado_e_devolve_a_fila():
     banco = BancoFake(pendentes=[{"id": 11, "tipo": "sinal", "conteudo": "cartão",
                                   "status": "pendente"}])
     bot = BotFake(ok=False)
-    entregues, falhas, cartoes = entregar_pendentes(banco, bot, agora_iso=AGORA_ISO)
+    entregues, falhas, cartoes, _ = entregar_pendentes(banco, bot, agora_iso=AGORA_ISO)
     assert (entregues, falhas, cartoes) == (0, 1, 0)
     assert banco.entregues == [] and banco.devolvidas == [11]
     assert banco._fila[0]["status"] == "pendente"   # volta para o próximo ciclo
@@ -277,7 +288,7 @@ def test_reivindicacao_reserva_e_nao_reentrega():
     banco = BancoFake(pendentes=[{"id": 12, "tipo": "sinal", "conteudo": "c",
                                   "status": "pendente"}])
     entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
-    entregues, _, _ = entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
+    entregues, _, _, _ = entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
     assert entregues == 0                            # já entregue, não reivindica de novo
 
 
@@ -380,3 +391,68 @@ def test_bot_telegram_erro_de_rede_vira_false_nao_propaga():
 
     assert BotTelegram("T", "1", transporte=transporte_connectionerror).enviar("x") is False
     assert BotTelegram("T", "1", transporte=transporte_oserror).enviar("x") is False
+
+
+# ---------------- posição de papel: a entrega abre a exposição (P0.8) ----------------
+
+def _pendente(id, tipo="sinal", sinal_id="s1"):
+    return {"id": id, "tipo": tipo, "sinal_id": sinal_id, "conteudo": "cartão",
+            "status": "pendente"}
+
+
+def test_entrega_confirmada_abre_posicao_de_papel():
+    """O stake nocional só passa a consumir teto DEPOIS da entrega — é o análogo do
+    momento em que o dinheiro real sairia da banca. Antes do P0.8 nada reservava, e
+    `vw_exposicao_aberta` ficava zerada para sempre no modo sombra."""
+    banco = BancoFake(pendentes=[_pendente(21)])
+    entregues, falhas, cartoes, reservas = entregar_pendentes(
+        banco, BotFake(), agora_iso=AGORA_ISO)
+    assert (entregues, falhas, cartoes, reservas) == (1, 0, 1, 1)
+    assert banco.reservas == ["s1"]
+
+
+def test_envio_que_falhou_nao_reserva_exposicao():
+    """Cartão que o Telegram recusou não é oportunidade entregue: reservar aqui
+    inventaria uma posição que ninguém recebeu."""
+    banco = BancoFake(pendentes=[_pendente(22)])
+    _, falhas, _, reservas = entregar_pendentes(banco, BotFake(ok=False), agora_iso=AGORA_ISO)
+    assert (falhas, reservas) == (1, 0)
+    assert banco.reservas == []
+
+
+def test_alerta_entregue_nao_abre_posicao():
+    """Só o cartão de SINAL vira posição — alerta de drawdown não é aposta."""
+    banco = BancoFake(pendentes=[_pendente(23, tipo="alerta_drawdown", sinal_id=None)])
+    entregues, _, cartoes, reservas = entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
+    assert (entregues, cartoes, reservas) == (1, 0, 0)
+    assert banco.reservas == []
+
+
+def test_reenvio_do_mesmo_cartao_nao_duplica_posicao():
+    """A recusa do banco por `ux_exposicoes_papel_sinal` não é erro: o resultado
+    desejado (UMA posição) já está lá. O contador não a soma de novo."""
+    banco = BancoFake(pendentes=[_pendente(24)], reserva={"reservado": False,
+                                                          "motivo": "ja_reservado"})
+    _, _, cartoes, reservas = entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
+    assert (cartoes, reservas) == (1, 0)
+    assert banco.reservas == ["s1"]
+
+
+def test_falha_ao_reservar_nao_desfaz_entrega_confirmada():
+    """A entrega já aconteceu no Telegram: derrubar o ciclo aqui devolveria o cartão
+    à fila e o reenviaria. O sinal volta a contar como 'em voo' na view — que é o
+    lado seguro do erro."""
+    banco = BancoFake(pendentes=[_pendente(25)], reserva_levanta=True)
+    entregues, falhas, cartoes, reservas = entregar_pendentes(
+        banco, BotFake(), agora_iso=AGORA_ISO)
+    assert (entregues, falhas, cartoes, reservas) == (1, 0, 1, 0)
+    assert banco.entregues == [25]
+
+
+def test_resumo_do_ciclo_publica_posicoes_de_papel():
+    banco = BancoFake(confirmados=[_sinal()], snaps=_snaps_ok(),
+                      eventos={"ev1": {"id": "ev1", "inicio_utc": "2026-07-21T20:00:00Z"}})
+    resumo = processar(banco, BotFake(), GatesFake(), agora_iso=AGORA_ISO)
+    assert resumo.enviados == 1
+    assert resumo.posicoes_papel == 1
+    assert banco.pulsos[-1][1]["posicoes_papel"] == 1

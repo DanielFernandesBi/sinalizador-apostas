@@ -171,6 +171,40 @@ def _e_duplicidade(exc: Exception) -> bool:
     return e_violacao_unicidade(exc)
 
 
+class ReservasDoCiclo:
+    """Exposição que o PRÓPRIO ciclo já comprometeu (P0.8).
+
+    `vw_exposicao_total` é lida UMA vez, no início do ciclo: um sinal emitido agora
+    só aparece nela no ciclo seguinte. Sem este acumulador, N candidatos do mesmo
+    jogo avaliados no mesmo ciclo leem todos a mesma exposição e passam juntos pelo
+    teto — o buraco do P0.8 inteiro, reduzido a uma iteração.
+
+    Não persiste nada: é memória de um ciclo. A verdade durável são as posições
+    (`apostas`, `exposicoes_papel`) e os sinais em voo, todas em `vw_exposicao_total`.
+    """
+
+    def __init__(self) -> None:
+        self._por_chave: dict[tuple[str, str], float] = {}
+
+    @staticmethod
+    def _chaves(evento_id: str, liga: str, dia: str) -> tuple:
+        return (("jogo", evento_id), ("liga_dia", f"{liga}|{dia}"), ("dia", dia))
+
+    def somar(self, evento_id: str, liga: str, dia: str, valor: float) -> None:
+        for chave in self._chaves(evento_id, liga, dia):
+            self._por_chave[chave] = self._por_chave.get(chave, 0.0) + valor
+
+    def sobre(self, base: dict[str, float], evento_id: str, liga: str,
+              dia: str) -> dict[str, float]:
+        """Exposição do banco (`base`) + o que este ciclo já comprometeu."""
+        jogo, liga_dia, so_dia = self._chaves(evento_id, liga, dia)
+        return {
+            "jogo": base.get("jogo", 0.0) + self._por_chave.get(jogo, 0.0),
+            "liga_dia": base.get("liga_dia", 0.0) + self._por_chave.get(liga_dia, 0.0),
+            "dia": base.get("dia", 0.0) + self._por_chave.get(so_dia, 0.0),
+        }
+
+
 def avaliar_grupo(
     banco: Any,
     grupo: GrupoMercado,
@@ -180,6 +214,7 @@ def avaliar_grupo(
     banca: float,
     banca_origem: str,
     exposto: dict[str, float],
+    reservas: Optional[ReservasDoCiclo] = None,
     agora: datetime,
     politica: PoliticaVenue,
     venues_executaveis: Optional[set[str]],
@@ -189,6 +224,8 @@ def avaliar_grupo(
     resumo: ResumoL1,
 ) -> None:
     """Roda o pipeline para cada seleção do grupo. Escreve sinais/abortos no banco."""
+    if reservas is None:
+        reservas = ReservasDoCiclo()
     ordem = ORDEM_SELECAO.get(grupo.mercado)
     if ordem is None:
         resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}: mercado fora do escopo")
@@ -345,9 +382,12 @@ def avaliar_grupo(
                            edge, gates, resumo, chave=chave, chaves_abortos=chaves_abortos)
             continue
 
-        # Gate de exposição em camadas (agregado).
+        # Gate de exposição em camadas: o agregado do banco (real + papel + em voo)
+        # MAIS o que este mesmo ciclo já comprometeu (P0.8).
+        dia_partida = str(grupo.inicio_utc.date())
+        exposto_efetivo = reservas.sobre(exposto, grupo.evento_id, liga, dia_partida)
         tetos = tetos_exposicao(gates, banca)
-        vexp = avaliar_exposicao(stake_valor, exposto, tetos)
+        vexp = avaliar_exposicao(stake_valor, exposto_efetivo, tetos)
         if not vexp.aprovado:
             _abortar_dedup(banco, grupo, sel, vexp.gate_reprovado, dossie_parcial,
                            edge, gates, resumo, chave=chave, chaves_abortos=chaves_abortos)
@@ -369,8 +409,9 @@ def avaliar_grupo(
             p_justa=p_justa, odd_ref=odd_ref, melhor=melhor, edge=edge, comissao=comissao,
             stake_frac=stake_frac, odd_min=odd_min, ts_ref=ts_ref, janela_sinc=janela_sinc,
             referencia_estavel=referencia_estavel, serie_ref=serie_ref, serie_venue=serie_venue,
-            candidatos_venue=candidatos_venue, exposto=exposto, liquidez_disp=liquidez_disp,
+            candidatos_venue=candidatos_venue, exposto=exposto_efetivo, liquidez_disp=liquidez_disp,
             aplica_liquidez=aplica_liquidez, politica=politica, banca_origem=banca_origem,
+            stake_valor=stake_valor, banca=banca,
         )
         try:
             ret = enfileirar_sinal(banco, dossie, evento_id=grupo.evento_id,
@@ -392,6 +433,9 @@ def avaliar_grupo(
             chaves_abertas.add(chave)
             continue
         chaves_abertas.add(chave)  # dedup intra-ciclo (não reemite no mesmo ciclo)
+        # P0.8: o sinal recém-emitido já compromete teto para os candidatos SEGUINTES
+        # deste mesmo ciclo — antes de existir qualquer posição no banco.
+        reservas.somar(grupo.evento_id, liga, dia_partida, stake_valor)
         resumo.sinais += 1
         _log.info("sinal enfileirado", extra={"evento": grupo.evento_id, "mercado": grupo.mercado,
                                                "selecao": sel, "gatilho": gatilho, "caminho": caminho,
@@ -493,7 +537,7 @@ def _montar_dossie(
     *, grupo, sel, gatilho, gatilho_anomalo, caminho, p_justa, odd_ref, melhor, edge,
     comissao, stake_frac, odd_min, ts_ref, janela_sinc, referencia_estavel, serie_ref,
     serie_venue, candidatos_venue, exposto, liquidez_disp, aplica_liquidez, politica,
-    banca_origem,
+    banca_origem, stake_valor, banca,
 ) -> Dossie:
     sincronia_ok = abs((melhor["ts_fonte"] - ts_ref).total_seconds()) <= janela_sinc
     liquidez: dict[str, Any] = {
@@ -550,6 +594,12 @@ def _montar_dossie(
             "por_liga_dia": exposto.get("liga_dia", 0.0),
             "por_dia": exposto.get("dia", 0.0),
             "gates_exposicao_ok": True,
+            # Sugestão nº 13 (P0.8) — nocional ABSOLUTO desta oportunidade e a banca
+            # que o dimensionou. `sinais.stake_pct` guarda só a fração: recompor o
+            # valor depois multiplicaria por uma banca que pode não ser mais a mesma,
+            # e a posição de papel deixaria de corresponder ao que foi sinalizado.
+            "stake_valor": stake_valor,
+            "banca_valor": banca,
         },
         "tipster": None,
     }
@@ -597,7 +647,11 @@ def agrupar_snapshots(
 
 
 def _exposto_do_evento(exposicao_aberta: list[dict], evento_id: str, liga: str, dia: str) -> dict[str, float]:
-    """Extrai {jogo, liga_dia, dia} das linhas de vw_exposicao_aberta (grouping sets)."""
+    """Extrai {jogo, liga_dia, dia} das linhas de `vw_exposicao_total` (grouping sets).
+
+    A view soma dinheiro real em risco, posição de PAPEL e sinal EM VOO (P0.8) — antes
+    era só `apostas` pendentes, e no modo sombra isso era sempre zero.
+    """
     out = {"jogo": 0.0, "liga_dia": 0.0, "dia": 0.0}
     for r in exposicao_aberta:
         exp = float(r.get("exposto") or 0.0)
@@ -718,6 +772,8 @@ def rodar_l1(
     homolog: dict[tuple[str, str], str] = _homolog() if _homolog else {}
 
     exposicao_aberta = banco.exposicao_aberta()
+    # P0.8: uma leitura por ciclo; o que o ciclo emite entra aqui, não no banco.
+    reservas = ReservasDoCiclo()
     grupos = agrupar_snapshots(snaps, casas, eventos)
     for grupo in grupos:
         resumo.grupos += 1
@@ -725,7 +781,7 @@ def rodar_l1(
         dia = str((_dt(ev.get("inicio_utc")) or agora).date())
         exposto = _exposto_do_evento(exposicao_aberta, grupo.evento_id, ev.get("liga", ""), dia)
         avaliar_grupo(banco, grupo, casas, gates, banca=banca, banca_origem=banca_origem,
-                      exposto=exposto, agora=agora, politica=politica,
+                      exposto=exposto, reservas=reservas, agora=agora, politica=politica,
                       venues_executaveis=venues_executaveis, homolog=homolog,
                       chaves_abertas=chaves_abertas, chaves_abortos=chaves_abortos, resumo=resumo)
 

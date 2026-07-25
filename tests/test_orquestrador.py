@@ -558,3 +558,90 @@ def test_candidato_ja_registrado_nao_reemite_mesmo_apos_veto():
 
     assert r.sinais == 0
     assert banco.por_tabela("sinais") == []
+
+
+# ---------------- P0.8: exposição comprometida DENTRO do ciclo ----------------
+
+REF_OU = [("over", 2.0), ("under", 2.0)]
+
+
+def _ref_ou_snaps(ts=(T_ANT, T)):
+    return [_snap(sel, odd, "c-pin", ts=t, linha=2.5, mercado="ou")
+            for t in ts for sel, odd in REF_OU]
+
+
+def _cenario_dois_candidatos_no_mesmo_jogo():
+    """Dois mercados do MESMO evento, cada um com edge folgado o bastante para o
+    stake bater o teto de `stake_max_pct` (2% de 1000 = 20). Teto por jogo = 3% = 30:
+    o primeiro cabe, o segundo não."""
+    snaps = (_ref_snaps() + _ref_ou_snaps()
+             + [_snap("1", 2.60, "c-b365"),
+                _snap("over", 2.60, "c-b365", linha=2.5, mercado="ou")])
+    homolog = {("Premier League", "1x2"): "homologado",
+               ("Premier League", "ou"): "homologado"}
+    return BancoFake(snaps, banca=1000.0, venues_exec=["bet365_br"], homologados=homolog)
+
+
+def test_segundo_sinal_do_mesmo_ciclo_ja_ve_o_teto_ocupado():
+    """P0.8 — a view de exposição é lida UMA vez por ciclo. Sem o acumulador, os dois
+    candidatos leem exposição zero e passam juntos: 40 de nocional num teto de 30."""
+    banco = _cenario_dois_candidatos_no_mesmo_jogo()
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+
+    assert r.sinais == 1, f"esperava 1 sinal, veio {r.sinais}"
+    abortos = banco.por_tabela("abortos_l1")
+    assert [a["gate_reprovado"] for a in abortos] == ["exposicao_jogo"]
+
+
+def test_teto_maior_deixa_os_dois_passarem():
+    """Controle: o bloqueio acima é do TETO, não de um efeito colateral do
+    acumulador. Com teto por jogo de 10% (100), os dois nocionais de 20 cabem."""
+    gates = dict(_GATES, exposicao_max_jogo_pct=10.0, exposicao_max_liga_dia_pct=10.0)
+
+    class GatesFolgados:
+        def get(self, nome):
+            return gates[nome]
+
+    banco = _cenario_dois_candidatos_no_mesmo_jogo()
+    r = rodar_l1(banco, GatesFolgados(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+    assert r.sinais == 2 and r.abortos == 0
+
+
+def test_dossie_grava_o_nocional_absoluto_e_a_banca():
+    """A posição de papel é aberta pelo L3 a partir do DOSSIÊ: `stake_pct` sozinho é
+    fração, e recompor o valor depois multiplicaria por uma banca que pode ter mudado."""
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-b365")]
+    banco = BancoFake(snaps, banca=None, banca_papel="500", venues_exec=["bet365_br"])
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+
+    assert r.sinais == 1
+    sinal = banco.por_tabela("sinais")[0]
+    exp = sinal["dossie"]["exposicao"]
+    assert exp["banca_valor"] == 500.0
+    assert exp["stake_valor"] == pytest.approx(sinal["stake_pct"] / 100.0 * 500.0)
+    assert exp["stake_valor"] > 0
+    assert sinal["dossie"]["banca_origem"] == "papel"
+
+
+def test_reservas_do_ciclo_nao_vazam_entre_jogos_ligas_e_dias():
+    from sinalizador.l1_gatilhos.orquestrador import ReservasDoCiclo
+
+    res = ReservasDoCiclo()
+    base = {"jogo": 0.0, "liga_dia": 0.0, "dia": 0.0}
+    res.somar("ev1", "Premier League", "2026-07-20", 20.0)
+
+    assert res.sobre(base, "ev1", "Premier League", "2026-07-20") == {
+        "jogo": 20.0, "liga_dia": 20.0, "dia": 20.0}
+    # outro jogo da MESMA liga no MESMO dia: só o nível do jogo zera
+    assert res.sobre(base, "ev2", "Premier League", "2026-07-20") == {
+        "jogo": 0.0, "liga_dia": 20.0, "dia": 20.0}
+    # outra liga no mesmo dia: só o nível do dia acumula
+    assert res.sobre(base, "ev3", "La Liga", "2026-07-20") == {
+        "jogo": 0.0, "liga_dia": 0.0, "dia": 20.0}
+    # outro dia: nada acumula
+    assert res.sobre(base, "ev4", "Premier League", "2026-07-21") == base
+    # soma sobre o que já veio do banco
+    assert res.sobre({"jogo": 5.0, "liga_dia": 5.0, "dia": 5.0},
+                     "ev1", "Premier League", "2026-07-20")["jogo"] == 25.0

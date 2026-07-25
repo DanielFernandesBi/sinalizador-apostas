@@ -11,7 +11,10 @@ Um ciclo (`processar`) faz, NESTA ordem — e o código segue a lista, não o co
   3. enfileiramento dos cartões (E4.1/E4.2): para cada `confirmado` sem cartão,
      re-checa o preço — janela fechada SUPRIME (registro interno); senão a
      notificação é GRAVADA como `pendente`. Nada é enviado neste passo;
-  4. envio (E4.4): a outbox reivindica as pendentes, envia e marca a entrega.
+  4. envio (E4.4): a outbox reivindica as pendentes, envia e marca a entrega. O
+     cartão ENTREGUE abre a posição de papel (Sugestão nº 13 / P0.8): é aqui, e só
+     aqui, que a oportunidade passa a consumir os tetos de exposição — o análogo
+     exato do momento em que o dinheiro real sairia da banca.
 
 OUTBOX (achado do 2º ciclo, L3): a linha nasce ANTES do envio, com chave idempotente
 (um cartão por sinal). Antes, o Telegram era chamado primeiro e o registro vinha
@@ -53,6 +56,7 @@ class ResumoL3:
     falhas_envio: int = 0       # devolvidos à fila para o próximo ciclo
     suprimidos: int = 0         # confirmados cuja janela fechou
     alertas_entregues: int = 0  # entregas que não são cartão de sinal
+    posicoes_papel: int = 0     # reservas de exposição abertas pela entrega (P0.8)
 
 
 def _odd_venue_atual(banco: Any, sinal: dict[str, Any], *,
@@ -152,29 +156,58 @@ def enfileirar_cartoes(banco: Any, *, limite: int = 200,
     return resumo
 
 
+def _reservar_papel(banco: Any, sinal_id: Any, *, agora_iso: Optional[str]) -> bool:
+    """P0.8 — a oportunidade ENTREGUE abre a posição de papel.
+
+    É o análogo exato de "o Daniel apostou": só depois disto o stake nocional passa a
+    consumir os tetos de exposição. O banco decide se cabe reservar (regime de papel,
+    antes do apito, ainda sem posição) — aqui não há regra, só a chamada. Falha de
+    rede não pode desfazer uma entrega já confirmada: registra e segue (o sinal volta
+    a contar como "em voo" na `vw_exposicao_total`, que é o lado seguro do erro).
+    """
+    reservar = getattr(banco, "reservar_exposicao_papel", None)
+    if reservar is None or sinal_id is None:
+        return False
+    try:
+        r = reservar(sinal_id, agora_iso)
+    except Exception:
+        _log.warning("falha ao reservar exposição de papel — cartão JÁ entregue",
+                     extra={"sinal_id": sinal_id}, exc_info=True)
+        return False
+    if isinstance(r, dict) and r.get("reservado"):
+        return True
+    motivo = r.get("motivo") if isinstance(r, dict) else None
+    if motivo not in (None, "ja_reservado", "regime_real"):
+        _log.warning("exposição de papel não reservada",
+                     extra={"sinal_id": sinal_id, "motivo": motivo})
+    return False
+
+
 def entregar_pendentes(banco: Any, bot: Bot, *, limite: int = 200,
                        agora_iso: Optional[str] = None,
-                       reclaim_s: float = 300.0) -> tuple[int, int, int]:
-    """E4.3/E4.4 — o REMETENTE da outbox. Devolve (entregues, falhas, cartoes).
+                       reclaim_s: float = 300.0) -> tuple[int, int, int, int]:
+    """E4.3/E4.4 — o REMETENTE da outbox. Devolve (entregues, falhas, cartoes, reservas).
 
     Reivindica atomicamente (`pendente → enviando`), envia e só então marca
     `entregue`. Falha de envio devolve a linha à fila na hora. O contador conta
     ENTREGA CONFIRMADA — antes ele somava mesmo quando `bot.enviar()` devolvia
     False, e o resumo dizia "enviado" para mensagem que nunca saiu.
     """
-    entregues = falhas = cartoes = 0
+    entregues = falhas = cartoes = reservas = 0
     for notif in banco.reivindicar_notificacoes(agora_iso, limite, reclaim_s):
         if bot.enviar(notif["conteudo"]):
             banco.marcar_notificacao_entregue(notif["id"], agora_iso)
             entregues += 1
             if notif.get("tipo") == "sinal":
                 cartoes += 1
+                if _reservar_papel(banco, notif.get("sinal_id"), agora_iso=agora_iso):
+                    reservas += 1
         else:
             banco.devolver_notificacao(notif["id"])
             falhas += 1
             _log.warning("envio falhou — devolvido à fila para o próximo ciclo",
                          extra={"notificacao_id": notif["id"], "tipo": notif.get("tipo")})
-    return entregues, falhas, cartoes
+    return entregues, falhas, cartoes, reservas
 
 
 def processar(banco: Any, bot: Bot, gates: Any, *, limite: int = 200,
@@ -192,16 +225,19 @@ def processar(banco: Any, bot: Bot, gates: Any, *, limite: int = 200,
     resumo = enfileirar_cartoes(banco, limite=limite, agora=agora,
                                 idade_max_s=idade_max_s)
     resumo.expirados = expirados
-    # 4. envia o que está na fila (cartões + alertas), pela outbox.
-    entregues, falhas, cartoes = entregar_pendentes(
+    # 4. envia o que está na fila (cartões + alertas), pela outbox — e a entrega
+    #    confirmada abre a posição de papel (P0.8).
+    entregues, falhas, cartoes, reservas = entregar_pendentes(
         banco, bot, limite=limite, agora_iso=agora_iso, reclaim_s=reclaim_s)
     resumo.enviados = cartoes
     resumo.falhas_envio = falhas
     resumo.alertas_entregues = entregues - cartoes
+    resumo.posicoes_papel = reservas
 
     detalhe = {"enviados": resumo.enviados, "enfileirados": resumo.enfileirados,
                "falhas_envio": resumo.falhas_envio, "suprimidos": resumo.suprimidos,
-               "expirados": resumo.expirados, "alertas": resumo.alertas_entregues}
+               "expirados": resumo.expirados, "alertas": resumo.alertas_entregues,
+               "posicoes_papel": resumo.posicoes_papel}
     banco.pulsar(DAEMON, detalhe)
     _log.info("ciclo L3 concluído", extra=detalhe)
     return resumo
