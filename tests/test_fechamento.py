@@ -176,7 +176,7 @@ class BancoFake:
     da SQL real foi verificada contra o banco, com rollback)."""
 
     def __init__(self, *, snaps_ref=(), sinais=None, abortos=None, casas=None,
-                 desfechos=(), erro_ao_registrar=None, notificacoes=None):
+                 desfechos=(), erro_ao_registrar=None, entregas=None):
         self._snaps = list(snaps_ref)
         self._sinais = sinais or []
         self._abortos = abortos or []
@@ -186,8 +186,8 @@ class BancoFake:
         # desfechos JÁ existentes no banco (invisíveis ao caminho rápido do app)
         self._desfechos: dict = {k: True for k in desfechos}
         self._erro_ao_registrar = erro_ao_registrar
-        # P0.7: notificações por sinal — é delas que sai a categoria do confirmado.
-        self._notificacoes = notificacoes or {}
+        # P0.7/P1.3: o desfecho de ENTREGA é a fonte da categoria do confirmado.
+        self._entregas = entregas or {}
         self.resultados = []          # linhas de clv_resultados
         self.clv_log = []             # linhas de clv_log
         self.finalizados = []
@@ -207,8 +207,12 @@ class BancoFake:
     def abortos_rastreados_do_evento(self, evento_id):
         return self._abortos
 
-    def notificacoes_de_sinais(self, sinal_ids):
-        return {k: v for k, v in self._notificacoes.items() if k in set(sinal_ids)}
+    def entregas_de_sinais(self, sinal_ids):
+        """Espelha `entregas_sinal` (0018): UM desfecho por sinal."""
+        return {k: v for k, v in self._entregas.items() if k in set(sinal_ids)}
+
+    def selar_entregas(self, agora_iso=None):
+        return 0
 
     def itens_com_desfecho(self, evento_id):
         return ({k[1] for k in self._desfechos if k[0] == "s"},
@@ -286,14 +290,10 @@ ENTREGUE_A_TEMPO = "2026-07-20T20:58:00Z"        # antes do kickoff (21h00)
 ENTREGUE_TARDE = "2026-07-20T21:03:00Z"          # depois do apito
 
 
-def _cartao(status="entregue", entregue_em=ENTREGUE_A_TEMPO):
-    return {"tipo": "sinal", "status": status, "entregue_em": entregue_em,
-            "conteudo": "cartão"}
-
-
-def _supressao():
-    return {"tipo": "administrativo", "status": "interno",
-            "conteudo": "[expirado-no-envio] sinal s1: odd atual 1.8 < mínima 1.9"}
+def _entrega(desfecho="entregue", entregue_em=ENTREGUE_A_TEMPO):
+    """Linha de `entregas_sinal` (0018) — a fonte canônica do P0.7."""
+    return {"desfecho": desfecho,
+            "entregue_em": entregue_em if desfecho == "entregue" else None}
 
 
 def _gates():
@@ -304,7 +304,7 @@ def _gates():
 
 def test_sinal_confirmado_ENTREGUE_gera_clv_real():
     banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
-                      notificacoes={"s1": [_cartao()]})
+                      entregas={"s1": _entrega()})
     r = processar_evento(banco, _evento(), _gates())
 
     assert r["calculados"] == 1 and r["indisponiveis"] == 0
@@ -358,25 +358,25 @@ def test_confirmado_suprimido_pelo_l3_nao_e_clv_real():
     # O L2 confirmou, mas a janela fechou antes do envio: o cartão nunca existiu
     # para o operador. Contar como "real" inflaria o KPI que autoriza dinheiro real.
     banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
-                      notificacoes={"s1": [_supressao()]})
+                      entregas={"s1": _entrega("suprimido_preco")})
     processar_evento(banco, _evento(), _gates())
     res = banco.por_ref(sinal_id="s1")
     assert res["p_categoria"] == "confirmado_suprimido"
-    assert res["p_motivo"] == "janela_fechou_antes_do_envio"
+    assert res["p_motivo"] == "suprimido_preco"
     assert banco.clv_log[0]["contrafactual"] is True    # não foi oportunidade real
 
 
-@pytest.mark.parametrize("notifs,motivo", [
-    ([], "cartao_nunca_enfileirado"),
-    ([_cartao(status="pendente", entregue_em=None)], "cartao_pendente"),
-    ([_cartao(status="enviando", entregue_em=None)], "cartao_enviando"),
-    ([_cartao(entregue_em=ENTREGUE_TARDE)], "entregue_apos_o_inicio"),
+@pytest.mark.parametrize("entrega,motivo", [
+    (None, "sem_registro_de_entrega"),
+    (_entrega("nao_entregue_timeout"), "nao_entregue_timeout"),
+    (_entrega("nao_entregue_falha"), "nao_entregue_falha"),
+    (_entrega(entregue_em=ENTREGUE_TARDE), "entregue_apos_o_inicio"),
 ])
-def test_confirmado_nao_entregue_tem_motivo_proprio(notifs, motivo):
+def test_confirmado_nao_entregue_tem_motivo_proprio(entrega, motivo):
     # Telegram fora, outbox presa, ou entrega depois do apito: falha OPERACIONAL.
     # Separada da supressão por preço, que é falha de MERCADO — perguntas diferentes.
     banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
-                      notificacoes={"s1": notifs})
+                      entregas={"s1": entrega} if entrega else {})
     processar_evento(banco, _evento(), _gates())
     res = banco.por_ref(sinal_id="s1")
     assert res["p_categoria"] == "confirmado_nao_entregue"
@@ -385,7 +385,7 @@ def test_confirmado_nao_entregue_tem_motivo_proprio(notifs, motivo):
 
 def test_entrega_no_limite_antes_do_apito_conta_como_real():
     banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
-                      notificacoes={"s1": [_cartao(entregue_em="2026-07-20T20:59:59Z")]})
+                      entregas={"s1": _entrega(entregue_em="2026-07-20T20:59:59Z")})
     processar_evento(banco, _evento(), _gates())
     assert banco.por_ref(sinal_id="s1")["p_categoria"] == "real_entregue"
     assert banco.clv_log[0]["contrafactual"] is False
@@ -395,7 +395,7 @@ def test_categorias_de_confirmado_nao_se_confundem_com_veto():
     # O veto do crivo continua sendo contrafactual_l2: é decisão, não falha de entrega.
     banco = BancoFake(snaps_ref=_snaps_completos(),
                       sinais=[_sinal("s1"), _sinal("s2", "vetado")],
-                      notificacoes={"s1": [_cartao()]})
+                      entregas={"s1": _entrega()})
     processar_evento(banco, _evento(), _gates())
     assert banco.por_ref(sinal_id="s1")["p_categoria"] == "real_entregue"
     assert banco.por_ref(sinal_id="s2")["p_categoria"] == "contrafactual_l2"
@@ -587,7 +587,7 @@ def test_item_emitido_antes_da_remarcacao_sai_da_amostra():
     fechamento será do horário NOVO. Comparar as duas mede coisas diferentes."""
     banco = BancoFake(snaps_ref=_snaps_completos(),
                       sinais=[{**_sinal("s1"), "criado_em": ANTES_DA_REVISAO}],
-                      notificacoes={"s1": [_cartao()]})
+                      entregas={"s1": _entrega()})
     r = processar_evento(banco, _evento_remarcado(), _gates(),
                          agora=para_datetime("2026-07-20T23:00:00Z"))
 
@@ -601,7 +601,7 @@ def test_item_emitido_antes_da_remarcacao_sai_da_amostra():
 def test_evento_cancelado_usa_desfecho_proprio():
     banco = BancoFake(snaps_ref=_snaps_completos(),
                       sinais=[{**_sinal("s1"), "criado_em": ANTES_DA_REVISAO}],
-                      notificacoes={"s1": [_cartao()]})
+                      entregas={"s1": _entrega()})
     r = processar_evento(banco, _evento_remarcado(status="cancelado"), _gates(),
                          agora=para_datetime("2026-07-20T23:00:00Z"))
 
@@ -614,7 +614,7 @@ def test_item_emitido_depois_da_remarcacao_espera_o_novo_apito():
     agora seria o fechamento prematuro que a 0007 corrigiu."""
     banco = BancoFake(snaps_ref=_snaps_completos(),
                       sinais=[{**_sinal("s1"), "criado_em": DEPOIS_DA_REVISAO}],
-                      notificacoes={"s1": [_cartao()]})
+                      entregas={"s1": _entrega()})
     r = processar_evento(banco, _evento_remarcado(), _gates(),
                          agora=para_datetime("2026-07-20T18:00:00Z"))  # antes do kickoff
 
@@ -630,7 +630,7 @@ def test_remarcacao_separa_os_dois_lados_no_mesmo_evento():
         snaps_ref=_snaps_completos(),
         sinais=[{**_sinal("s1"), "criado_em": ANTES_DA_REVISAO},
                 {**_sinal("s2"), "criado_em": DEPOIS_DA_REVISAO}],
-        notificacoes={"s1": [_cartao()], "s2": [_cartao()]})
+        entregas={"s1": _entrega(), "s2": _entrega()})
     r = processar_evento(banco, _evento_remarcado(), _gates(),
                          agora=para_datetime("2026-07-20T23:00:00Z"))
 
@@ -644,6 +644,26 @@ def test_evento_sem_revisao_segue_o_caminho_normal():
     """Controle: sem `invalidado_em` nada muda — o desvio não pode vazar."""
     banco = BancoFake(snaps_ref=_snaps_completos(),
                       sinais=[{**_sinal("s1"), "criado_em": ANTES_DA_REVISAO}],
-                      notificacoes={"s1": [_cartao()]})
+                      entregas={"s1": _entrega()})
     r = processar_evento(banco, _evento(), _gates())
     assert r["calculados"] == 1 and r["indisponiveis"] == 0
+
+
+def test_supressao_por_frescor_tambem_e_perda_de_mercado():
+    """`suprimido_frescor` e `suprimido_preco` respondem a mesma pergunta — o preço
+    deixou de estar lá —, e nenhum dos dois é falha do pipeline."""
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
+                      entregas={"s1": _entrega("suprimido_frescor")})
+    processar_evento(banco, _evento(), _gates())
+    assert banco.por_ref(sinal_id="s1")["p_categoria"] == "confirmado_suprimido"
+
+
+def test_entrega_ainda_nao_selada_e_fail_loud():
+    """O L4 sela antes de fechar; confirmado sem desfecho depois do apito é anomalia
+    e vira perda operacional nomeada, nunca CLV real."""
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
+                      entregas={"s1": {"desfecho": None}})
+    processar_evento(banco, _evento(), _gates())
+    res = banco.por_ref(sinal_id="s1")
+    assert res["p_categoria"] == "confirmado_nao_entregue"
+    assert res["p_motivo"] == "entrega_nao_selada"

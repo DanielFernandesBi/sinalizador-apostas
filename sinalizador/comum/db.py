@@ -346,11 +346,14 @@ class Banco:
             "p_agora": agora_iso, "p_limite": limite, "p_reclaim_s": reclaim_s,
         })
 
-    def devolver_notificacao(self, notif_id: int) -> bool:
+    def devolver_notificacao(self, notif_id: int, erro: Optional[str] = None,
+                             agora_iso: Optional[str] = None) -> dict[str, Any]:
         """Falha de envio: devolve a linha à fila imediatamente (retry no próximo
         ciclo, sem esperar a janela de recuperação)."""
-        r = self._rpc("fn_devolver_notificacao", {"p_id": notif_id})
-        return bool(r.get("retorno"))
+        r = self._rpc("fn_devolver_notificacao", {
+            "p_id": notif_id, "p_erro": erro, "p_agora": agora_iso or _agora_utc_iso(),
+        })
+        return r if isinstance(r, dict) else {"devolvido": bool(r)}
 
     # ---------------- LEITURA do L4 (fechamento / CLV) ----------------
 
@@ -620,6 +623,58 @@ class Banco:
         """
         return self._rpc("fn_marcar_evento_cancelado", {
             "p_evento_id": evento_id, "p_motivo": motivo, "p_fonte": fonte,
+        })
+
+
+    # -------- ENTREGA COM DESFECHO / EPISÓDIO / DEAD-LETTER (P1.3, P1.4, P1.6) --------
+
+    def registrar_tentativa_cartao(self, sinal_id: str, motivo: str,
+                                   agora_iso: Optional[str] = None) -> dict[str, Any]:
+        """Conta uma tentativa frustrada de enviar o cartão, SEM selar desfecho.
+
+        Antes, cada ciclo com janela fechada inseria uma notificação administrativa
+        nova — centenas por sinal. Agora é UMA linha por sinal, com contador e último
+        motivo. Não sela porque o preço pode voltar acima da mínima antes do apito.
+        """
+        return self._rpc("fn_registrar_tentativa_cartao", {
+            "p_sinal_id": sinal_id, "p_motivo": motivo,
+            "p_agora": agora_iso or _agora_utc_iso(),
+        })
+
+    def registrar_entrega_cartao(self, sinal_id: str,
+                                 agora_iso: Optional[str] = None) -> dict[str, Any]:
+        """Sela o desfecho `entregue` — a oportunidade chegou ao operador."""
+        return self._rpc("fn_registrar_entrega_cartao", {
+            "p_sinal_id": sinal_id, "p_agora": agora_iso or _agora_utc_iso(),
+        })
+
+    def selar_entregas(self, agora_iso: Optional[str] = None) -> int:
+        """Sela o que não tem mais volta: confirmados cujo apito passou sem entrega.
+        O motivo da última tentativa distingue perda de MERCADO de perda OPERACIONAL."""
+        r = self._rpc("fn_selar_entregas", {"p_agora": agora_iso or _agora_utc_iso()})
+        return int(r.get("retorno") or 0)
+
+    def entregas_de_sinais(self, sinal_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Desfecho de entrega por sinal — fonte do P0.7 no L4."""
+        if not sinal_ids:
+            return {}
+        resp = self._c.table("entregas_sinal").select("*").in_("sinal_id", sinal_ids).execute()
+        return {r["sinal_id"]: r for r in (resp.data or [])}
+
+    def abrir_episodio_kill_switch(self, pico: Optional[float] = None,
+                                   drawdown_pct: Optional[float] = None,
+                                   agora_iso: Optional[str] = None) -> dict[str, Any]:
+        """Abre o episódio de suspensão. `abriu=False` = a MESMA suspensão já está
+        aberta, e alertar de novo seria spam (o índice parcial garante um só)."""
+        return self._rpc("fn_abrir_episodio_kill_switch", {
+            "p_pico": pico, "p_drawdown_pct": drawdown_pct,
+            "p_agora": agora_iso or _agora_utc_iso(),
+        })
+
+    def encerrar_episodio_kill_switch(self, motivo: Optional[str] = None,
+                                      agora_iso: Optional[str] = None) -> dict[str, Any]:
+        return self._rpc("fn_encerrar_episodio_kill_switch", {
+            "p_motivo": motivo, "p_agora": agora_iso or _agora_utc_iso(),
         })
 
     # ---------------- EXPOSIÇÃO DE PAPEL (Sugestão nº 13 / P0.8) ----------------

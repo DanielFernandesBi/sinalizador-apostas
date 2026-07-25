@@ -57,6 +57,7 @@ class ResumoL3:
     suprimidos: int = 0         # confirmados cuja janela fechou
     alertas_entregues: int = 0  # entregas que não são cartão de sinal
     posicoes_papel: int = 0     # reservas de exposição abertas pela entrega (P0.8)
+    mortas: int = 0             # P1.6: a outbox desistiu (dead-letter)
 
 
 def _odd_venue_atual(banco: Any, sinal: dict[str, Any], *,
@@ -91,14 +92,34 @@ def expirar_pendentes(banco: Any, *, limite: int = 200,
     return n
 
 
-def alerta_drawdown(banco: Any) -> bool:
-    """E4.3: enfileira um alerta de drawdown se o kill switch disparou e não há
-    outro alerta_drawdown pendente (anti-spam)."""
+def alerta_drawdown(banco: Any, *, agora_iso: Optional[str] = None) -> bool:
+    """E4.3: UM alerta por EPISÓDIO de suspensão (P1.4).
+
+    O anti-spam antigo olhava só notificações ainda PENDENTES — depois de entregue, a
+    linha some da fila e o ciclo seguinte enfileirava outro alerta. Como o kill switch
+    fica ligado até revisão formal (§7), era um alerta por ciclo do L3, para sempre. A
+    outbox (0010) piorou: antes `entregue` era booleano e a linha continuava visível.
+
+    Agora a unidade é o episódio, e quem garante "um só" é o banco (índice parcial de
+    episódio aberto), não a sorte de a notificação anterior ainda estar na fila.
+    """
     banca = banco.banca_atual()
+    abrir = getattr(banco, "abrir_episodio_kill_switch", None)
+    encerrar = getattr(banco, "encerrar_episodio_kill_switch", None)
+
     if not banca or not banca.get("kill_switch"):
+        # Saiu da suspensão: fecha o episódio para que a PRÓXIMA volte a alertar.
+        if encerrar is not None:
+            encerrar("kill switch desarmado", agora_iso)
         return False
-    if any(nt.get("tipo") == "alerta_drawdown" for nt in banco.notificacoes_pendentes(500)):
-        return False
+
+    if abrir is None:                                  # banco sem a RPC (fake antigo)
+        if any(nt.get("tipo") == "alerta_drawdown" for nt in banco.notificacoes_pendentes(500)):
+            return False
+    else:
+        r = abrir(banca.get("pico"), banca.get("drawdown_pct"), agora_iso)
+        if not r.get("abriu"):
+            return False                               # a MESMA suspensão já alertou
     banco.inserir("notificacoes", {
         "sinal_id": None, "tipo": "alerta_drawdown", "canal": "telegram",
         "conteudo": (f"⛔ KILL SWITCH — drawdown {banca.get('drawdown_pct')}% atingiu o limite (P9). "
@@ -111,7 +132,8 @@ def alerta_drawdown(banco: Any) -> bool:
 
 def enfileirar_cartoes(banco: Any, *, limite: int = 200,
                        agora: Optional[datetime] = None,
-                       idade_max_s: Optional[float] = None) -> ResumoL3:
+                       idade_max_s: Optional[float] = None,
+                       agora_iso: Optional[str] = None) -> ResumoL3:
     """E4.1/E4.2: grava como `pendente` o cartão de cada confirmado ainda sem cartão.
 
     NÃO ENVIA NADA: registrar antes de enviar é o que impede o cartão duplicado.
@@ -125,16 +147,18 @@ def enfileirar_cartoes(banco: Any, *, limite: int = 200,
         minima = float(sinal["odd_minima_aceitavel"])
         if janela_fechou(odd, minima):
             # Janela fechada (preço caiu, ausente OU velho) → não vira cartão. O sinal
-            # já é 'confirmado' (imutável): fica o registro INTERNO, que não vai ao bot.
-            banco.inserir("notificacoes", {
-                "sinal_id": sinal["id"], "tipo": "administrativo", "canal": "telegram",
-                "conteudo": (f"[expirado-no-envio] sinal {sinal['id']}: "
-                             f"odd atual {odd} < mínima {minima} — cartão suprimido"),
-                "status": "interno",
-            })
+            # já é 'confirmado' (imutável). P1.3: isto CONTA como tentativa numa linha
+            # única por sinal — antes inseria uma notificação administrativa por ciclo,
+            # centenas por sinal. E não sela desfecho: o preço pode voltar acima da
+            # mínima antes do apito, e aí o cartão sai.
+            motivo = ("preco_abaixo_da_minima" if odd is not None
+                      else "frescor_sem_preco_atual")
+            registrar = getattr(banco, "registrar_tentativa_cartao", None)
+            if registrar is not None:
+                registrar(sinal["id"], motivo, agora_iso)
             resumo.suprimidos += 1
-            _log.info("cartão suprimido (janela fechou)",
-                      extra={"sinal_id": sinal["id"], "odd_atual": odd})
+            _log.info("cartão não enviado neste ciclo (janela fechada)",
+                      extra={"sinal_id": sinal["id"], "odd_atual": odd, "motivo": motivo})
             continue
         crivo = banco.crivo_do_sinal(sinal["id"])
         evento = banco.evento_por_id(sinal["evento_id"])
@@ -185,29 +209,44 @@ def _reservar_papel(banco: Any, sinal_id: Any, *, agora_iso: Optional[str]) -> b
 
 def entregar_pendentes(banco: Any, bot: Bot, *, limite: int = 200,
                        agora_iso: Optional[str] = None,
-                       reclaim_s: float = 300.0) -> tuple[int, int, int, int]:
-    """E4.3/E4.4 — o REMETENTE da outbox. Devolve (entregues, falhas, cartoes, reservas).
+                       reclaim_s: float = 300.0) -> tuple[int, int, int, int, int]:
+    """E4.3/E4.4 — o REMETENTE. Devolve (entregues, falhas, cartoes, reservas, mortas).
 
     Reivindica atomicamente (`pendente → enviando`), envia e só então marca
     `entregue`. Falha de envio devolve a linha à fila na hora. O contador conta
     ENTREGA CONFIRMADA — antes ele somava mesmo quando `bot.enviar()` devolvia
     False, e o resumo dizia "enviado" para mensagem que nunca saiu.
     """
-    entregues = falhas = cartoes = reservas = 0
+    entregues = falhas = cartoes = reservas = mortas = 0
     for notif in banco.reivindicar_notificacoes(agora_iso, limite, reclaim_s):
         if bot.enviar(notif["conteudo"]):
             banco.marcar_notificacao_entregue(notif["id"], agora_iso)
             entregues += 1
             if notif.get("tipo") == "sinal":
                 cartoes += 1
+                # P1.3: sela o desfecho de entrega — é o que o L4 lê para separar CLV
+                # real de perda de mercado e de perda operacional (P0.7).
+                selar = getattr(banco, "registrar_entrega_cartao", None)
+                if selar is not None and notif.get("sinal_id"):
+                    selar(notif["sinal_id"], agora_iso)
                 if _reservar_papel(banco, notif.get("sinal_id"), agora_iso=agora_iso):
                     reservas += 1
         else:
-            banco.devolver_notificacao(notif["id"])
+            # P1.6: a devolução agora tem backoff e teto — antes voltava a `pendente`
+            # na hora, então token revogado girava para sempre disputando a fila.
+            r = banco.devolver_notificacao(notif["id"], "bot.enviar() devolveu False",
+                                           agora_iso)
             falhas += 1
-            _log.warning("envio falhou — devolvido à fila para o próximo ciclo",
-                         extra={"notificacao_id": notif["id"], "tipo": notif.get("tipo")})
-    return entregues, falhas, cartoes, reservas
+            if isinstance(r, dict) and r.get("morta"):
+                mortas += 1
+                _log.error("outbox DESISTIU da notificação (dead-letter)",
+                           extra={"notificacao_id": notif["id"], "tipo": notif.get("tipo"),
+                                  "tentativas": r.get("tentativas")})
+            else:
+                _log.warning("envio falhou — volta à fila após o backoff",
+                             extra={"notificacao_id": notif["id"], "tipo": notif.get("tipo"),
+                                    "espera_s": (r or {}).get("espera_s")})
+    return entregues, falhas, cartoes, reservas, mortas
 
 
 def processar(banco: Any, bot: Bot, gates: Any, *, limite: int = 200,
@@ -220,24 +259,25 @@ def processar(banco: Any, bot: Bot, gates: Any, *, limite: int = 200,
     expirados = expirar_pendentes(banco, limite=limite, agora=agora,
                                   idade_max_s=idade_max_s)
     # 2. alerta de drawdown.
-    alerta_drawdown(banco)
+    alerta_drawdown(banco, agora_iso=agora_iso)
     # 3. enfileira os cartões (grava, não envia).
     resumo = enfileirar_cartoes(banco, limite=limite, agora=agora,
-                                idade_max_s=idade_max_s)
+                                idade_max_s=idade_max_s, agora_iso=agora_iso)
     resumo.expirados = expirados
     # 4. envia o que está na fila (cartões + alertas), pela outbox — e a entrega
     #    confirmada abre a posição de papel (P0.8).
-    entregues, falhas, cartoes, reservas = entregar_pendentes(
+    entregues, falhas, cartoes, reservas, mortas = entregar_pendentes(
         banco, bot, limite=limite, agora_iso=agora_iso, reclaim_s=reclaim_s)
     resumo.enviados = cartoes
     resumo.falhas_envio = falhas
     resumo.alertas_entregues = entregues - cartoes
     resumo.posicoes_papel = reservas
+    resumo.mortas = mortas
 
     detalhe = {"enviados": resumo.enviados, "enfileirados": resumo.enfileirados,
                "falhas_envio": resumo.falhas_envio, "suprimidos": resumo.suprimidos,
                "expirados": resumo.expirados, "alertas": resumo.alertas_entregues,
-               "posicoes_papel": resumo.posicoes_papel}
+               "posicoes_papel": resumo.posicoes_papel, "mortas": resumo.mortas}
     banco.pulsar(DAEMON, detalhe)
     _log.info("ciclo L3 concluído", extra=detalhe)
     return resumo

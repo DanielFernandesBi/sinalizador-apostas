@@ -66,7 +66,7 @@ class ErroUnicidade(RuntimeError):
 class BancoFake:
     def __init__(self, *, confirmados=None, aguardando=None, snaps=None, crivos=None,
                  eventos=None, notif_por_sinal=None, pendentes=None, banca=None,
-                 reserva=None, reserva_levanta=False):
+                 reserva=None, reserva_levanta=False, max_tentativas=6):
         self._confirmados = confirmados or []
         self._aguardando = aguardando or []
         self._snaps = snaps or {}
@@ -86,6 +86,11 @@ class BancoFake:
         self.reservas = []
         self._reserva = reserva if reserva is not None else {"reservado": True}
         self._reserva_levanta = reserva_levanta
+        # P1.3/P1.4/P1.6 (migration 0018)
+        self.entregas = {}
+        self.episodios = []
+        self.episodio_aberto = False
+        self._max_tentativas = max_tentativas
 
     # -- leituras --
     def sinais_por_status(self, status, limite=200):
@@ -149,12 +154,49 @@ class BancoFake:
                 n["status"] = "entregue"
         return True
 
-    def devolver_notificacao(self, notif_id):
+    def devolver_notificacao(self, notif_id, erro=None, agora_iso=None):
+        """Espelha `fn_devolver_notificacao` (0018): backoff e desistência."""
         self.devolvidas.append(notif_id)
         for n in self._fila:
             if n["id"] == notif_id and n["status"] == "enviando":
+                tent = n.get("tentativas", 1)
+                if tent >= self._max_tentativas:
+                    n["status"] = "morta"
+                    if n.get("tipo") == "sinal" and n.get("sinal_id"):
+                        self.entregas[n["sinal_id"]] = {"desfecho": "nao_entregue_falha"}
+                    return {"devolvido": False, "morta": True, "tentativas": tent}
                 n["status"] = "pendente"
-        return True
+                return {"devolvido": True, "espera_s": 30 * 2 ** (tent - 1)}
+        return {"devolvido": False, "motivo": "nao_estava_enviando"}
+
+    # -- P1.3 / P1.4 (espelham as RPCs da 0018) --
+    def registrar_tentativa_cartao(self, sinal_id, motivo, agora_iso=None):
+        e = self.entregas.setdefault(sinal_id, {"tentativas": 0, "desfecho": None})
+        if e.get("desfecho"):
+            return {"registrado": False, "motivo": "desfecho_ja_selado"}
+        e["tentativas"] += 1
+        e["ultimo_motivo"] = motivo
+        return {"registrado": True, "tentativas": e["tentativas"]}
+
+    def registrar_entrega_cartao(self, sinal_id, agora_iso=None):
+        e = self.entregas.setdefault(sinal_id, {"tentativas": 0, "desfecho": None})
+        if e.get("desfecho"):
+            return {"registrado": False, "motivo": "desfecho_ja_selado"}
+        e["desfecho"] = "entregue"
+        e["entregue_em"] = agora_iso
+        return {"registrado": True}
+
+    def abrir_episodio_kill_switch(self, pico=None, drawdown_pct=None, agora_iso=None):
+        if self.episodio_aberto:
+            return {"abriu": False, "motivo": "episodio_ja_aberto"}
+        self.episodio_aberto = True
+        self.episodios.append({"pico": pico, "drawdown_pct": drawdown_pct})
+        return {"abriu": True, "episodio_id": len(self.episodios)}
+
+    def encerrar_episodio_kill_switch(self, motivo=None, agora_iso=None):
+        encerrou = self.episodio_aberto
+        self.episodio_aberto = False
+        return {"encerrou": encerrou}
 
     def reservar_exposicao_papel(self, sinal_id, agora_iso=None):
         self.reservas.append(sinal_id)
@@ -221,14 +263,37 @@ def test_cartao_e_gravado_pendente_antes_de_qualquer_envio():
     assert nota["status"] == "pendente"
 
 
-def test_janela_fechada_suprime_com_registro_interno():
+def test_janela_fechada_conta_tentativa_sem_selar_desfecho():
+    """P1.3: antes, cada ciclo com janela fechada inseria uma notificação
+    administrativa nova — centenas por sinal. Agora é UMA linha com contador. E não
+    sela: o preço pode voltar acima da mínima antes do apito."""
     banco = BancoFake(confirmados=[_sinal()], snaps=_snaps_ok(odd=1.80))
-    r = enfileirar_cartoes(banco, agora=AGORA, idade_max_s=IDADE_MAX)
+    r = enfileirar_cartoes(banco, agora=AGORA, idade_max_s=IDADE_MAX, agora_iso=AGORA_ISO)
     assert r.enfileirados == 0 and r.suprimidos == 1
     assert banco.notificacoes(tipo="sinal") == []
-    adm = banco.notificacoes(tipo="administrativo")[0]
-    assert adm["status"] == "interno"          # nunca vai ao bot
-    assert "expirado-no-envio" in adm["conteudo"]
+    assert banco.notificacoes(tipo="administrativo") == []   # nada de linha por ciclo
+    assert banco.entregas["s1"]["tentativas"] == 1
+    assert banco.entregas["s1"]["ultimo_motivo"] == "preco_abaixo_da_minima"
+    assert banco.entregas["s1"]["desfecho"] is None          # ainda pode virar cartão
+
+
+def test_ciclos_repetidos_de_supressao_nao_multiplicam_linhas():
+    """O achado do P1.3 em uma linha: com o L3 a cada 30 s e um sinal confirmado
+    horas antes do apito, o modelo antigo escrevia centenas de registros."""
+    banco = BancoFake(confirmados=[_sinal()], snaps=_snaps_ok(odd=1.80))
+    for _ in range(5):
+        enfileirar_cartoes(banco, agora=AGORA, idade_max_s=IDADE_MAX, agora_iso=AGORA_ISO)
+    assert len(banco.entregas) == 1
+    assert banco.entregas["s1"]["tentativas"] == 5
+    assert banco.notificacoes(tipo="administrativo") == []
+
+
+def test_frescor_e_preco_sao_motivos_distintos():
+    """A distinção alimenta o P0.7: preço que caiu é perda de MERCADO; ausência de
+    preço atual é falha da CAPTURA."""
+    banco = BancoFake(confirmados=[_sinal()], snaps={})           # sem snapshot algum
+    enfileirar_cartoes(banco, agora=AGORA, idade_max_s=IDADE_MAX, agora_iso=AGORA_ISO)
+    assert banco.entregas["s1"]["ultimo_motivo"] == "frescor_sem_preco_atual"
 
 
 def test_snapshot_velho_suprime_o_cartao():
@@ -267,7 +332,7 @@ def test_envio_confirmado_marca_entregue():
     banco = BancoFake(pendentes=[{"id": 10, "tipo": "alerta_daemon",
                                   "conteudo": "daemon l0 mudo", "status": "pendente"}])
     bot = BotFake()
-    entregues, falhas, cartoes, _ = entregar_pendentes(banco, bot, agora_iso=AGORA_ISO)
+    entregues, falhas, cartoes, _, _ = entregar_pendentes(banco, bot, agora_iso=AGORA_ISO)
     assert (entregues, falhas, cartoes) == (1, 0, 0)
     assert banco.entregues == [10] and bot.enviados == ["daemon l0 mudo"]
 
@@ -277,7 +342,7 @@ def test_falha_de_envio_nao_conta_como_enviado_e_devolve_a_fila():
     banco = BancoFake(pendentes=[{"id": 11, "tipo": "sinal", "conteudo": "cartão",
                                   "status": "pendente"}])
     bot = BotFake(ok=False)
-    entregues, falhas, cartoes, _ = entregar_pendentes(banco, bot, agora_iso=AGORA_ISO)
+    entregues, falhas, cartoes, _, _ = entregar_pendentes(banco, bot, agora_iso=AGORA_ISO)
     assert (entregues, falhas, cartoes) == (0, 1, 0)
     assert banco.entregues == [] and banco.devolvidas == [11]
     assert banco._fila[0]["status"] == "pendente"   # volta para o próximo ciclo
@@ -288,7 +353,7 @@ def test_reivindicacao_reserva_e_nao_reentrega():
     banco = BancoFake(pendentes=[{"id": 12, "tipo": "sinal", "conteudo": "c",
                                   "status": "pendente"}])
     entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
-    entregues, _, _, _ = entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
+    entregues, _, _, _, _ = entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
     assert entregues == 0                            # já entregue, não reivindica de novo
 
 
@@ -405,7 +470,7 @@ def test_entrega_confirmada_abre_posicao_de_papel():
     momento em que o dinheiro real sairia da banca. Antes do P0.8 nada reservava, e
     `vw_exposicao_aberta` ficava zerada para sempre no modo sombra."""
     banco = BancoFake(pendentes=[_pendente(21)])
-    entregues, falhas, cartoes, reservas = entregar_pendentes(
+    entregues, falhas, cartoes, reservas, _ = entregar_pendentes(
         banco, BotFake(), agora_iso=AGORA_ISO)
     assert (entregues, falhas, cartoes, reservas) == (1, 0, 1, 1)
     assert banco.reservas == ["s1"]
@@ -415,7 +480,7 @@ def test_envio_que_falhou_nao_reserva_exposicao():
     """Cartão que o Telegram recusou não é oportunidade entregue: reservar aqui
     inventaria uma posição que ninguém recebeu."""
     banco = BancoFake(pendentes=[_pendente(22)])
-    _, falhas, _, reservas = entregar_pendentes(banco, BotFake(ok=False), agora_iso=AGORA_ISO)
+    _, falhas, _, reservas, _ = entregar_pendentes(banco, BotFake(ok=False), agora_iso=AGORA_ISO)
     assert (falhas, reservas) == (1, 0)
     assert banco.reservas == []
 
@@ -423,7 +488,7 @@ def test_envio_que_falhou_nao_reserva_exposicao():
 def test_alerta_entregue_nao_abre_posicao():
     """Só o cartão de SINAL vira posição — alerta de drawdown não é aposta."""
     banco = BancoFake(pendentes=[_pendente(23, tipo="alerta_drawdown", sinal_id=None)])
-    entregues, _, cartoes, reservas = entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
+    entregues, _, cartoes, reservas, _ = entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
     assert (entregues, cartoes, reservas) == (1, 0, 0)
     assert banco.reservas == []
 
@@ -433,7 +498,7 @@ def test_reenvio_do_mesmo_cartao_nao_duplica_posicao():
     desejado (UMA posição) já está lá. O contador não a soma de novo."""
     banco = BancoFake(pendentes=[_pendente(24)], reserva={"reservado": False,
                                                           "motivo": "ja_reservado"})
-    _, _, cartoes, reservas = entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
+    _, _, cartoes, reservas, _ = entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
     assert (cartoes, reservas) == (1, 0)
     assert banco.reservas == ["s1"]
 
@@ -443,7 +508,7 @@ def test_falha_ao_reservar_nao_desfaz_entrega_confirmada():
     à fila e o reenviaria. O sinal volta a contar como 'em voo' na view — que é o
     lado seguro do erro."""
     banco = BancoFake(pendentes=[_pendente(25)], reserva_levanta=True)
-    entregues, falhas, cartoes, reservas = entregar_pendentes(
+    entregues, falhas, cartoes, reservas, _ = entregar_pendentes(
         banco, BotFake(), agora_iso=AGORA_ISO)
     assert (entregues, falhas, cartoes, reservas) == (1, 0, 1, 0)
     assert banco.entregues == [25]
@@ -456,3 +521,63 @@ def test_resumo_do_ciclo_publica_posicoes_de_papel():
     assert resumo.enviados == 1
     assert resumo.posicoes_papel == 1
     assert banco.pulsos[-1][1]["posicoes_papel"] == 1
+
+
+# ---------------- P1.4: um alerta por EPISÓDIO de suspensão ----------------
+
+BANCA_SUSPENSA = {"saldo": 780.0, "pico": 1000.0, "drawdown_pct": 22.0, "kill_switch": True}
+BANCA_OK = {"saldo": 1000.0, "pico": 1000.0, "drawdown_pct": 0.0, "kill_switch": False}
+
+
+def test_kill_switch_alerta_uma_vez_por_episodio():
+    """Antes o anti-spam olhava só notificações PENDENTES: entregue a primeira, o
+    ciclo seguinte enfileirava outra — um alerta por ciclo, indefinidamente."""
+    banco = BancoFake(banca=BANCA_SUSPENSA)
+    assert alerta_drawdown(banco, agora_iso=AGORA_ISO) is True
+    # simula a entrega (que era o que "apagava" o anti-spam antigo)
+    for n in banco._fila:
+        n["status"] = "entregue"
+    assert alerta_drawdown(banco, agora_iso=AGORA_ISO) is False
+    assert alerta_drawdown(banco, agora_iso=AGORA_ISO) is False
+    assert len(banco.notificacoes(tipo="alerta_drawdown")) == 1
+    assert len(banco.episodios) == 1
+
+
+def test_nova_suspensao_depois_de_recuperar_volta_a_alertar():
+    """O episódio fecha quando o kill switch desarma — senão uma suspensão futura
+    ficaria silenciada para sempre."""
+    banco = BancoFake(banca=BANCA_SUSPENSA)
+    assert alerta_drawdown(banco, agora_iso=AGORA_ISO) is True
+    banco._banca = BANCA_OK
+    assert alerta_drawdown(banco, agora_iso=AGORA_ISO) is False   # fecha o episódio
+    assert banco.episodio_aberto is False
+    banco._banca = BANCA_SUSPENSA
+    assert alerta_drawdown(banco, agora_iso=AGORA_ISO) is True    # episódio novo
+    assert len(banco.notificacoes(tipo="alerta_drawdown")) == 2
+
+
+# ---------------- P1.6: backoff e dead-letter ----------------
+
+def test_falha_de_envio_volta_a_fila_com_backoff():
+    banco = BancoFake(pendentes=[_pendente(31)])
+    _, falhas, _, _, mortas = entregar_pendentes(banco, BotFake(ok=False), agora_iso=AGORA_ISO)
+    assert (falhas, mortas) == (1, 0)
+    assert banco._fila[0]["status"] == "pendente"
+
+
+def test_outbox_desiste_e_sela_perda_operacional():
+    """Token revogado girava para sempre: `tentativas` era incrementado e nunca lido
+    como limite. Agora a desistência é registrada — e vira desfecho de entrega, que é
+    o que o P0.7 chama de perda operacional."""
+    banco = BancoFake(pendentes=[_pendente(32)], max_tentativas=1)
+    _, falhas, _, _, mortas = entregar_pendentes(banco, BotFake(ok=False), agora_iso=AGORA_ISO)
+    assert (falhas, mortas) == (1, 1)
+    assert banco._fila[0]["status"] == "morta"
+    assert banco.entregas["s1"]["desfecho"] == "nao_entregue_falha"
+
+
+def test_entrega_confirmada_sela_o_desfecho():
+    banco = BancoFake(pendentes=[_pendente(33)])
+    entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
+    assert banco.entregas["s1"]["desfecho"] == "entregue"
+    assert banco.entregas["s1"]["entregue_em"] == AGORA_ISO

@@ -162,35 +162,44 @@ CATEGORIA_POR_STATUS: dict[str, str] = {
 STATUS_AUDITAVEIS = ("confirmado",) + tuple(CATEGORIA_POR_STATUS)
 
 
+# Desfecho de entrega (`entregas_sinal`, migration 0018) → categoria do P0.7.
+CATEGORIA_POR_ENTREGA: dict[str, str] = {
+    "suprimido_preco":      "confirmado_suprimido",      # perda de MERCADO
+    "suprimido_frescor":    "confirmado_suprimido",      # perda de MERCADO
+    "nao_entregue_timeout": "confirmado_nao_entregue",   # perda OPERACIONAL
+    "nao_entregue_falha":   "confirmado_nao_entregue",   # perda OPERACIONAL
+}
+
+
 def categoria_do_confirmado(
-    notificacoes: list[dict[str, Any]], inicio: Optional[datetime]
+    entrega: Optional[dict[str, Any]], inicio: Optional[datetime]
 ) -> tuple[str, Optional[str]]:
     """Categoria de um sinal `confirmado`, pela ENTREGA EFETIVA (P0.7).
 
-    Devolve (categoria, motivo). O frescor do preço no momento do cartão já é
-    garantido a montante: o L3 só enfileira depois de re-checar a odd contra a
-    mínima E a idade do snapshot. Aqui resta a pergunta que faltava — o cartão
-    chegou ao operador ANTES do apito?
+    Devolve (categoria, motivo). A fonte é o DESFECHO DE ENTREGA — uma linha por
+    sinal (P1.3). Antes isto era reconstruído a cada fechamento varrendo as
+    notificações e procurando a string "[expirado-no-envio]" num registro
+    administrativo; além de frágil, dependia de linhas que o L3 escrevia UMA POR
+    CICLO. Com o desfecho canônico, a pergunta "o cartão chegou antes do apito?"
+    tem uma resposta gravada, não inferida.
     """
-    cartao = next((n for n in notificacoes if n.get("tipo") == "sinal"), None)
-    if cartao is None:
-        # Sem cartão: ou o L3 suprimiu (registro interno), ou nem chegou a processar.
-        suprimido = any(
-            n.get("tipo") == "administrativo" and "expirado-no-envio" in (n.get("conteudo") or "")
-            for n in notificacoes
-        )
-        if suprimido:
-            return "confirmado_suprimido", "janela_fechou_antes_do_envio"
-        return "confirmado_nao_entregue", "cartao_nunca_enfileirado"
+    if not entrega:
+        # O L4 chama `selar_entregas` antes de fechar, então isto é anomalia:
+        # confirmado sem desfecho depois do apito. Fail-loud como perda operacional.
+        return "confirmado_nao_entregue", "sem_registro_de_entrega"
 
-    if cartao.get("status") != "entregue":
-        # Preso na outbox: pendente, ou reservado por um envio que não concluiu.
-        return "confirmado_nao_entregue", f"cartao_{cartao.get('status')}"
+    desfecho = entrega.get("desfecho")
+    if desfecho is None:
+        return "confirmado_nao_entregue", "entrega_nao_selada"
+    if desfecho != "entregue":
+        return CATEGORIA_POR_ENTREGA.get(desfecho, "confirmado_nao_entregue"), desfecho
 
-    entregue_em = para_datetime(cartao.get("entregue_em"))
+    entregue_em = para_datetime(entrega.get("entregue_em"))
     if entregue_em is None or (inicio is not None and entregue_em >= inicio):
+        # Chegou, mas depois do apito: não era mais oportunidade executável.
         return "confirmado_nao_entregue", "entregue_apos_o_inicio"
     return "real_entregue", None
+
 
 MOTIVO_POR_STATUS: dict[str, str] = {
     "expirado": "preco_deixou_de_ser_executavel",
@@ -240,13 +249,12 @@ def _itens_do_evento(banco: Any, evento_id: str,
     """
     itens: list[ItemFechamento] = []
     sinais = banco.sinais_do_evento(evento_id, status=list(STATUS_AUDITAVEIS))
-    # P0.7: para os confirmados é preciso saber se o cartão saiu de fato.
-    ler_notifs = getattr(banco, "notificacoes_de_sinais", None)
-    notifs_por_sinal = (ler_notifs([s["id"] for s in sinais]) if ler_notifs else {})
+    # P0.7/P1.3: para os confirmados, o desfecho de ENTREGA é a fonte da categoria.
+    ler_entregas = getattr(banco, "entregas_de_sinais", None)
+    entregas = (ler_entregas([s["id"] for s in sinais]) if ler_entregas else {})
     for s in sinais:
         if s["status"] == "confirmado":
-            categoria, motivo = categoria_do_confirmado(
-                notifs_por_sinal.get(s["id"], []), inicio)
+            categoria, motivo = categoria_do_confirmado(entregas.get(s["id"]), inicio)
         else:
             categoria = CATEGORIA_POR_STATUS[s["status"]]
             motivo = MOTIVO_POR_STATUS.get(s["status"])
@@ -453,11 +461,15 @@ def rodar_fechamento(banco: Any, gates: Any, agora_iso: str, *,
     # Nenhum sinal sobrevive ao kickoff em 'aguardando_crivo' (Sugestão nº 10):
     # senão o item nunca teria desfecho e o evento nunca finalizaria.
     timeouts = banco.marcar_timeout_crivo(agora_iso)
+    # P1.3 — sela o desfecho de entrega dos confirmados cujo apito já passou. Tem de
+    # vir ANTES de processar os eventos: é dele que sai a categoria do P0.7.
+    selar = getattr(banco, "selar_entregas", None)
+    entregas_seladas = selar(agora_iso) if selar else 0
 
     assentamento_s = float(gates.get("fechamento_assentamento_s"))
     eventos = banco.fila_fechamento(agora_iso, assentamento_s, limite)
     total = {"eventos": 0, "clv": 0, "indisponiveis": 0, "pendentes": 0,
-             "timeout_crivo": timeouts}
+             "timeout_crivo": timeouts, "entregas_seladas": entregas_seladas}
     agora = para_datetime(agora_iso)
     for evento in eventos:
         r = processar_evento(banco, evento, gates, agora=agora)
