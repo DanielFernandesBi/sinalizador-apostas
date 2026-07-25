@@ -568,3 +568,82 @@ def test_relatorio_lista_daemons_mudos():
     txt = formatar_relatorio([], None, saude, amostra_minima=200)
     assert "l1" in txt.split("Daemons mudos:")[1]
     assert "l0_referencia" not in txt.split("Daemons mudos:")[1]
+
+
+# ---------------- evento remarcado / cancelado (P1.2) ----------------
+
+REVISAO = "2026-07-20T15:00:00Z"          # a fonte remarcou a partida às 15h
+ANTES_DA_REVISAO = "2026-07-20T14:00:00Z"
+DEPOIS_DA_REVISAO = "2026-07-20T16:00:00Z"
+
+
+def _evento_remarcado(status="agendado"):
+    """Kickoff empurrado para depois; `invalidado_em` carimba a revisão."""
+    return {"id": "ev1", "inicio_utc": INICIO, "invalidado_em": REVISAO, "status": status}
+
+
+def test_item_emitido_antes_da_remarcacao_sai_da_amostra():
+    """A odd de emissão precificava a partida no horário ANTIGO; a linha de
+    fechamento será do horário NOVO. Comparar as duas mede coisas diferentes."""
+    banco = BancoFake(snaps_ref=_snaps_completos(),
+                      sinais=[{**_sinal("s1"), "criado_em": ANTES_DA_REVISAO}],
+                      notificacoes={"s1": [_cartao()]})
+    r = processar_evento(banco, _evento_remarcado(), _gates(),
+                         agora=para_datetime("2026-07-20T23:00:00Z"))
+
+    assert r["calculados"] == 0 and r["indisponiveis"] == 1
+    linha = banco.resultados[0]
+    assert linha["p_resultado"] == "indisponivel_evento_remarcado"
+    assert linha["p_motivo"] == "emitido_antes_da_revisao_do_evento"
+    assert banco.clv_log == []          # nada entrou na série
+
+
+def test_evento_cancelado_usa_desfecho_proprio():
+    banco = BancoFake(snaps_ref=_snaps_completos(),
+                      sinais=[{**_sinal("s1"), "criado_em": ANTES_DA_REVISAO}],
+                      notificacoes={"s1": [_cartao()]})
+    r = processar_evento(banco, _evento_remarcado(status="cancelado"), _gates(),
+                         agora=para_datetime("2026-07-20T23:00:00Z"))
+
+    assert r["indisponiveis"] == 1
+    assert banco.resultados[0]["p_resultado"] == "indisponivel_evento_cancelado"
+
+
+def test_item_emitido_depois_da_remarcacao_espera_o_novo_apito():
+    """A fila trouxe o evento por causa dos itens invalidados. Encerrar os demais
+    agora seria o fechamento prematuro que a 0007 corrigiu."""
+    banco = BancoFake(snaps_ref=_snaps_completos(),
+                      sinais=[{**_sinal("s1"), "criado_em": DEPOIS_DA_REVISAO}],
+                      notificacoes={"s1": [_cartao()]})
+    r = processar_evento(banco, _evento_remarcado(), _gates(),
+                         agora=para_datetime("2026-07-20T18:00:00Z"))  # antes do kickoff
+
+    assert r["calculados"] == 0 and r["indisponiveis"] == 0
+    assert r["pendentes"] == 1
+    assert banco.resultados == [] and banco.finalizados == []
+
+
+def test_remarcacao_separa_os_dois_lados_no_mesmo_evento():
+    """Um item de cada lado da revisão: o antigo termina, o novo mede quando o novo
+    apito assenta."""
+    banco = BancoFake(
+        snaps_ref=_snaps_completos(),
+        sinais=[{**_sinal("s1"), "criado_em": ANTES_DA_REVISAO},
+                {**_sinal("s2"), "criado_em": DEPOIS_DA_REVISAO}],
+        notificacoes={"s1": [_cartao()], "s2": [_cartao()]})
+    r = processar_evento(banco, _evento_remarcado(), _gates(),
+                         agora=para_datetime("2026-07-20T23:00:00Z"))
+
+    por_sinal = {x["p_sinal_id"]: x["p_resultado"] for x in banco.resultados}
+    assert por_sinal["s1"] == "indisponivel_evento_remarcado"
+    assert por_sinal["s2"] == "calculado"
+    assert r["calculados"] == 1 and r["indisponiveis"] == 1
+
+
+def test_evento_sem_revisao_segue_o_caminho_normal():
+    """Controle: sem `invalidado_em` nada muda — o desvio não pode vazar."""
+    banco = BancoFake(snaps_ref=_snaps_completos(),
+                      sinais=[{**_sinal("s1"), "criado_em": ANTES_DA_REVISAO}],
+                      notificacoes={"s1": [_cartao()]})
+    r = processar_evento(banco, _evento(), _gates())
+    assert r["calculados"] == 1 and r["indisponiveis"] == 0

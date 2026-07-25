@@ -11,12 +11,37 @@ class BancoFake:
         self.eventos = {}
         self.casas = casas or {"pinnacle": {"id": "casa-pinn"}}
         self.inseridos = []
+        self.revisoes = []
         self.lotes = []            # (tabela, [registros]) de inserir_muitos
         self.pulsos = []
         self._seq = 0
 
-    def evento_por_id_externo(self, fonte, valor):
-        return self.eventos.get(valor)
+    def garantir_evento(self, dados):
+        """Espelha `fn_garantir_evento` (0016): identidade única por id externo,
+        atualização dos fatos que a fonte governa e revisão registrada."""
+        id_api = (dados.get("ids_externos") or {}).get("odds_api")
+        if not id_api:
+            return {"id": None, "criado": False, "motivo": "sem_id_da_fonte"}
+        if not dados.get("inicio_utc"):
+            return {"id": None, "criado": False, "motivo": "sem_inicio_utc"}
+        atual = self.eventos.get(id_api)
+        if atual is None:
+            self._seq += 1
+            row = {"id": f"eventos-{self._seq}", **dados}
+            self.eventos[id_api] = row
+            self.inseridos.append(("eventos", row))
+            return {"id": row["id"], "criado": True, "alterado": False}
+        campos = [c for c in ("inicio_utc", "mandante", "visitante", "liga")
+                  if dados.get(c) is not None and atual.get(c) != dados.get(c)]
+        if not campos:
+            return {"id": atual["id"], "criado": False, "alterado": False}
+        tipo = "remarcado" if "inicio_utc" in campos else "corrigido"
+        atual.update({c: dados[c] for c in campos})
+        if tipo == "remarcado":
+            atual["invalidado_em"] = "2026-07-20T18:00:00Z"
+        self.revisoes.append({"evento_id": atual["id"], "tipo": tipo, "campos": campos})
+        return {"id": atual["id"], "criado": False, "alterado": True,
+                "tipo": tipo, "campos": campos}
 
     def casa_por_nome(self, nome):
         return self.casas.get(nome)
@@ -25,8 +50,6 @@ class BancoFake:
         self._seq += 1
         row = {"id": f"{tabela}-{self._seq}", **registro}
         self.inseridos.append((tabela, row))
-        if tabela == "eventos":
-            self.eventos[registro["ids_externos"]["odds_api"]] = row
         if tabela == "casas":
             self.casas[registro["nome"]] = row
         return row

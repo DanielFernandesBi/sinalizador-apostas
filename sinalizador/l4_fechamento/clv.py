@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from sinalizador.comum.erros import e_violacao_unicidade
@@ -212,6 +212,9 @@ class ItemFechamento:
     p_emissao: float
     contrafactual: bool
     motivo_origem: Optional[str] = None
+    # Quando o item foi emitido. É o que decide se ele sobrevive a uma remarcação
+    # do evento (P1.2): emitido ANTES da revisão, mediu outro mercado.
+    criado_em: Optional[datetime] = None
 
     @property
     def ref(self) -> str:
@@ -256,6 +259,7 @@ def _itens_do_evento(banco: Any, evento_id: str,
             # Só o cartão ENTREGUE conta como oportunidade que existiu de fato.
             contrafactual=(categoria != "real_entregue"),
             motivo_origem=motivo,
+            criado_em=para_datetime(s.get("criado_em")),
         ))
     for a in banco.abortos_rastreados_do_evento(evento_id):
         dp = a.get("dossie_parcial") or {}
@@ -268,6 +272,7 @@ def _itens_do_evento(banco: Any, evento_id: str,
                 mercado=str(dp.get("mercado") or "?"), selecao=str(sel or "?"),
                 linha=linha_key(dp.get("linha")), odd_emissao=0.0, p_emissao=0.0,
                 contrafactual=True, motivo_origem="dossie_parcial_incompleto",
+                criado_em=para_datetime(a.get("ts")),
             ))
             continue
         # candidato_sombra (achado 8) é um aborto com este gate — categoria calibração.
@@ -279,11 +284,13 @@ def _itens_do_evento(banco: Any, evento_id: str,
             odd_emissao=float(odd),
             p_emissao=float(dp.get("p_justa") or prob_implicita(float(odd))),
             contrafactual=True,
+            criado_em=para_datetime(a.get("ts")),
         ))
     return itens
 
 
-def processar_evento(banco: Any, evento: dict[str, Any], gates: Any) -> dict[str, int]:
+def processar_evento(banco: Any, evento: dict[str, Any], gates: Any, *,
+                     agora: Optional[datetime] = None) -> dict[str, int]:
     """Dá desfecho terminal a cada item do evento e, se todos terminarem, finaliza.
 
     Substitui `fechar_evento` (achado #4). O evento NÃO é mais marcado 'encerrado'
@@ -311,6 +318,35 @@ def processar_evento(banco: Any, evento: dict[str, Any], gates: Any) -> dict[str
     if not pendentes:
         _finalizar_se_completo(banco, evento["id"], resumo)
         return resumo
+
+    # P1.2 — o evento foi remarcado ou cancelado. Item emitido ATÉ o instante da
+    # revisão mediu outro mercado: a odd de emissão da partida das 15h não é
+    # comparável à linha de fechamento da partida das 20h. Sai da amostra com motivo
+    # próprio. O empate conta como invalidado — no instante exato da revisão não dá
+    # para dizer de qual mercado veio a emissão, e ambiguidade aborta (P6).
+    invalidado_em = para_datetime(evento.get("invalidado_em"))
+    if invalidado_em is not None:
+        def _invalidado(i: ItemFechamento) -> bool:
+            return i.criado_em is not None and i.criado_em <= invalidado_em
+
+        resultado_inv = ("indisponivel_evento_cancelado"
+                         if evento.get("status") == "cancelado"
+                         else "indisponivel_evento_remarcado")
+        for item in [i for i in pendentes if _invalidado(i)]:
+            _registrar(banco, evento["id"], item, resultado_inv,
+                       motivo="emitido_antes_da_revisao_do_evento", resumo=resumo)
+        pendentes = [i for i in pendentes if not _invalidado(i)]
+        if not pendentes:
+            _finalizar_se_completo(banco, evento["id"], resumo)
+            return resumo
+        # Os que sobraram foram emitidos DEPOIS da revisão: são do mercado novo e só
+        # medem quando o NOVO apito assentar. A fila trouxe o evento por causa dos
+        # invalidados; encerrar estes agora seria o fechamento prematuro que a 0007
+        # corrigiu.
+        assentamento_s = float(gates.get("fechamento_assentamento_s"))
+        if agora is not None and inicio + timedelta(seconds=assentamento_s) > agora:
+            resumo["pendentes"] += len(pendentes)
+            return resumo
 
     ref_ids = [c["id"] for c in banco.casas_ativas() if c.get("tipo") == "referencia"]
     if not ref_ids:
@@ -422,8 +458,9 @@ def rodar_fechamento(banco: Any, gates: Any, agora_iso: str, *,
     eventos = banco.fila_fechamento(agora_iso, assentamento_s, limite)
     total = {"eventos": 0, "clv": 0, "indisponiveis": 0, "pendentes": 0,
              "timeout_crivo": timeouts}
+    agora = para_datetime(agora_iso)
     for evento in eventos:
-        r = processar_evento(banco, evento, gates)
+        r = processar_evento(banco, evento, gates, agora=agora)
         total["eventos"] += 1
         total["clv"] += r["calculados"]
         total["indisponiveis"] += r["indisponiveis"]

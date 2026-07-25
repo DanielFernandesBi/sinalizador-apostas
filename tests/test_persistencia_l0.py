@@ -11,11 +11,35 @@ class BancoFake:
         self.eventos = eventos or {}   # id_api -> row
         self.casas = casas or {}       # nome -> row
         self.inseridos = []
+        self.revisoes = []
         self._seq = 0
 
-    def evento_por_id_externo(self, fonte, valor):
-        assert fonte == "odds_api"
-        return self.eventos.get(valor)
+    def garantir_evento(self, dados):
+        """Espelha `fn_garantir_evento` (0016): identidade única por id externo,
+        atualização dos fatos que a fonte governa e revisão registrada."""
+        id_api = (dados.get("ids_externos") or {}).get("odds_api")
+        if not id_api:
+            return {"id": None, "criado": False, "motivo": "sem_id_da_fonte"}
+        if not dados.get("inicio_utc"):
+            return {"id": None, "criado": False, "motivo": "sem_inicio_utc"}
+        atual = self.eventos.get(id_api)
+        if atual is None:
+            self._seq += 1
+            row = {"id": f"eventos-{self._seq}", **dados}
+            self.eventos[id_api] = row
+            self.inseridos.append(("eventos", row))
+            return {"id": row["id"], "criado": True, "alterado": False}
+        campos = [c for c in ("inicio_utc", "mandante", "visitante", "liga")
+                  if dados.get(c) is not None and atual.get(c) != dados.get(c)]
+        if not campos:
+            return {"id": atual["id"], "criado": False, "alterado": False}
+        tipo = "remarcado" if "inicio_utc" in campos else "corrigido"
+        atual.update({c: dados[c] for c in campos})
+        if tipo == "remarcado":
+            atual["invalidado_em"] = "2026-07-20T18:00:00Z"
+        self.revisoes.append({"evento_id": atual["id"], "tipo": tipo, "campos": campos})
+        return {"id": atual["id"], "criado": False, "alterado": True,
+                "tipo": tipo, "campos": campos}
 
     def casa_por_nome(self, nome):
         return self.casas.get(nome)
@@ -24,8 +48,6 @@ class BancoFake:
         self._seq += 1
         row = {"id": f"{tabela}-{self._seq}", **registro}
         self.inseridos.append((tabela, row))
-        if tabela == "eventos":
-            self.eventos[registro["ids_externos"]["odds_api"]] = row
         if tabela == "casas":
             self.casas[registro["nome"]] = row
         return row
@@ -89,3 +111,45 @@ def test_gravar_snapshot_usa_ts_fonte_da_api():
     assert reg["odd"] == 2.10 and reg["linha"] is None
     assert "ts_captura" not in reg   # deixado para o default do schema (now())
     assert row["id"] == "odds_snapshots-1"
+
+
+# ---------------- a fonte governa os fatos do evento (P1.2) ----------------
+
+def test_kickoff_remarcado_atualiza_o_banco_e_registra_revisao():
+    """Antes, o evento existente NUNCA era atualizado: o kickoff velho ficava para
+    sempre e corrompia de uma vez a trava de apito do L1, a fila do L4 e a linha de
+    fechamento."""
+    banco = BancoFake()
+    eid = garantir_evento(banco, _ev_norm())
+
+    novo = {**_ev_norm(), "inicio_utc": "2026-07-20T22:30:00Z"}
+    assert garantir_evento(banco, novo) == eid          # mesma partida, mesmo id
+    assert banco.eventos["ev1"]["inicio_utc"] == "2026-07-20T22:30:00Z"
+    assert banco.revisoes == [{"evento_id": eid, "tipo": "remarcado",
+                               "campos": ["inicio_utc"]}]
+
+
+def test_correcao_de_nome_nao_e_remarcacao():
+    banco = BancoFake()
+    garantir_evento(banco, _ev_norm())
+    garantir_evento(banco, {**_ev_norm(), "mandante": "A FC"})
+
+    assert banco.revisoes[0]["tipo"] == "corrigido"
+    assert banco.eventos["ev1"]["mandante"] == "A FC"
+
+
+def test_payload_identico_nao_gera_revisao():
+    banco = BancoFake()
+    garantir_evento(banco, _ev_norm())
+    garantir_evento(banco, _ev_norm())
+    assert banco.revisoes == []
+    assert len([t for t, _ in banco.inseridos if t == "eventos"]) == 1
+
+
+def test_evento_sem_inicio_e_descartado():
+    """Sem horário não se cria evento: `inicio_utc` é a pedra de tudo o que vem
+    depois, e chutá-lo seria pior que perder o tick (P6)."""
+    banco = BancoFake()
+    sem_inicio = {k: v for k, v in _ev_norm().items() if k != "inicio_utc"}
+    assert garantir_evento(banco, sem_inicio) is None
+    assert banco.eventos == {}

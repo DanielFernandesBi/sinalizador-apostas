@@ -593,6 +593,35 @@ class Banco:
         """Heartbeat do daemon (E1.5). É apenas um INSERT em `heartbeats`."""
         self.inserir("heartbeats", {"daemon": daemon, "detalhe": detalhe})
 
+    # ---------------- VERDADE DO EVENTO (Sugestão nº 14 / P1.2) ----------------
+
+    def garantir_evento(self, dados: dict[str, Any]) -> dict[str, Any]:
+        """Get-or-create-or-update do evento (`fn_garantir_evento`), numa transação.
+
+        Substitui o read-then-insert: sem índice único sobre o id externo, dois
+        ciclos do L0 podiam criar DUAS linhas para a mesma partida e partir os
+        snapshots entre elas. E o antigo caminho nunca atualizava nada — kickoff
+        remarcado ficava velho no banco para sempre, corrompendo de uma vez a trava
+        de apito do L1, a fila do L4 e a linha de fechamento.
+
+        Devolve `{id, criado, alterado, tipo?, campos?}`. Toda mudança fica em
+        `eventos_revisoes` com antes/depois.
+        """
+        return self._rpc("fn_garantir_evento", {"p_dados": dados})
+
+    def marcar_evento_cancelado(self, evento_id: str, motivo: Optional[str] = None,
+                                fonte: str = "manual") -> dict[str, Any]:
+        """Cancela o evento EXPLICITAMENTE (`fn_marcar_evento_cancelado`).
+
+        Não há detecção automática: a fonte apenas para de listar o jogo cancelado, e
+        uma resposta parcial por falha de rede é indistinguível disso. Inferir
+        cancelamento da ausência seria tratar dado ausente como confirmação positiva
+        (P6). Ver PC-CANCELAMENTO.
+        """
+        return self._rpc("fn_marcar_evento_cancelado", {
+            "p_evento_id": evento_id, "p_motivo": motivo, "p_fonte": fonte,
+        })
+
     # ---------------- EXPOSIÇÃO DE PAPEL (Sugestão nº 13 / P0.8) ----------------
 
     def reservar_exposicao_papel(self, sinal_id: str,

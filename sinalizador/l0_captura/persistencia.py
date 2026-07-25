@@ -17,7 +17,7 @@ _log = logging.getLogger(__name__)
 
 
 class BancoL0(Protocol):
-    def evento_por_id_externo(self, fonte: str, valor: str) -> Optional[dict[str, Any]]: ...
+    def garantir_evento(self, dados: dict[str, Any]) -> dict[str, Any]: ...
     def casa_por_nome(self, nome: str) -> Optional[dict[str, Any]]: ...
     def inserir(self, tabela: str, registro: dict[str, Any]) -> dict[str, Any]: ...
     def inserir_muitos(self, tabela: str, registros: list[dict[str, Any]]) -> list[dict[str, Any]]: ...
@@ -25,17 +25,33 @@ class BancoL0(Protocol):
 
 
 def garantir_evento(banco: BancoL0, ev_norm: dict[str, Any]) -> Optional[str]:
-    """id do evento no banco (get-or-create por ids_externos.odds_api). None se o
-    evento veio sem id da fonte (dado incompleto — não se inventa chave)."""
-    id_api = (ev_norm.get("ids_externos") or {}).get("odds_api")
-    if not id_api:
-        _log.warning("evento sem id da fonte descartado (P6)", extra={"ev": ev_norm.get("liga")})
+    """id do evento no banco, pela RPC transacional `fn_garantir_evento` (P1.2).
+
+    A fonte GOVERNA os fatos do evento: se o kickoff mudou, o banco muda junto e a
+    alteração vira uma linha de `eventos_revisoes`. O antigo get-or-create em duas
+    etapas (lê, e insere se não achou) tinha dois furos: sem índice único, dois
+    ciclos concorrentes criavam duas linhas para a mesma partida; e nada nunca
+    atualizava o kickoff, que é a pedra em que a trava de apito do L1, a fila do L4 e
+    a linha de fechamento se apoiam.
+
+    None quando o evento veio sem id da fonte ou sem início (dado incompleto — não se
+    inventa chave nem horário).
+    """
+    r = banco.garantir_evento(ev_norm)
+    evento_id = r.get("id")
+    if not evento_id:
+        _log.warning("evento descartado pelo banco (P6)",
+                     extra={"motivo": r.get("motivo"), "liga": ev_norm.get("liga")})
         return None
-    existente = banco.evento_por_id_externo("odds_api", id_api)
-    if existente:
-        return existente["id"]
-    criado = banco.inserir("eventos", ev_norm)
-    return criado.get("id")
+    if r.get("alterado"):
+        # Remarcação é fato operacional, não ruído: o L4 vai tirar da amostra tudo o
+        # que foi emitido antes dela.
+        nivel = _log.warning if r.get("tipo") == "remarcado" else _log.info
+        nivel("evento revisado pela fonte", extra={
+            "evento_id": evento_id, "tipo": r.get("tipo"), "campos": r.get("campos"),
+            "posicoes_papel_liberadas": r.get("posicoes_papel_liberadas"),
+        })
+    return str(evento_id)
 
 
 def garantir_casa(
