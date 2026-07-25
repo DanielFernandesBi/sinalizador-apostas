@@ -115,11 +115,52 @@ def detectar_anomalia(
     return abs(move_venue.pct) >= limiar and abs(move_ref.pct) < limiar
 
 
+def classificar_elegibilidade(
+    venues: list[dict], *, ts_referencia: datetime, agora: datetime,
+    idade_max_s: float, janela_sincronia_s: float,
+) -> list[dict]:
+    """Marca cada venue como ELEGÍVEL ou não, ANTES do line shopping (P1.1).
+
+    Um venue só é executável se o preço capturado ainda vale: odd > 1, snapshot
+    dentro de `snapshot_idade_max_s` e sincronizado com a revisão de referência
+    dentro de `janela_sincronia_s`.
+
+    Por que a ordem importa: antes, o line shopping escolhia a MAIOR odd entre as
+    casas capturadas e só depois os gates de idade e sincronia rodavam sobre a
+    escolhida. Uma casa com odd 2,20 VELHA vencia uma casa com 2,12 fresca — e o
+    candidato morria, sem que a segunda casa fosse sequer avaliada. Não é falso
+    positivo (nada é emitido a mais), é MUDEZ: enquanto o preço velho fosse o maior,
+    aquele venue nunca teria vez, em ciclo nenhum. Preço que não é executável não é
+    preço; ele não pode ganhar um leilão do qual não podia participar.
+
+    Devolve a MESMA lista, cada item acrescido de `elegivel` (bool) e, quando não,
+    `motivo_inelegivel`. As inelegíveis seguem no consenso (`venues_comparados` do
+    dossiê) marcadas — some-las do dossiê apagaria a evidência de line shopping.
+    """
+    marcados: list[dict] = []
+    for v in venues:
+        odd = v.get("odd") or 0
+        ts = v.get("ts_fonte")
+        motivo: Optional[str] = None
+        if odd <= 1.0:
+            motivo = "odd_invalida"
+        elif ts is None:
+            motivo = "sem_carimbo_de_fonte"
+        elif (agora - ts).total_seconds() > idade_max_s:
+            motivo = "snapshot_velho"
+        elif abs((ts - ts_referencia).total_seconds()) > janela_sincronia_s:
+            motivo = "dessincronizado_da_referencia"
+        marcados.append({**v, "elegivel": motivo is None,
+                         **({"motivo_inelegivel": motivo} if motivo else {})})
+    return marcados
+
+
 def melhor_preco(venues: list[dict]) -> Optional[dict]:
     """Line shopping: a casa com o MAIOR preço entre as capturadas (odd > 1).
 
     `venues`: lista de dicts com ao menos `casa` e `odd`. Retorna o dict vencedor
-    (o de maior odd) ou None se nenhum for válido.
+    (o de maior odd) ou None se nenhum for válido. Quem chama já deve ter filtrado
+    por elegibilidade (`classificar_elegibilidade`) — aqui só se compara preço.
     """
     validos = [v for v in venues if (v.get("odd") or 0) > 1.0]
     if not validos:

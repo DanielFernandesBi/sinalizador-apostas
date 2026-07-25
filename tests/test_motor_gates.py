@@ -122,3 +122,40 @@ def test_exposicao_reprova_quando_estoura_teto_jogo():
 def test_exposicao_aprova_dentro_do_teto():
     r = avaliar_exposicao(10.0, exposto={"dia": 50.0}, tetos={"dia": 100.0})
     assert r.aprovado
+
+
+# ---------------- Kelly sobre o ganho LÍQUIDO (P1.9) ----------------
+
+def test_kelly_sem_comissao_e_identico_a_formula_anterior():
+    """Regime ratificado hoje é varejo de odd fixa (comissão 0): a correção NÃO pode
+    mudar o comportamento do modo sombra."""
+    gates = GatesFake()
+    for p, odd in ((0.55, 2.10), (0.40, 3.00), (0.70, 1.60)):
+        antigo = (p * odd - 1.0) / (odd - 1.0)
+        esperado = min(max(antigo, 0.0) * 0.25, 0.02) if antigo > 0 else 0.0
+        assert stake_kelly_fracao(p, odd, gates) == pytest.approx(esperado)
+
+
+def test_comissao_reduz_o_stake_na_exchange():
+    """Com 6,5% de comissão o ganho por unidade é menor, logo Kelly é menor. Usar a
+    odd bruta presumiria prêmio maior que o recebido e superdimensionaria."""
+    gates = GatesFake({**SEED, "stake_max_pct": "100.0"})   # sem teto: Kelly puro
+    bruto = stake_kelly_fracao(0.55, 2.10, gates)
+    liquido = stake_kelly_fracao(0.55, 2.10, gates, comissao=0.065)
+    assert liquido < bruto
+    b = (2.10 - 1.0) * (1 - 0.065)
+    assert liquido == pytest.approx(((0.55 * b - 0.45) / b) * 0.25)
+
+
+def test_comissao_pode_zerar_uma_aposta_que_parecia_ter_valor():
+    """O caso que importa: edge positivo no bruto, negativo no líquido. Antes o
+    sistema dimensionaria stake para uma aposta que já não vale."""
+    gates = GatesFake({**SEED, "stake_max_pct": "100.0"})
+    p, odd, com = 0.50, 2.05, 0.065
+    assert stake_kelly_fracao(p, odd, gates) > 0.0            # bruto: parece valer
+    assert stake_kelly_fracao(p, odd, gates, comissao=com) == 0.0
+
+
+def test_comissao_invalida_e_recusada():
+    with pytest.raises(ValueError):
+        stake_kelly_fracao(0.55, 2.10, GatesFake(), comissao=1.0)

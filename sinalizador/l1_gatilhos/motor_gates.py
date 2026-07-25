@@ -105,18 +105,35 @@ def avaliar(
     return ResultadoGate(True, None, None)
 
 
-def stake_kelly_fracao(p_justa: float, odd_venue: float, gates: ProvedorGates) -> float:
+def stake_kelly_fracao(p_justa: float, odd_venue: float, gates: ProvedorGates,
+                       *, comissao: float = 0.0) -> float:
     """Stake como FRAÇÃO da banca por Kelly fracionário, com teto absoluto (P5).
 
-    f_kelly = (p·odd − 1) / (odd − 1); aplica `kelly_fracao` (¼) e limita a
-    `stake_max_pct` (2% da banca). Edge não-positivo → stake 0 (não aposta).
+    Kelly é `f = (p·b − q) / b`, onde **b é o ganho LÍQUIDO por unidade apostada** e
+    `q = 1 − p`. Numa exchange a comissão come parte do ganho, então o b real é
+    `(odd − 1) × (1 − comissão)` — usar `odd − 1` presumiria um prêmio maior que o
+    efetivamente recebido e **superdimensionaria o stake** (P1.9).
+
+    Com `comissao = 0` (varejo de odd fixa, o regime ratificado pela Sugestão nº 6)
+    a fórmula colapsa EXATAMENTE na anterior — `(p·odd − 1)/(odd − 1)` —, então o
+    modo sombra não muda de comportamento. A correção só morde onde há comissão.
+
+    Slippage ainda NÃO entra aqui: em odd fixa é zero por definição (Doutrina
+    §-sombra) e não existe estimador para exchange enquanto não houver book
+    capturável (PC-SLIPPAGE). Somar um zero inventado seria fingir precisão.
+
+    Aplica `kelly_fracao` (¼) e limita a `stake_max_pct`. Edge não-positivo → 0.
     """
     if not 0.0 <= p_justa <= 1.0:
         raise ValueError(f"p_justa fora de [0,1]: {p_justa}")
     if odd_venue <= 1.0:
         raise ValueError(f"odd_venue deve ser > 1.0: {odd_venue}")
-    b = odd_venue - 1.0
-    kelly_pleno = (p_justa * odd_venue - 1.0) / b
+    if not 0.0 <= comissao < 1.0:
+        raise ValueError(f"comissao fora de [0,1): {comissao}")
+    b = (odd_venue - 1.0) * (1.0 - comissao)
+    if b <= 0.0:
+        return 0.0
+    kelly_pleno = (p_justa * b - (1.0 - p_justa)) / b
     if kelly_pleno <= 0.0:
         return 0.0
     fracao = kelly_pleno * float(gates.get("kelly_fracao"))

@@ -52,7 +52,13 @@ from sinalizador.comum.modelos import Dossie
 from .abortos import deve_rastrear_clv, registrar_aborto
 from .dossie import construir_dossie, enfileirar_sinal
 from .edge import comissao_fracao, edge_liquido, odd_minima_aceitavel
-from .gatilhos import detectar_anomalia, detectar_odds_drop, melhor_preco, variacao_pct
+from .gatilhos import (
+    classificar_elegibilidade,
+    detectar_anomalia,
+    detectar_odds_drop,
+    melhor_preco,
+    variacao_pct,
+)
 from .revisao import ORDEM_SELECAO, linha_key, ultima_revisao_completa
 from .motor_gates import (
     ContextoAvaliacao,
@@ -89,6 +95,7 @@ class ResumoL1:
     candidatos_sombra: int = 0   # achado 8: passou tudo, mercado não homologado (só CLV)
     pos_kickoff: int = 0         # P0.1: grupos recusados por partida já iniciada
     nao_autorizados: int = 0     # achado 8: grupo pulado (suspenso/caducado ou sem config)
+    venues_inelegiveis: int = 0  # P1.1: havia casa executável, nenhum preço ainda válido
     pulados: list[str] = field(default_factory=list)  # motivos de skip (P6)
 
 
@@ -280,6 +287,7 @@ def avaliar_grupo(
 
     casas_venue = _casas_venue_da_politica(casas, politica)
     janela_sinc = float(gates.get("janela_sincronia_s"))
+    idade_max_s = float(gates.get("snapshot_idade_max_s"))
     janela_drop = float(gates.get("janela_drop_s"))
     anomalia_lim = float(gates.get("anomalia_move_pct"))
     edge_min_frac = float(gates.get("edge_min_pct")) / 100.0
@@ -304,10 +312,30 @@ def avaliar_grupo(
         # `venues_comparados` como observação de consenso, nunca como venue do sinal.
         executaveis = [c for c in candidatos_venue
                        if _casa_executavel(c["casa"], politica, venues_executaveis)]
-        melhor = melhor_preco(executaveis)
+        # P1.1 — elegibilidade ANTES do leilão de preço. Preço velho ou
+        # dessincronizado não é executável e não pode ganhar um line shopping do qual
+        # não podia participar: antes, ele vencia e matava o candidato inteiro, e a
+        # casa fresca logo atrás nunca era avaliada.
+        candidatos_venue = classificar_elegibilidade(
+            candidatos_venue, ts_referencia=ts_ref, agora=agora,
+            idade_max_s=idade_max_s, janela_sincronia_s=janela_sinc)
+        elegiveis = [c for c in classificar_elegibilidade(
+                         executaveis, ts_referencia=ts_ref, agora=agora,
+                         idade_max_s=idade_max_s, janela_sincronia_s=janela_sinc)
+                     if c["elegivel"]]
+        melhor = melhor_preco(elegiveis)
         if melhor is None:
-            motivo = ("sem venue capturado" if not candidatos_venue
-                      else "venues capturados, nenhum executável (allowlist)")
+            if not candidatos_venue:
+                motivo = "sem venue capturado"
+            elif not executaveis:
+                motivo = "venues capturados, nenhum executável (allowlist)"
+            else:
+                # Havia casa executável — o preço é que não valia mais. Isso é falha
+                # de CAPTURA, não juízo de mercado: não vira aborto (inflaria o log a
+                # cada ciclo, sem chave de candidato para deduplicar), mas é contado,
+                # porque mudez silenciosa foi exatamente o achado do P1.1.
+                motivo = "venues executáveis, nenhum com preço elegível"
+                resumo.venues_inelegiveis += 1
             resumo.pulados.append(f"{grupo.evento_id}/{grupo.mercado}/{sel}: {motivo}")
             continue
 
@@ -351,7 +379,9 @@ def avaliar_grupo(
             continue
         referencia_estavel = abs(move_ref.pct) < anomalia_lim
 
-        stake_frac = stake_kelly_fracao(p_justa, melhor["odd"], gates)
+        # P1.9: Kelly sobre o ganho LÍQUIDO. Em varejo (comissão 0) é idêntico ao
+        # anterior; na exchange, usar o bruto superdimensionaria o stake.
+        stake_frac = stake_kelly_fracao(p_justa, melhor["odd"], gates, comissao=comissao)
         stake_valor = stake_frac * banca
 
         eh_exchange = casa_row.get("tipo") == "exchange"
@@ -585,8 +615,14 @@ def _montar_dossie(
             },
         },
         "liquidez": liquidez,
+        # Consenso COMPLETO, com a elegibilidade de cada casa (P1.1). As inelegíveis
+        # ficam: some-las apagaria a evidência de que o line shopping as viu e por que
+        # foram descartadas — e é justamente isso que permite auditar a mudez.
         "venues_comparados": [
-            {"casa": v["casa"], "odd": v["odd"], "ts_fonte": v["ts_fonte"].isoformat()}
+            {"casa": v["casa"], "odd": v["odd"], "ts_fonte": v["ts_fonte"].isoformat(),
+             **({"elegivel": v["elegivel"]} if "elegivel" in v else {}),
+             **({"motivo_inelegivel": v["motivo_inelegivel"]}
+                if v.get("motivo_inelegivel") else {})}
             for v in candidatos_venue
         ],
         "exposicao": {
@@ -789,6 +825,7 @@ def rodar_l1(
                           "abortos": resumo.abortos, "rastreados_clv": resumo.rastreados_clv,
                           "candidatos_sombra": resumo.candidatos_sombra,
                           "nao_autorizados": resumo.nao_autorizados,
+                          "venues_inelegiveis": resumo.venues_inelegiveis,
                           "politica_venue": politica.value, "banca_origem": banca_origem})
     _log.info("ciclo L1 concluído", extra={"grupos": resumo.grupos, "sinais": resumo.sinais,
                                            "abortos": resumo.abortos})

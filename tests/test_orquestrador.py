@@ -645,3 +645,87 @@ def test_reservas_do_ciclo_nao_vazam_entre_jogos_ligas_e_dias():
     # soma sobre o que já veio do banco
     assert res.sobre({"jogo": 5.0, "liga_dia": 5.0, "dia": 5.0},
                      "ev1", "Premier League", "2026-07-20")["jogo"] == 25.0
+
+
+# ---------------- P1.1: elegibilidade ANTES do line shopping ----------------
+
+T_VELHO = "2026-07-20T19:40:00Z"    # 1220 s antes de AGORA — fora de idade (600)
+
+
+def test_odd_velha_maior_nao_rouba_a_vez_da_fresca_menor():
+    """O cenário da auditoria: casa A com 2,20 VELHA e casa B com 2,12 fresca. Antes,
+    A vencia o line shopping, reprovava no gate de idade e matava o candidato — B
+    nunca era avaliada, em ciclo nenhum enquanto A fosse a maior."""
+    p1 = _p1()
+    odd_b = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.10, 3)
+    odd_a = odd_b + 0.08                                   # A é maior, porém velha
+    snaps = _ref_snaps() + [
+        _snap("1", odd_a, "c-b365", ts=T_VELHO),
+        _snap("1", odd_b, "c-betano"),
+    ]
+    banco = BancoFake(snaps, venues_exec=["bet365_br", "betano"])
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+
+    assert r.sinais == 1, f"esperava 1 sinal, veio {r.sinais} ({r.pulados})"
+    sinal = banco.por_tabela("sinais")[0]
+    assert sinal["casa_venue_id"] == "c-betano"             # a fresca, não a maior
+    assert float(sinal["odd_venue"]) == odd_b
+
+
+def test_consenso_preserva_a_casa_inelegivel_marcada():
+    """A inelegível não some do dossiê: apagá-la apagaria a evidência de que o line
+    shopping a viu e por que a descartou."""
+    p1 = _p1()
+    odd_b = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.10, 3)
+    snaps = _ref_snaps() + [
+        _snap("1", odd_b + 0.08, "c-b365", ts=T_VELHO),
+        _snap("1", odd_b, "c-betano"),
+    ]
+    banco = BancoFake(snaps, venues_exec=["bet365_br", "betano"])
+    rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+
+    comparados = {v["casa"]: v for v in
+                  banco.por_tabela("sinais")[0]["dossie"]["venues_comparados"]}
+    assert comparados["betano"]["elegivel"] is True
+    assert comparados["bet365_br"]["elegivel"] is False
+    assert comparados["bet365_br"]["motivo_inelegivel"] == "snapshot_velho"
+
+
+def test_nenhum_venue_elegivel_e_contado_como_mudez_sem_virar_aborto():
+    """Preço velho em TODAS as casas executáveis é falha de captura, não juízo de
+    mercado: não vira aborto (inflaria o log a cada ciclo), mas fica contado — mudez
+    silenciosa foi o achado."""
+    p1 = _p1()
+    odd = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.10, 3)
+    snaps = _ref_snaps() + [_snap("1", odd, "c-b365", ts=T_VELHO)]
+    banco = BancoFake(snaps, venues_exec=["bet365_br"])
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+
+    assert r.sinais == 0 and r.abortos == 0
+    assert r.venues_inelegiveis == 1
+    assert any("nenhum com preço elegível" in m for m in r.pulados)
+    assert banco.pulsos[0][1]["venues_inelegiveis"] == 1
+
+
+def test_classificar_elegibilidade_nomeia_cada_motivo():
+    from datetime import timedelta as _td
+
+    from sinalizador.l1_gatilhos.gatilhos import classificar_elegibilidade
+
+    ts_ref = AGORA - _td(seconds=20)
+    venues = [
+        {"casa": "ok", "odd": 2.10, "ts_fonte": AGORA - _td(seconds=10)},
+        {"casa": "velha", "odd": 2.30, "ts_fonte": AGORA - _td(seconds=1200)},
+        {"casa": "dessinc", "odd": 2.40, "ts_fonte": AGORA - _td(seconds=500)},
+        {"casa": "odd_ruim", "odd": 1.0, "ts_fonte": AGORA},
+        {"casa": "sem_ts", "odd": 2.50, "ts_fonte": None},
+    ]
+    por_casa = {v["casa"]: v for v in classificar_elegibilidade(
+        venues, ts_referencia=ts_ref, agora=AGORA,
+        idade_max_s=600.0, janela_sincronia_s=60.0)}
+
+    assert por_casa["ok"]["elegivel"] is True
+    assert por_casa["velha"]["motivo_inelegivel"] == "snapshot_velho"
+    assert por_casa["dessinc"]["motivo_inelegivel"] == "dessincronizado_da_referencia"
+    assert por_casa["odd_ruim"]["motivo_inelegivel"] == "odd_invalida"
+    assert por_casa["sem_ts"]["motivo_inelegivel"] == "sem_carimbo_de_fonte"
