@@ -105,7 +105,8 @@ def _registrar_erro(banco: Any, sinal_id: str, motivo: str) -> None:
         _log.exception("falha ao marcar sinal como erro", extra={"sinal_id": sinal_id})
     banco.inserir("notificacoes", {
         "sinal_id": sinal_id, "tipo": "administrativo", "canal": "telegram",
-        "conteudo": f"[crivo:erro] sinal {sinal_id}: {motivo}", "entregue": False,
+        "conteudo": f"[crivo:erro] sinal {sinal_id}: {motivo}",
+        # sem status: o default do schema e 'pendente' (a outbox do L3 entrega).
     })
     _log.error("crivo falhou — sinal marcado erro", extra={"sinal_id": sinal_id, "motivo": motivo})
 

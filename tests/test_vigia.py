@@ -49,7 +49,9 @@ def test_alertar_grava_notificacao_alerta_daemon():
     assert len(inseridas) == 1
     tabela, reg = banco.inseridos[0]
     assert tabela == "notificacoes"
-    assert reg["tipo"] == "alerta_daemon" and reg["entregue"] is False
+    # sem `status` explícito: o default do schema é 'pendente', e a outbox do L3
+    # (migration 0010) é quem entrega. Cravar o estado aqui duplicaria a decisão.
+    assert reg["tipo"] == "alerta_daemon" and "status" not in reg
     assert "l0_varejo" in reg["conteudo"]
     assert reg["sinal_id"] is None
 

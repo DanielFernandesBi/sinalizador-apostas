@@ -1,20 +1,37 @@
-"""Testes do L3 (notificação): cartão, re-checagem de preço, expiração, alertas.
+"""Testes do L3 (notificação): cartão, frescor de preço, expiração, outbox, alertas.
 
 Tudo com fakes: nem rede, nem token, nem Supabase. O núcleo depende só do Protocol
-`Bot` e da fachada do `Banco`.
+`Bot` e da fachada do `Banco`. O `BancoFake` simula a semântica da outbox da
+migration 0010 (a fidelidade das funções SQL foi verificada contra o banco real).
 """
+import pytest
+
+from sinalizador.comum.tempo import para_datetime
 from sinalizador.l3_notifica.bot import BotTelegram
 from sinalizador.l3_notifica.cartao import formatar_cartao, janela_fechou, odd_atual, preco_caiu
 from sinalizador.l3_notifica.notifica import (
     ResumoL3,
     alerta_drawdown,
-    emitir_confirmados,
+    enfileirar_cartoes,
     entregar_pendentes,
     expirar_pendentes,
     processar,
 )
 
 ODD_MIN = 1.90
+AGORA_ISO = "2026-07-21T12:05:00Z"
+AGORA = para_datetime(AGORA_ISO)
+TS_FRESCO = "2026-07-21T12:00:00Z"     # 300 s — dentro de snapshot_idade_max_s (600)
+TS_VELHO = "2026-07-20T12:00:00Z"      # ~1 dia — fora
+IDADE_MAX = 600.0
+
+
+class GatesFake:
+    def __init__(self, snapshot_idade_max_s=IDADE_MAX):
+        self._v = {"snapshot_idade_max_s": snapshot_idade_max_s}
+
+    def get(self, nome):
+        return self._v[nome]
 
 
 def _sinal(id="s1", *, status="confirmado", odd_venue=2.05, odd_min=ODD_MIN, linha=None):
@@ -28,8 +45,8 @@ def _sinal(id="s1", *, status="confirmado", odd_venue=2.05, odd_min=ODD_MIN, lin
     }
 
 
-def _snap(odd):
-    return {"odd": odd, "ts_captura": "2026-07-21T12:00:00Z"}
+def _snap(odd, ts=TS_FRESCO):
+    return {"odd": odd, "ts_fonte": ts, "ts_captura": ts}
 
 
 class BotFake:
@@ -42,26 +59,36 @@ class BotFake:
         return self.ok
 
 
+class ErroUnicidade(RuntimeError):
+    """Equivale ao 23505 de ux_notificacao_cartao."""
+
+
 class BancoFake:
     def __init__(self, *, confirmados=None, aguardando=None, snaps=None, crivos=None,
                  eventos=None, notif_por_sinal=None, pendentes=None, banca=None):
         self._confirmados = confirmados or []
         self._aguardando = aguardando or []
-        self._snaps = snaps or {}          # (evento,casa,mercado,sel,linha) -> snap
+        self._snaps = snaps or {}
         self._crivos = crivos or {}
         self._eventos = eventos or {}
-        self._notif_por_sinal = notif_por_sinal or {}  # sinal_id -> [tipos já existentes]
-        self._pendentes = list(pendentes or [])
+        self._notif_por_sinal = notif_por_sinal or {}
         self._banca = banca
         self.inseridos = []
         self.transicoes = []
         self.entregues = []
+        self.devolvidas = []
         self.pulsos = []
+        self.ordem = []                     # ordem real das fases (achado da ordem)
+        self._fila = list(pendentes or [])  # linhas em pendente/enviando
+        self._prox_id = 100
 
+    # -- leituras --
     def sinais_por_status(self, status, limite=200):
+        self.ordem.append("enfileirar")
         return self._confirmados if status == "confirmado" else []
 
-    def sinais_aguardando_crivo(self, limite=200):
+    def sinais_aguardando_crivo(self, limite=200, agora_iso=None):
+        self.ordem.append("expirar")
         return self._aguardando
 
     def ultimo_snapshot_venue(self, evento_id, casa_id, mercado, selecao, linha):
@@ -78,34 +105,65 @@ class BancoFake:
         return [{"tipo": t} for t in tipos if tipo is None or t == tipo]
 
     def notificacoes_pendentes(self, limite=200):
-        return self._pendentes
+        return [n for n in self._fila if n.get("status") in ("pendente", "enviando")]
 
     def banca_atual(self):
         return self._banca
 
+    # -- escritas --
     def inserir(self, tabela, registro):
-        row = {"id": len(self.inseridos) + 1, **registro}
+        if tabela == "notificacoes" and registro.get("tipo") == "sinal":
+            # ux_notificacao_cartao: um cartão por sinal
+            if any(n.get("tipo") == "sinal" and n.get("sinal_id") == registro.get("sinal_id")
+                   for (_t, n) in self.inseridos):
+                raise ErroUnicidade(
+                    'duplicate key value violates unique constraint "ux_notificacao_cartao"')
+        self._prox_id += 1
+        row = {"id": self._prox_id, "status": "pendente", **registro}
         self.inseridos.append((tabela, row))
-        if tabela == "notificacoes" and not registro.get("entregue", False):
-            self._pendentes.append(row)
+        if tabela == "notificacoes" and row["status"] == "pendente":
+            self._fila.append(row)
         return row
 
     def transicionar_status_sinal(self, sinal_id, novo_status):
         self.transicoes.append((sinal_id, novo_status))
         return {"id": sinal_id, "status": novo_status}
 
-    def marcar_notificacao_entregue(self, notif_id):
+    def reivindicar_notificacoes(self, agora_iso, limite=200, reclaim_s=300.0):
+        self.ordem.append("enviar")
+        reivindicadas = [n for n in self._fila if n.get("status") == "pendente"][:limite]
+        for n in reivindicadas:
+            n["status"] = "enviando"
+            n["tentativas"] = n.get("tentativas", 0) + 1
+        return reivindicadas
+
+    def marcar_notificacao_entregue(self, notif_id, agora_iso=None):
         self.entregues.append(notif_id)
-        return {"id": notif_id, "entregue": True}
+        for n in self._fila:
+            if n["id"] == notif_id:
+                n["status"] = "entregue"
+        return True
+
+    def devolver_notificacao(self, notif_id):
+        self.devolvidas.append(notif_id)
+        for n in self._fila:
+            if n["id"] == notif_id and n["status"] == "enviando":
+                n["status"] = "pendente"
+        return True
 
     def pulsar(self, daemon, detalhe=None):
         self.pulsos.append((daemon, detalhe))
 
     def notificacoes(self, tipo=None):
-        return [r for (t, r) in self.inseridos if t == "notificacoes" and (tipo is None or r["tipo"] == tipo)]
+        return [r for (t, r) in self.inseridos
+                if t == "notificacoes" and (tipo is None or r["tipo"] == tipo)]
 
 
-# ---------------- cartão + re-checagem de preço ----------------
+def _snaps_ok(odd=2.05, ts=TS_FRESCO):
+    return {("ev1", "c-b365", "1x2", "1", None): _snap(odd, ts)}
+
+
+# ---------------- cartão + frescor de preço ----------------
 
 def test_odd_atual_e_janela():
     assert odd_atual(_snap(2.0)) == 2.0
@@ -118,6 +176,18 @@ def test_odd_atual_e_janela():
     assert preco_caiu(None, 1.90) is False          # ausência não expira
 
 
+def test_snapshot_velho_nao_conta_como_atual():
+    # O último snapshot não é necessariamente ATUAL: acima do gate, é como se não
+    # houvesse preço (mesmo gate do L1 — Doutrina §3, janela de validade do dado).
+    assert odd_atual(_snap(2.05, TS_FRESCO), agora=AGORA, idade_max_s=IDADE_MAX) == 2.05
+    assert odd_atual(_snap(2.05, TS_VELHO), agora=AGORA, idade_max_s=IDADE_MAX) is None
+    # fronteira: exatamente no limite ainda vale
+    limite = "2026-07-21T11:55:00Z"                 # 600 s
+    assert odd_atual(_snap(2.05, limite), agora=AGORA, idade_max_s=IDADE_MAX) == 2.05
+    # sem carimbo não se afirma frescor
+    assert odd_atual({"odd": 2.05}, agora=AGORA, idade_max_s=IDADE_MAX) is None
+
+
 def test_formatar_cartao_tem_o_essencial():
     txt = formatar_cartao(_sinal(), {"verdict": "CONFIRMA", "observacao": "linha estável"},
                           {"liga": "Premier League", "mandante": "A", "visitante": "B"},
@@ -128,71 +198,109 @@ def test_formatar_cartao_tem_o_essencial():
     assert "linha estável" in txt
 
 
-# ---------------- emissão dos confirmados ----------------
+# ---------------- enfileiramento (grava, NÃO envia) ----------------
 
-def test_confirmado_com_preco_ok_envia_e_registra():
-    s = _sinal()
-    banco = BancoFake(confirmados=[s], snaps={("ev1", "c-b365", "1x2", "1", None): _snap(2.05)},
+def test_cartao_e_gravado_pendente_antes_de_qualquer_envio():
+    # O coração da outbox: enfileirar não toca no bot.
+    banco = BancoFake(confirmados=[_sinal()], snaps=_snaps_ok(),
                       crivos={"s1": {"verdict": "CONFIRMA", "observacao": None}})
-    bot = BotFake()
-    r = emitir_confirmados(banco, bot)
-    assert r.enviados == 1 and r.suprimidos == 0
-    assert len(bot.enviados) == 1
-    notas = banco.notificacoes(tipo="sinal")
-    assert len(notas) == 1 and notas[0]["entregue"] is True
-
-
-def test_confirmado_com_janela_fechada_suprime_sem_enviar():
-    s = _sinal(odd_venue=2.05)
-    # preço atual 1.80 < mínima 1.90 → janela fechou
-    banco = BancoFake(confirmados=[s], snaps={("ev1", "c-b365", "1x2", "1", None): _snap(1.80)})
-    bot = BotFake()
-    r = emitir_confirmados(banco, bot)
-    assert r.enviados == 0 and r.suprimidos == 1
-    assert bot.enviados == []                      # NADA enviado (E4.2)
-    adm = banco.notificacoes(tipo="administrativo")
-    assert len(adm) == 1 and adm[0]["entregue"] is True and "expirado-no-envio" in adm[0]["conteudo"]
-
-
-def test_confirmado_sem_preco_fresco_nao_envia():
-    s = _sinal()
-    banco = BancoFake(confirmados=[s], snaps={})   # sem snapshot → fail-safe
-    bot = BotFake()
-    r = emitir_confirmados(banco, bot)
-    assert r.enviados == 0 and r.suprimidos == 1 and bot.enviados == []
-
-
-def test_confirmado_ja_notificado_nao_reenvia():
-    s = _sinal()
-    banco = BancoFake(confirmados=[s], snaps={("ev1", "c-b365", "1x2", "1", None): _snap(2.05)},
-                      notif_por_sinal={"s1": ["sinal"]})
-    bot = BotFake()
-    r = emitir_confirmados(banco, bot)
-    assert r.enviados == 0 and bot.enviados == []
-
-
-def test_envio_falho_deixa_nota_pendente():
-    s = _sinal()
-    banco = BancoFake(confirmados=[s], snaps={("ev1", "c-b365", "1x2", "1", None): _snap(2.05)})
-    bot = BotFake(ok=False)
-    emitir_confirmados(banco, bot)
+    r = enfileirar_cartoes(banco, agora=AGORA, idade_max_s=IDADE_MAX)
+    assert r.enfileirados == 1 and r.suprimidos == 0
     nota = banco.notificacoes(tipo="sinal")[0]
-    assert nota["entregue"] is False               # não entregue → retry no próximo ciclo
+    assert nota["status"] == "pendente"
 
 
-# ---------------- expiração de aguardando_crivo (frescor) ----------------
+def test_janela_fechada_suprime_com_registro_interno():
+    banco = BancoFake(confirmados=[_sinal()], snaps=_snaps_ok(odd=1.80))
+    r = enfileirar_cartoes(banco, agora=AGORA, idade_max_s=IDADE_MAX)
+    assert r.enfileirados == 0 and r.suprimidos == 1
+    assert banco.notificacoes(tipo="sinal") == []
+    adm = banco.notificacoes(tipo="administrativo")[0]
+    assert adm["status"] == "interno"          # nunca vai ao bot
+    assert "expirado-no-envio" in adm["conteudo"]
+
+
+def test_snapshot_velho_suprime_o_cartao():
+    # Antes: preço de um dia atrás valia como atual e o cartão saía.
+    banco = BancoFake(confirmados=[_sinal()], snaps=_snaps_ok(odd=2.05, ts=TS_VELHO))
+    r = enfileirar_cartoes(banco, agora=AGORA, idade_max_s=IDADE_MAX)
+    assert r.enfileirados == 0 and r.suprimidos == 1
+
+
+def test_sem_preco_nao_enfileira():
+    banco = BancoFake(confirmados=[_sinal()], snaps={})
+    r = enfileirar_cartoes(banco, agora=AGORA, idade_max_s=IDADE_MAX)
+    assert r.enfileirados == 0 and r.suprimidos == 1
+
+
+def test_sinal_ja_com_cartao_nao_reenfileira():
+    banco = BancoFake(confirmados=[_sinal()], snaps=_snaps_ok(),
+                      notif_por_sinal={"s1": ["sinal"]})
+    assert enfileirar_cartoes(banco, agora=AGORA, idade_max_s=IDADE_MAX).enfileirados == 0
+
+
+def test_corrida_no_enfileiramento_nao_duplica_cartao():
+    # Dois processos enfileirando o mesmo cartão: o índice único recusa o segundo, e
+    # isso NÃO é erro — é o resultado desejado (existe um cartão).
+    banco = BancoFake(confirmados=[_sinal()], snaps=_snaps_ok())
+    enfileirar_cartoes(banco, agora=AGORA, idade_max_s=IDADE_MAX)
+    banco._notif_por_sinal = {}                # o caminho rápido não enxerga
+    r = enfileirar_cartoes(banco, agora=AGORA, idade_max_s=IDADE_MAX)
+    assert r.enfileirados == 0
+    assert len(banco.notificacoes(tipo="sinal")) == 1
+
+
+# ---------------- envio (outbox) ----------------
+
+def test_envio_confirmado_marca_entregue():
+    banco = BancoFake(pendentes=[{"id": 10, "tipo": "alerta_daemon",
+                                  "conteudo": "daemon l0 mudo", "status": "pendente"}])
+    bot = BotFake()
+    entregues, falhas, cartoes = entregar_pendentes(banco, bot, agora_iso=AGORA_ISO)
+    assert (entregues, falhas, cartoes) == (1, 0, 0)
+    assert banco.entregues == [10] and bot.enviados == ["daemon l0 mudo"]
+
+
+def test_falha_de_envio_nao_conta_como_enviado_e_devolve_a_fila():
+    # O contador mentia: somava mesmo com bot.enviar() == False.
+    banco = BancoFake(pendentes=[{"id": 11, "tipo": "sinal", "conteudo": "cartão",
+                                  "status": "pendente"}])
+    bot = BotFake(ok=False)
+    entregues, falhas, cartoes = entregar_pendentes(banco, bot, agora_iso=AGORA_ISO)
+    assert (entregues, falhas, cartoes) == (0, 1, 0)
+    assert banco.entregues == [] and banco.devolvidas == [11]
+    assert banco._fila[0]["status"] == "pendente"   # volta para o próximo ciclo
+
+
+def test_reivindicacao_reserva_e_nao_reentrega():
+    # Uma linha reivindicada sai da fila de pendentes: outro remetente não a pega.
+    banco = BancoFake(pendentes=[{"id": 12, "tipo": "sinal", "conteudo": "c",
+                                  "status": "pendente"}])
+    entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
+    entregues, _, _ = entregar_pendentes(banco, BotFake(), agora_iso=AGORA_ISO)
+    assert entregues == 0                            # já entregue, não reivindica de novo
+
+
+# ---------------- expiração (frescor) ----------------
 
 def test_expira_aguardando_crivo_com_preco_caido():
-    s = _sinal(id="s2", status="aguardando_crivo")
-    banco = BancoFake(aguardando=[s], snaps={("ev1", "c-b365", "1x2", "1", None): _snap(1.80)})
-    n = expirar_pendentes(banco)
+    banco = BancoFake(aguardando=[_sinal(id="s2", status="aguardando_crivo")],
+                      snaps=_snaps_ok(odd=1.80))
+    n = expirar_pendentes(banco, agora=AGORA, idade_max_s=IDADE_MAX)
     assert n == 1 and banco.transicoes == [("s2", "expirado")]
 
 
 def test_nao_expira_sem_preco_fresco():
-    s = _sinal(id="s3", status="aguardando_crivo")
-    banco = BancoFake(aguardando=[s], snaps={})    # sem snapshot → não inventa movimento
-    assert expirar_pendentes(banco) == 0 and banco.transicoes == []
+    banco = BancoFake(aguardando=[_sinal(id="s3", status="aguardando_crivo")], snaps={})
+    assert expirar_pendentes(banco, agora=AGORA, idade_max_s=IDADE_MAX) == 0
+    assert banco.transicoes == []
+
+
+def test_preco_velho_nao_expira():
+    # Preço velho não prova queda: expirar por ele seria inventar movimento.
+    banco = BancoFake(aguardando=[_sinal(id="s4", status="aguardando_crivo")],
+                      snaps=_snaps_ok(odd=1.80, ts=TS_VELHO))
+    assert expirar_pendentes(banco, agora=AGORA, idade_max_s=IDADE_MAX) == 0
 
 
 # ---------------- alertas ----------------
@@ -201,8 +309,7 @@ def test_alerta_drawdown_dispara_uma_vez():
     banco = BancoFake(banca={"kill_switch": True, "drawdown_pct": 21.0})
     assert alerta_drawdown(banco) is True
     assert len(banco.notificacoes(tipo="alerta_drawdown")) == 1
-    # segunda vez: já há pendente → não duplica
-    assert alerta_drawdown(banco) is False
+    assert alerta_drawdown(banco) is False          # já há pendente → não duplica
 
 
 def test_alerta_drawdown_nao_dispara_sem_kill_switch():
@@ -210,19 +317,35 @@ def test_alerta_drawdown_nao_dispara_sem_kill_switch():
     assert alerta_drawdown(banco) is False
 
 
-def test_entregar_pendentes_marca_entregue():
-    pend = [{"id": 10, "tipo": "alerta_daemon", "conteudo": "daemon l0 mudo"}]
-    banco = BancoFake(pendentes=pend)
-    bot = BotFake()
-    n = entregar_pendentes(banco, bot)
-    assert n == 1 and banco.entregues == [10] and bot.enviados == ["daemon l0 mudo"]
+# ---------------- ciclo ----------------
+
+def test_processar_expira_antes_de_enfileirar_e_envia_por_ultimo():
+    # A ordem que a documentação sempre descreveu — e que o código não seguia.
+    banco = BancoFake(confirmados=[_sinal()],
+                      aguardando=[_sinal(id="s9", status="aguardando_crivo")],
+                      snaps=_snaps_ok())
+    processar(banco, BotFake(), GatesFake(), agora_iso=AGORA_ISO)
+    assert banco.ordem[0] == "expirar"
+    assert banco.ordem.index("enfileirar") < banco.ordem.index("enviar")
 
 
-def test_processar_pulsa_heartbeat_l3():
-    banco = BancoFake()
-    r = processar(banco, BotFake())
+def test_processar_conta_so_o_que_saiu_e_pulsa():
+    banco = BancoFake(confirmados=[_sinal()], snaps=_snaps_ok(),
+                      crivos={"s1": {"verdict": "CONFIRMA", "observacao": None}})
+    r = processar(banco, BotFake(), GatesFake(), agora_iso=AGORA_ISO)
     assert isinstance(r, ResumoL3)
-    assert banco.pulsos and banco.pulsos[-1][0] == "l3"
+    assert r.enfileirados == 1 and r.enviados == 1 and r.falhas_envio == 0
+    assert banco.pulsos[-1][0] == "l3"
+    assert banco.pulsos[-1][1]["enviados"] == 1
+
+
+def test_processar_com_telegram_fora_nao_conta_enviado():
+    banco = BancoFake(confirmados=[_sinal()], snaps=_snaps_ok(),
+                      crivos={"s1": {"verdict": "CONFIRMA", "observacao": None}})
+    r = processar(banco, BotFake(ok=False), GatesFake(), agora_iso=AGORA_ISO)
+    assert r.enfileirados == 1                       # gravado
+    assert r.enviados == 0 and r.falhas_envio == 1   # mas NÃO entregue
+    assert banco.pulsos[-1][1]["enviados"] == 0
 
 
 # ---------------- bot real (transporte fake) ----------------

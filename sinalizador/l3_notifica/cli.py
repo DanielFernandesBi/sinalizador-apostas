@@ -13,10 +13,12 @@ import argparse
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from urllib.request import urlopen
 
 from sinalizador.comum.config import carregar_config
 from sinalizador.comum.db import Banco
+from sinalizador.comum.gates import CarregadorGates
 from sinalizador.comum.log import configurar_logging
 
 from .bot import BotTelegram
@@ -72,11 +74,15 @@ def main(argv: list[str] | None = None) -> int:
         return _descobrir_chat(cfg.exigir("telegram_bot_token"))
 
     banco = Banco()
+    gates = CarregadorGates(banco)
+    gates.validar_integridade()  # falha alto se a integridade dos gates estiver violada
     bot = BotTelegram(cfg.exigir("telegram_bot_token"), cfg.exigir("telegram_chat_id"))
 
     def rodar() -> None:
-        r = processar(banco, bot, limite=args.limite)
-        print(f"[l3] enviados={r.enviados} suprimidos={r.suprimidos} "
+        r = processar(banco, bot, gates, limite=args.limite,
+                      agora_iso=datetime.now(timezone.utc).isoformat())
+        print(f"[l3] enviados={r.enviados} enfileirados={r.enfileirados} "
+              f"falhas_envio={r.falhas_envio} suprimidos={r.suprimidos} "
               f"expirados={r.expirados} alertas={r.alertas_entregues}")
 
     while True:

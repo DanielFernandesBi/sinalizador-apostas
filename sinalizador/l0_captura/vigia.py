@@ -59,7 +59,7 @@ def alertar_mudos(banco: BancoVigia, mudos: list[dict[str, Any]]) -> list[dict[s
         reg = banco.inserir(
             "notificacoes",
             {"sinal_id": None, "tipo": "alerta_daemon", "canal": "telegram",
-             "conteudo": _conteudo(m), "entregue": False},
+             "conteudo": _conteudo(m)},   # status default 'pendente' (outbox do L3)
         )
         inseridas.append(reg)
         _log.warning("daemon mudo — alerta registrado", extra=m)

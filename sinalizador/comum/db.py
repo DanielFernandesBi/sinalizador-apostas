@@ -271,16 +271,37 @@ class Banco:
         return q.execute().data or []
 
     def notificacoes_pendentes(self, limite: int = 200) -> list[dict[str, Any]]:
-        """Notificações não entregues (fila de envio do L3 — alertas e cartões)."""
+        """Notificações ainda NÃO entregues — leitura, sem reservar (usada só para
+        o anti-spam do alerta de drawdown). Quem vai ENVIAR usa
+        `reivindicar_notificacoes`, que reserva atomicamente."""
         resp = (
             self._c.table("notificacoes")
             .select("*")
-            .eq("entregue", False)
+            .in_("status", ["pendente", "enviando"])
             .order("id")
             .limit(limite)
             .execute()
         )
         return resp.data or []
+
+    def reivindicar_notificacoes(self, agora_iso: str, limite: int = 200,
+                                 reclaim_s: float = 300.0) -> list[dict[str, Any]]:
+        """Reserva atomicamente as notificações a enviar (`fn_reivindicar_notificacoes`).
+
+        Move `pendente → enviando` e devolve as linhas reservadas. Dois processos do L3
+        pegam conjuntos DISJUNTOS (`for update skip locked`) — nunca o mesmo cartão.
+        Linhas presas em `enviando` por um processo que morreu voltam à fila após
+        `reclaim_s`.
+        """
+        return self._rpc_lista("fn_reivindicar_notificacoes", {
+            "p_agora": agora_iso, "p_limite": limite, "p_reclaim_s": reclaim_s,
+        })
+
+    def devolver_notificacao(self, notif_id: int) -> bool:
+        """Falha de envio: devolve a linha à fila imediatamente (retry no próximo
+        ciclo, sem esperar a janela de recuperação)."""
+        r = self._rpc("fn_devolver_notificacao", {"p_id": notif_id})
+        return bool(r.get("retorno"))
 
     # ---------------- LEITURA do L4 (fechamento / CLV) ----------------
 
@@ -493,17 +514,18 @@ class Banco:
         """Heartbeat do daemon (E1.5). É apenas um INSERT em `heartbeats`."""
         self.inserir("heartbeats", {"daemon": daemon, "detalhe": detalhe})
 
-    def marcar_notificacao_entregue(self, notif_id: int) -> dict[str, Any]:
-        """`notificacoes` NÃO é append-only (schema 0001 não bloqueia UPDATE nela):
-        marca a entrega (entregue=true + enviado_em). Único campo de estado que muda."""
-        resp = (
-            self._c.table("notificacoes")
-            .update({"entregue": True, "enviado_em": _agora_utc_iso()})
-            .eq("id", notif_id)
-            .execute()
-        )
-        atualizados = resp.data or []
-        return atualizados[0] if atualizados else {}
+    def marcar_notificacao_entregue(self, notif_id: int,
+                                    agora_iso: Optional[str] = None) -> bool:
+        """Fecha a outbox: `enviando → entregue` (`fn_marcar_notificacao_entregue`).
+
+        É o passo imediatamente posterior ao aceite do Telegram. A janela entre os
+        dois é irredutível (a API não tem chave de idempotência em `sendMessage`) —
+        e a escolha assumida é a duplicata rara em vez do sinal perdido em silêncio.
+        """
+        r = self._rpc("fn_marcar_notificacao_entregue", {
+            "p_id": notif_id, "p_agora": agora_iso or _agora_utc_iso(),
+        })
+        return bool(r.get("retorno"))
 
     def transicionar_status_sinal(self, sinal_id: str, novo_status: str) -> dict[str, Any]:
         """Única mutação de `sinais`: muda só `status`, e só a partir de

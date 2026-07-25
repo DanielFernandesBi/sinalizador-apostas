@@ -6,14 +6,32 @@ fechou (preço caiu abaixo da mínima) o cartão NÃO é enviado.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Optional
 
+from sinalizador.comum.tempo import para_datetime
 
-def odd_atual(snap: Optional[dict[str, Any]]) -> Optional[float]:
-    """Odd corrente do venue a partir do último snapshot. None se ausente (P6:
-    sem preço fresco não se afirma nada — quem chama decide o fail-safe)."""
+
+def odd_atual(
+    snap: Optional[dict[str, Any]], *,
+    agora: Optional[datetime] = None, idade_max_s: Optional[float] = None,
+) -> Optional[float]:
+    """Odd corrente do venue a partir do último snapshot. None se ausente ou VELHA.
+
+    A idade é conferida contra `snapshot_idade_max_s` — o MESMO gate que o L1 usa
+    (Doutrina §3, "janela de validade do dado"): um preço não deixa de ser antigo
+    porque é o mais recente que existe. Sem esta checagem, um snapshot de dias atrás
+    contava como "atual" e podia gerar cartão de um preço que não existe mais.
+
+    None é o fail-safe combinado: `janela_fechou(None)` suprime o cartão, e
+    `preco_caiu(None)` NÃO expira (preço velho não prova queda). P6 nos dois sentidos.
+    """
     if not snap or snap.get("odd") is None:
         return None
+    if agora is not None and idade_max_s is not None:
+        ts = para_datetime(snap.get("ts_fonte"))
+        if ts is None or (agora - ts).total_seconds() > float(idade_max_s):
+            return None
     try:
         return float(snap["odd"])
     except (TypeError, ValueError):
