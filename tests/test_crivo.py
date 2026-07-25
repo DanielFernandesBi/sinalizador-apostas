@@ -349,3 +349,166 @@ def test_resumo_separa_adiado_de_erro():
     r = processar_fila(banco, ModeloQueFalha(RateLimitError("429")), limite=10)
     assert r.adiados == 1 and r.erros == 0 and r.avaliados == 1
     assert banco.pulsos[-1][1]["adiados"] == 1
+
+
+# ---------------- P1.7: stop_reason, continuação e custo ----------------
+
+import pytest                                      # noqa: E402
+from sinalizador.l2_crivo.modelo import (          # noqa: E402
+    ModeloAnthropic,
+    RecusaDoModeloError,
+    RespostaIncompletaError,
+    custo_usd,
+)
+
+
+class _Bloco:
+    def __init__(self, tipo, texto=""):
+        self.type = tipo
+        self.text = texto
+
+
+class _Uso:
+    def __init__(self, entrada=0, saida=0, leitura=0, escrita=0):
+        self.input_tokens = entrada
+        self.output_tokens = saida
+        self.cache_read_input_tokens = leitura
+        self.cache_creation_input_tokens = escrita
+
+
+class _Resp:
+    def __init__(self, stop_reason, blocos, uso, categoria=None):
+        self.stop_reason = stop_reason
+        self.content = blocos
+        self.usage = uso
+        self.stop_details = type("D", (), {"category": categoria})() if categoria else None
+
+
+class _MensagensFake:
+    """Espelha `client.messages` do SDK: devolve uma resposta por chamada."""
+
+    def __init__(self, respostas):
+        self._respostas = list(respostas)
+        self.chamadas = []
+
+    def create(self, **kwargs):
+        self.chamadas.append(kwargs)
+        return self._respostas[min(len(self.chamadas) - 1, len(self._respostas) - 1)]
+
+
+def _modelo_com(respostas, **kw):
+    """ModeloAnthropic sem SDK: troca o cliente por um fake."""
+    m = ModeloAnthropic.__new__(ModeloAnthropic)
+    m._cliente = type("C", (), {"messages": _MensagensFake(respostas)})()
+    m._modelo = "modelo-teste"
+    m._max_tokens = kw.get("max_tokens", 16000)
+    m._max_buscas = kw.get("max_buscas", 8)
+    m._max_continuacoes = kw.get("max_continuacoes", 3)
+    return m
+
+
+def test_pause_turn_continua_a_conversa_e_soma_o_uso():
+    """O laço server-side da busca bate o limite e a resposta vem pela metade. A API
+    espera o reenvio de usuário + resposta do assistente — sem 'continue'."""
+    respostas = [
+        _Resp("pause_turn", [_Bloco("text", '{"parte":'), _Bloco("server_tool_use")],
+              _Uso(100, 50)),
+        _Resp("end_turn", [_Bloco("text", '"final"}')], _Uso(200, 80, leitura=1000)),
+    ]
+    m = _modelo_com(respostas)
+    r = m.avaliar(system="manual", dossie_json="{}", caminho="profundo")
+
+    assert r.texto == '{"parte":"final"}'
+    assert r.stop_reason == "end_turn" and r.continuacoes == 1
+    assert r.tokens_entrada == 300 and r.tokens_saida == 130    # SOMADO, não o último
+    assert r.buscas_web == 1
+    chamadas = m._cliente.messages.chamadas
+    assert len(chamadas) == 2
+    papeis = [msg["role"] for msg in chamadas[1]["messages"]]
+    assert papeis == ["user", "assistant"]                      # sem 'continue' extra
+
+
+def test_pause_turn_infinito_nao_queima_o_candidato():
+    """Continuação tem teto; esgotado, é análise inacabada — não saída inválida."""
+    m = _modelo_com([_Resp("pause_turn", [_Bloco("text", "x")], _Uso(10, 5))],
+                    max_continuacoes=2)
+    with pytest.raises(RespostaIncompletaError):
+        m.avaliar(system="m", dossie_json="{}", caminho="profundo")
+    assert len(m._cliente.messages.chamadas) == 3               # 1 + 2 continuações
+
+
+def test_max_tokens_e_incompleto_nao_saida_invalida():
+    m = _modelo_com([_Resp("max_tokens", [_Bloco("text", '{"cort')], _Uso(10, 5))])
+    with pytest.raises(RespostaIncompletaError):
+        m.avaliar(system="m", dossie_json="{}", caminho="rapido")
+
+
+def test_refusal_levanta_recusa_com_categoria():
+    m = _modelo_com([_Resp("refusal", [], _Uso(10, 0), categoria="cyber")])
+    with pytest.raises(RecusaDoModeloError) as exc:
+        m.avaliar(system="m", dossie_json="{}", caminho="rapido")
+    assert exc.value.categoria == "cyber"
+
+
+def test_caminho_rapido_nao_habilita_busca():
+    m = _modelo_com([_Resp("end_turn", [_Bloco("text", "{}")], _Uso(10, 5))])
+    m.avaliar(system="m", dossie_json="{}", caminho="rapido")
+    assert m._cliente.messages.chamadas[0]["tools"] is None
+
+
+def test_caminho_profundo_limita_as_buscas():
+    m = _modelo_com([_Resp("end_turn", [_Bloco("text", "{}")], _Uso(10, 5))], max_buscas=4)
+    m.avaliar(system="m", dossie_json="{}", caminho="profundo")
+    tools = m._cliente.messages.chamadas[0]["tools"]
+    assert tools[0]["max_uses"] == 4
+
+
+def test_custo_inclui_tokens_de_cache():
+    """`input_tokens` é só o resto NÃO cacheado: somar apenas ele subestimava a conta
+    justamente quando o Manual vinha do cache."""
+    sem_cache = custo_usd(1000, 100)
+    com_cache = custo_usd(1000, 100, cache_leitura=50_000, cache_escrita=10_000)
+    assert com_cache > sem_cache
+    esperado = (1000 + 0.1 * 50_000 + 1.25 * 10_000) * (5.0 / 1e6) + 100 * (25.0 / 1e6)
+    assert com_cache == pytest.approx(round(esperado, 6))
+
+
+def test_resposta_incompleta_preserva_o_candidato():
+    """O achado central do P1.7: `pause_turn` esgotado e `max_tokens` chegavam como
+    texto cortado, eram lidos como saída inválida e viravam `erro` PERMANENTE — um
+    soluço da API apagava a aposta da amostra para sempre (Sugestão nº 11)."""
+    for exc in (RespostaIncompletaError("pause_turn ainda pendente"),
+                RespostaIncompletaError("resposta cortada em max_tokens=16000")):
+        banco = BancoFake()
+        status = avaliar_sinal(banco, ModeloQueFalha(exc), _sinal(_dossie()), manual=MANUAL)
+        assert status == "adiado", exc
+        assert banco.transicoes == []                   # candidato intacto na fila
+        assert banco.por_tabela("crivos") == []
+
+
+def test_recusa_do_modelo_e_permanente():
+    """Reenviar o mesmo conteúdo recusa de novo: retentar até o apito só gastaria."""
+    banco = BancoFake()
+    status = avaliar_sinal(banco, ModeloQueFalha(RecusaDoModeloError("cyber")),
+                           _sinal(_dossie()), manual=MANUAL)
+    assert status == "erro"
+    assert banco.por_tabela("crivos") == []
+
+
+def test_metricas_do_caminho_profundo_chegam_ao_crivo():
+    """Sem isso a auditoria não distingue uma avaliação sadia de uma que quase não
+    aconteceu — e a conta do caminho profundo fica invisível."""
+    class ModeloProfundo:
+        def avaliar(self, *, system, dossie_json, caminho):
+            return RespostaModelo(
+                texto=_saida_valida(verdict="CONFIRMA"), modelo="fake",
+                latencia_ms=9, tokens_entrada=100, tokens_saida=50, custo_usd=0.01,
+                stop_reason="end_turn", tokens_cache_leitura=7000,
+                tokens_cache_escrita=0, buscas_web=3, continuacoes=1)
+
+    banco = BancoFake()
+    assert avaliar_sinal(banco, ModeloProfundo(), _sinal(_dossie()), manual=MANUAL) == "confirmado"
+    crivo = banco.por_tabela("crivos")[0]
+    assert crivo["stop_reason"] == "end_turn"
+    assert crivo["buscas_web"] == 3 and crivo["continuacoes"] == 1
+    assert crivo["tokens_cache_leitura"] == 7000

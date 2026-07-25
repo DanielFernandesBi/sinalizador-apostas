@@ -6,6 +6,11 @@ do Crivo VIGENTE, lido da `config_sistema` (nunca hard-coded).
 
     python -m sinalizador.l2_crivo.cli --once            # processa a fila uma vez e sai
     python -m sinalizador.l2_crivo.cli --intervalo-s 30  # laço contínuo
+    python -m sinalizador.l2_crivo.cli smoke             # UMA chamada real à API (P1.7)
+
+`smoke` é a única coisa aqui que gasta crédito: verifica as SUPOSIÇÕES sobre a API
+(modelo existe, versão da ferramenta de busca aceita, `pause_turn` tratado, custo
+real) contra o Manual vigente, sem tocar o banco. Ver `smoke.py`.
 
 Invariante: nenhuma falha aprova um sinal. Exceção no caminho → sinal `erro`.
 """
@@ -29,6 +34,11 @@ _log = logging.getLogger("l2.cli")
 def main(argv: list[str] | None = None) -> int:
     configurar_logging()
     ap = argparse.ArgumentParser(description="L2 — crivo (IA) sobre sinais aguardando_crivo")
+    ap.add_argument("cmd", nargs="?", choices=["smoke"],
+                    help="smoke: uma chamada REAL à API contra o Manual vigente")
+    ap.add_argument("--caminho", choices=["rapido", "profundo"], default="profundo",
+                    help="(smoke) caminho a exercitar")
+    ap.add_argument("--modelo", help="(smoke) sobrepõe o modelo padrão")
     ap.add_argument("--once", action="store_true", help="processa a fila uma vez e sai")
     ap.add_argument("--intervalo-s", type=float, default=30.0, help="segundos entre ciclos")
     ap.add_argument("--limite", type=int, default=50, help="máx. de sinais por ciclo")
@@ -36,6 +46,15 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = carregar_config()
     banco = Banco()
+
+    if args.cmd == "smoke":
+        from .crivo import carregar_manual
+        from .smoke import rodar_smoke
+        # O Manual VIGENTE, o mesmo que o crivo usa — testar contra outro texto
+        # verificaria um sistema que não existe.
+        return rodar_smoke(cfg.exigir("anthropic_api_key"), carregar_manual(banco),
+                           caminho=args.caminho, modelo_id=args.modelo)
+
     modelo = ModeloAnthropic(cfg.exigir("anthropic_api_key"))
 
     def rodar() -> None:

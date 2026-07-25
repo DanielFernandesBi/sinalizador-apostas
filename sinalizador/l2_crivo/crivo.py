@@ -26,7 +26,12 @@ from pydantic import ValidationError
 from sinalizador.comum.erros import e_falha_transitoria
 from sinalizador.comum.modelos import CrivoSaida
 
-from .modelo import ModeloCrivo, RespostaModelo
+from .modelo import (
+    ModeloCrivo,
+    RecusaDoModeloError,
+    RespostaIncompletaError,
+    RespostaModelo,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -140,6 +145,20 @@ def avaliar_sinal(banco: Any, modelo: ModeloCrivo, sinal: dict[str, Any], *, man
         # PERMANENTE: repetir não conserta (JSON inválido, schema, passthrough).
         _registrar_erro(banco, sinal_id, str(e))
         return "erro"
+    except RespostaIncompletaError as e:
+        # P1.7 — a análise NÃO CONCLUIU (`pause_turn` esgotado, `max_tokens`). Isso
+        # chegava aqui como texto cortado, era lido como saída inválida e virava
+        # `erro` PERMANENTE: um soluço da API apagava a aposta da amostra para
+        # sempre, porque o candidato só tem um registro na vida do evento (Sugestão
+        # nº 11). Não é juízo sobre o sinal — fica na fila, e o kickoff limita o
+        # retry (o L4 fecha como `timeout_crivo`).
+        _log.warning("resposta do modelo incompleta — sinal segue na fila",
+                     extra={"sinal_id": sinal_id, "motivo": e.motivo})
+        return "adiado"
+    except RecusaDoModeloError as e:
+        # PERMANENTE, e retentar só gasta: o mesmo conteúdo é recusado de novo.
+        _registrar_erro(banco, sinal_id, f"modelo recusou (categoria={e.categoria})")
+        return "erro"
     except Exception as e:
         if e_falha_transitoria(e):
             # TRANSITÓRIA (rede, 429, 5xx): NÃO vira desfecho. Com a unicidade por
@@ -168,6 +187,14 @@ def avaliar_sinal(banco: Any, modelo: ModeloCrivo, sinal: dict[str, Any], *, man
         "tokens_entrada": resp.tokens_entrada,
         "tokens_saida": resp.tokens_saida,
         "custo_usd": resp.custo_usd,
+        # P1.7 — o que a chamada realmente consumiu. `custo_usd` já inclui os tokens
+        # de cache; a cobrança por USO da busca fica de fora (PC-CUSTO-FERRAMENTA),
+        # então `buscas_web` é o que permite fechar essa conta depois.
+        "stop_reason": resp.stop_reason,
+        "buscas_web": resp.buscas_web,
+        "continuacoes": resp.continuacoes,
+        "tokens_cache_leitura": resp.tokens_cache_leitura,
+        "tokens_cache_escrita": resp.tokens_cache_escrita,
     }, novo_status)
 
     if not r.get("aplicado"):
