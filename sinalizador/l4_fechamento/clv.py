@@ -129,10 +129,18 @@ def fechar_evento(banco: Any, evento: dict[str, Any]) -> int:
     if not fechamentos:
         return 0
 
-    sinal_ids_com_clv, aborto_ids_com_clv = banco.clv_ids_registrados(evento["id"])
+    # Achado #2.1: pergunta ao banco só pelos ids DESTE evento (`in_`), em vez de
+    # varrer `clv_log` inteira. Por isso sinais e abortos são carregados ANTES — é
+    # deles que saem os ids da consulta. Caminho rápido; a garantia é o índice único.
+    sinais = banco.sinais_do_evento(evento["id"], status=["confirmado", "vetado"])
+    abortos = banco.abortos_rastreados_do_evento(evento["id"])
+    sinal_ids_com_clv, aborto_ids_com_clv = banco.clv_ids_registrados(
+        sinal_ids=[s["id"] for s in sinais],
+        aborto_ids=[a["id"] for a in abortos],
+    )
     gravadas = 0
 
-    for sinal in banco.sinais_do_evento(evento["id"], status=["confirmado", "vetado"]):
+    for sinal in sinais:
         if sinal["id"] in sinal_ids_com_clv:
             continue
         p = (fechamentos.get((sinal["mercado"], _linha_key(sinal.get("linha")))) or {}).get(sinal["selecao"])
@@ -145,7 +153,7 @@ def fechar_evento(banco: Any, evento: dict[str, Any]) -> int:
         ), ref=f"sinal={sinal['id']}"):
             gravadas += 1
 
-    for aborto in banco.abortos_rastreados_do_evento(evento["id"]):
+    for aborto in abortos:
         if aborto["id"] in aborto_ids_com_clv:
             continue
         dp = aborto.get("dossie_parcial") or {}

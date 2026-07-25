@@ -31,6 +31,7 @@ Operações expostas:
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -317,13 +318,39 @@ class Banco:
         )
         return resp.data or []
 
-    def clv_ids_registrados(self, evento_id: str) -> tuple[set, set]:
-        """(sinal_ids, aborto_ids) que JÁ têm CLV, para não duplicar o fechamento."""
-        resp = self._c.table("clv_log").select("sinal_id,aborto_l1_id").execute()
-        linhas = resp.data or []
-        sinal_ids = {r["sinal_id"] for r in linhas if r.get("sinal_id")}
-        aborto_ids = {r["aborto_l1_id"] for r in linhas if r.get("aborto_l1_id")}
-        return sinal_ids, aborto_ids
+    def clv_ids_registrados(
+        self, *, sinal_ids: Sequence[str] = (), aborto_ids: Sequence[int] = ()
+    ) -> tuple[set, set]:
+        """Quais destes ids JÁ têm CLV — caminho rápido do fechamento (achado #2.1).
+
+        Recebe os ids do EVENTO em fechamento e pergunta só por eles (`in_`), em vez
+        de varrer `clv_log` inteira: a versão anterior recebia `evento_id` e o
+        IGNORAVA, lendo a tabela toda a cada evento, a cada ciclo — e `clv_log` só
+        cresce (a meta é ≥200 amostras por célula liga×mercado).
+
+        Lista vazia não vira consulta (nem ida à rede). Isto é OTIMIZAÇÃO, não a
+        garantia: a unicidade real é dos índices `ux_clv_sinal`/`ux_clv_aborto`
+        (migration 0005), que barram a corrida entre esta leitura e o INSERT.
+        """
+        com_sinal: set = set()
+        com_aborto: set = set()
+        if sinal_ids:
+            resp = (
+                self._c.table("clv_log")
+                .select("sinal_id")
+                .in_("sinal_id", list(sinal_ids))
+                .execute()
+            )
+            com_sinal = {r["sinal_id"] for r in (resp.data or []) if r.get("sinal_id")}
+        if aborto_ids:
+            resp = (
+                self._c.table("clv_log")
+                .select("aborto_l1_id")
+                .in_("aborto_l1_id", list(aborto_ids))
+                .execute()
+            )
+            com_aborto = {r["aborto_l1_id"] for r in (resp.data or []) if r.get("aborto_l1_id")}
+        return com_sinal, com_aborto
 
     def marcar_evento_encerrado(self, evento_id: str) -> None:
         """`eventos.status` não é imutável no schema — o fechamento marca 'encerrado'

@@ -73,6 +73,7 @@ class BancoFake:
         self.inseridos = []
         self.encerrados = []
         self.pulsos = []
+        self.consultas_clv = []   # (sinal_ids, aborto_ids) perguntados por evento
 
     def casas_ativas(self):
         return [{"id": "c-pin", "nome": "pinnacle", "tipo": "referencia"},
@@ -87,8 +88,13 @@ class BancoFake:
     def abortos_rastreados_do_evento(self, evento_id):
         return self._abortos
 
-    def clv_ids_registrados(self, evento_id):
-        return self._com_clv
+    def clv_ids_registrados(self, *, sinal_ids=(), aborto_ids=()):
+        # achado #2.1: a consulta é FILTRADA pelos ids do evento em fechamento.
+        # Guarda o que foi perguntado para os testes de isolamento e devolve só a
+        # interseção — é o que o `in_` faria no banco.
+        self.consultas_clv.append((list(sinal_ids), list(aborto_ids)))
+        com_s, com_a = self._com_clv
+        return (com_s & set(sinal_ids)), (com_a & set(aborto_ids))
 
     def inserir(self, tabela, registro):
         if tabela == "clv_log":
@@ -189,6 +195,95 @@ def test_corrida_de_clv_em_aborto_tambem_e_absorvida():
                       clv_ja_no_banco={("a", 7)})
     assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}) == 0
     assert banco.clv() == []
+
+
+def test_consulta_de_clv_e_filtrada_pelos_ids_do_evento():
+    # achado #2.1: pergunta SÓ pelos ids deste evento — não varre clv_log inteira.
+    aborto = {"id": 7, "dossie_parcial": {"mercado": "1x2", "selecao": "1", "linha": None,
+                                          "odd_venue": 2.20, "p_justa": _p_fech()["1"]}}
+    banco = BancoFake(snaps_ref=_snaps_completos(),
+                      sinais=[_sinal("s1"), _sinal("s2")], abortos=[aborto])
+    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+
+    assert banco.consultas_clv == [(["s1", "s2"], [7])]   # uma consulta, só estes ids
+
+
+def test_evento_sem_sinais_nem_abortos_nao_consulta_clv():
+    # lista vazia não vira consulta (nem ida à rede) — nem para sinais, nem para abortos.
+    banco = BancoFake(snaps_ref=_snaps_completos())
+    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+    assert banco.consultas_clv == [([], [])]
+    assert banco.clv() == []
+
+
+def test_clv_de_outro_evento_nao_suprime_este():
+    # ISOLAMENTO: um CLV já registrado para o sinal de OUTRO evento não pode fazer o
+    # fechamento deste pular o seu próprio sinal. Com a varredura global antiga isso
+    # era "seguro por acidente" (o conjunto era grande demais); agora é por construção.
+    banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s-deste-evento")],
+                      com_clv=({"s-de-outro-evento"}, {999}))
+    n = fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+
+    assert n == 1
+    assert {r["sinal_id"] for r in banco.clv()} == {"s-deste-evento"}
+    assert banco.consultas_clv == [(["s-deste-evento"], [])]  # nem perguntou pelo alheio
+
+
+class _ClienteConsultaFake:
+    """Grava a cadeia de chamadas do supabase-py para inspecionar a consulta montada."""
+
+    def __init__(self, linhas_por_coluna):
+        self._linhas = linhas_por_coluna     # {'sinal_id': [...], 'aborto_l1_id': [...]}
+        self.consultas = []                  # (tabela, coluna, valores)
+        self._atual = None
+
+    def table(self, tabela):
+        self._tabela = tabela
+        return self
+
+    def select(self, colunas):
+        self._coluna = colunas
+        return self
+
+    def in_(self, coluna, valores):
+        self._atual = (self._tabela, coluna, list(valores))
+        return self
+
+    def execute(self):
+        assert self._atual is not None, "consulta sem filtro in_ — varreria a tabela"
+        tabela, coluna, valores = self._atual
+        self.consultas.append((tabela, coluna, valores))
+        self._atual = None
+        return type("R", (), {"data": [{coluna: v} for v in self._linhas.get(coluna, [])
+                                       if v in valores]})()
+
+
+def test_banco_clv_ids_registrados_consulta_filtrada():
+    # A consulta REAL (não o fake do fechamento): filtra por `in_` nos dois lados e
+    # devolve só o que existe. Antes lia `clv_log` inteira, ignorando o parâmetro.
+    from sinalizador.comum.db import Banco
+
+    cli = _ClienteConsultaFake({"sinal_id": ["s1", "s9"], "aborto_l1_id": [7]})
+    banco = Banco(client=cli)
+    com_s, com_a = banco.clv_ids_registrados(sinal_ids=["s1", "s2"], aborto_ids=[7, 8])
+
+    assert com_s == {"s1"} and com_a == {7}
+    assert cli.consultas == [
+        ("clv_log", "sinal_id", ["s1", "s2"]),
+        ("clv_log", "aborto_l1_id", [7, 8]),
+    ]
+
+
+def test_banco_clv_ids_registrados_nao_consulta_com_lista_vazia():
+    # Lista vazia não vira consulta — nem ida à rede. (O fake levantaria se `execute`
+    # fosse chamado sem `in_`.)
+    from sinalizador.comum.db import Banco
+
+    cli = _ClienteConsultaFake({})
+    banco = Banco(client=cli)
+    assert banco.clv_ids_registrados(sinal_ids=[], aborto_ids=[]) == (set(), set())
+    assert banco.clv_ids_registrados() == (set(), set())
+    assert cli.consultas == []
 
 
 def test_erro_que_nao_e_unicidade_sobe():
