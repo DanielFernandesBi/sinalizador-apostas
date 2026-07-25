@@ -2,18 +2,29 @@
 import pytest
 
 from sinalizador.comum.erros import e_violacao_unicidade
+from sinalizador.comum.tempo import para_datetime
 from sinalizador.l1_gatilhos.devig import devig_shin
 from sinalizador.l4_fechamento.clv import (
     clv_pct,
     fechar_evento,
-    probs_fechamento_por_mercado,
     prob_implicita,
+    revisoes_de_fechamento,
     rodar_fechamento,
 )
 from sinalizador.l4_fechamento.relatorio import formatar_relatorio
 
 INICIO = "2026-07-20T21:00:00Z"
+KICKOFF = para_datetime(INICIO)
+TS_FECH = "2026-07-20T20:55:00Z"       # revisão de fechamento padrão (300 s antes)
 REF_1X2 = [("1", 2.0), ("X", 3.5), ("2", 4.0)]
+
+
+class GatesFake:
+    def __init__(self, fechamento_idade_max_s=600.0):
+        self._v = {"fechamento_idade_max_s": fechamento_idade_max_s}
+
+    def get(self, nome):
+        return self._v[nome]
 
 
 def _p_fech():
@@ -21,8 +32,8 @@ def _p_fech():
     return dict(zip(("1", "X", "2"), probs))
 
 
-def _snap_ref(sel, odd, ts, *, mercado="1x2", linha=None):
-    return {"casa_id": "c-pin", "mercado": mercado, "selecao": sel, "linha": linha,
+def _snap_ref(sel, odd, ts, *, mercado="1x2", linha=None, casa="c-pin"):
+    return {"casa_id": casa, "mercado": mercado, "selecao": sel, "linha": linha,
             "odd": odd, "ts_fonte": ts}
 
 
@@ -37,22 +48,118 @@ def test_clv_pct_bate_o_fechamento():
     assert prob_implicita(2.0) == 0.5
 
 
-def test_probs_fechamento_usa_ultimo_e_deviga():
-    snaps = [
-        _snap_ref("1", 1.9, "2026-07-20T19:00:00Z"),   # antigo (será sobrescrito)
-        _snap_ref("1", 2.0, "2026-07-20T20:59:00Z"),   # último → fechamento
-        _snap_ref("X", 3.5, "2026-07-20T20:59:00Z"),
-        _snap_ref("2", 4.0, "2026-07-20T20:59:00Z"),
+def _revisao_completa(ts, odds=REF_1X2, casa="c-pin", mercado="1x2", linha=None):
+    return [_snap_ref(sel, odd, ts, mercado=mercado, linha=linha, casa=casa)
+            for sel, odd in odds]
+
+
+def _fech(snaps, *, inicio=KICKOFF, limite=600.0):
+    return revisoes_de_fechamento(snaps, inicio=inicio, limite_idade_s=limite)
+
+
+def test_revisao_mais_recente_completa_e_escolhida():
+    snaps = _revisao_completa("2026-07-20T19:00:00Z") + _revisao_completa("2026-07-20T20:59:00Z")
+    fech, ind = _fech(snaps)
+    rev = fech[("1x2", None)]
+    assert rev.ts_fonte == para_datetime("2026-07-20T20:59:00Z")
+    assert abs(rev.probs["1"] - _p_fech()["1"]) < 1e-9
+    assert sum(rev.probs.values()) > 0.99   # de-vigado (sem overround)
+    assert ind == []
+
+
+def test_revisao_mais_recente_incompleta_nao_e_misturada_com_a_anterior():
+    # O CORAÇÃO do achado #3: às 20h59 a seleção "2" foi suspensa. O fechamento tem
+    # de ser o book INTEIRO das 20h55 — jamais 1 e X de 20h59 casados com 2 de 20h55.
+    snaps = _revisao_completa("2026-07-20T20:55:00Z") + [
+        _snap_ref("1", 1.80, "2026-07-20T20:59:00Z"),   # revisão parcial (sem "2")
+        _snap_ref("X", 3.60, "2026-07-20T20:59:00Z"),
     ]
-    fech = probs_fechamento_por_mercado(snaps)
-    p = fech[("1x2", None)]
-    assert abs(p["1"] - _p_fech()["1"]) < 1e-9
-    assert sum(p.values()) > 0.99  # de-vigado (sem overround)
+    fech, ind = _fech(snaps)
+    rev = fech[("1x2", None)]
+    assert rev.ts_fonte == para_datetime("2026-07-20T20:55:00Z")   # a completa
+    assert rev.idade_s == 300.0
+    # as probabilidades vêm SÓ das odds das 20h55 (1.80/3.60 não entraram)
+    assert abs(rev.probs["1"] - _p_fech()["1"]) < 1e-9
 
 
-def test_probs_fechamento_pula_mercado_incompleto():
-    snaps = [_snap_ref("1", 2.0, INICIO), _snap_ref("X", 3.5, INICIO)]  # falta "2"
-    assert probs_fechamento_por_mercado(snaps) == {}
+def test_revisao_completa_anterior_dentro_do_gate_e_usada():
+    snaps = _revisao_completa("2026-07-20T20:55:00Z")     # 300 s antes do kickoff
+    fech, ind = _fech(snaps, limite=600.0)
+    assert ("1x2", None) in fech and ind == []
+
+
+def test_revisao_completa_anterior_fora_do_gate_e_rejeitada():
+    snaps = _revisao_completa("2026-07-20T20:30:00Z")     # 1800 s antes
+    fech, ind = _fech(snaps, limite=600.0)
+    assert fech == {}
+    assert len(ind) == 1
+    assert ind[0].motivo == "revisao_completa_defasada"
+    assert ind[0].idade_s == 1800.0 and ind[0].limite_s == 600.0
+
+
+def test_limite_exato_do_gate_e_aceito():
+    snaps = _revisao_completa("2026-07-20T20:50:00Z")     # exatamente 600 s
+    fech, ind = _fech(snaps, limite=600.0)
+    assert ("1x2", None) in fech and ind == []            # <= limite, não <
+
+
+def test_snapshot_posterior_ao_kickoff_nunca_e_usado():
+    snaps = _revisao_completa("2026-07-20T20:55:00Z") + _revisao_completa("2026-07-20T21:05:00Z")
+    fech, _ = _fech(snaps)
+    assert fech[("1x2", None)].ts_fonte == para_datetime("2026-07-20T20:55:00Z")
+
+
+def test_so_revisao_posterior_ao_kickoff_nao_gera_fechamento():
+    snaps = _revisao_completa("2026-07-20T21:05:00Z")
+    fech, ind = _fech(snaps)
+    assert fech == {} and ind[0].motivo == "sem_revisao_completa"
+
+
+def test_books_de_casas_de_referencia_diferentes_nunca_sao_combinados():
+    # duas referências, cada uma com meio book na mesma revisão: nenhuma fecha.
+    snaps = [
+        _snap_ref("1", 2.0, "2026-07-20T20:55:00Z", casa="c-pin"),
+        _snap_ref("X", 3.5, "2026-07-20T20:55:00Z", casa="c-pin"),
+        _snap_ref("2", 4.0, "2026-07-20T20:55:00Z", casa="c-pin2"),   # outra referência
+    ]
+    fech, ind = _fech(snaps)
+    assert fech == {}
+    assert ind[0].motivo == "sem_revisao_completa"
+
+
+def test_mercado_incompleto_nao_produz_shin():
+    snaps = [_snap_ref("1", 2.0, "2026-07-20T20:55:00Z"),
+             _snap_ref("X", 3.5, "2026-07-20T20:55:00Z")]        # falta "2"
+    fech, ind = _fech(snaps)
+    assert fech == {} and ind[0].motivo == "sem_revisao_completa"
+
+
+def test_capturas_repetidas_da_mesma_revisao_nao_alteram_probabilidades():
+    # o L0 recaptura a MESMA revisão (mesmo ts_fonte) em ciclos diferentes.
+    uma = _revisao_completa("2026-07-20T20:55:00Z")
+    fech_1, _ = _fech(uma)
+    fech_n, _ = _fech(uma + uma + uma)
+    assert fech_n[("1x2", None)].probs == fech_1[("1x2", None)].probs
+    assert fech_n[("1x2", None)].ts_fonte == fech_1[("1x2", None)].ts_fonte
+
+
+def test_ah_usa_a_linha_canonica():
+    # achado 5 + #3: o AH fecha por (mercado, linha canônica) — mandante e visitante
+    # na MESMA linha, na mesma revisão.
+    snaps = [
+        _snap_ref("mandante", 1.90, "2026-07-20T20:55:00Z", mercado="ah", linha=-0.5),
+        _snap_ref("visitante", 1.95, "2026-07-20T20:55:00Z", mercado="ah", linha=-0.5),
+    ]
+    fech, ind = _fech(snaps)
+    assert ("ah", -0.5) in fech and ind == []
+    assert set(fech[("ah", -0.5)].probs) == {"mandante", "visitante"}
+
+
+def test_mercado_fora_de_escopo_nao_vira_indisponibilidade():
+    # fora do escopo ≠ dado faltando: não polui o registro de perda de amostra.
+    snaps = [_snap_ref("sim", 2.0, "2026-07-20T20:55:00Z", mercado="ambas_marcam")]
+    fech, ind = _fech(snaps)
+    assert fech == {} and ind == []
 
 
 class ErroUnicidade(RuntimeError):
@@ -125,14 +232,14 @@ class BancoFake:
 
 
 def _snaps_completos():
-    return [_snap_ref(sel, odd, INICIO) for sel, odd in REF_1X2]
+    return [_snap_ref(sel, odd, TS_FECH) for sel, odd in REF_1X2]
 
 
 def test_fechar_evento_sinal_confirmado_gera_clv_real():
     sinal = {"id": "s1", "status": "confirmado", "mercado": "1x2", "selecao": "1",
              "linha": None, "odd_venue": 2.20, "p_justa": _p_fech()["1"]}
     banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[sinal])
-    n = fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+    n = fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
     assert n == 1
     clv = banco.clv()[0]
     assert clv["sinal_id"] == "s1" and clv["contrafactual"] is False
@@ -145,7 +252,7 @@ def test_fechar_evento_vetado_e_contrafactual():
     sinal = {"id": "s2", "status": "vetado", "mercado": "1x2", "selecao": "1",
              "linha": None, "odd_venue": 2.20, "p_justa": _p_fech()["1"]}
     banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[sinal])
-    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
     assert banco.clv()[0]["contrafactual"] is True
 
 
@@ -153,7 +260,7 @@ def test_fechar_evento_aborto_rastreado():
     aborto = {"id": 7, "dossie_parcial": {"mercado": "1x2", "selecao": "1", "linha": None,
                                           "odd_venue": 2.20, "p_justa": _p_fech()["1"]}}
     banco = BancoFake(snaps_ref=_snaps_completos(), abortos=[aborto])
-    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
     clv = banco.clv()[0]
     assert clv["aborto_l1_id"] == 7 and clv["contrafactual"] is True
 
@@ -162,7 +269,7 @@ def test_fechar_evento_nao_duplica_clv():
     sinal = {"id": "s1", "status": "confirmado", "mercado": "1x2", "selecao": "1",
              "linha": None, "odd_venue": 2.2, "p_justa": _p_fech()["1"]}
     banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[sinal], com_clv=({"s1"}, set()))
-    assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}) == 0
+    assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake()) == 0
 
 
 # ---- achado #2: idempotência do CLV garantida pelo banco ----
@@ -180,7 +287,7 @@ def test_corrida_de_clv_nao_duplica_nem_derruba_o_ciclo():
     banco = BancoFake(snaps_ref=_snaps_completos(),
                       sinais=[_sinal("s1"), _sinal("s2")],
                       clv_ja_no_banco={("s", "s1")})   # já existe no banco, invisível ao dedup
-    n = fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+    n = fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
 
     assert n == 1                                       # só s2 contou como gravado
     gravados = {r["sinal_id"] for r in banco.clv()}
@@ -193,7 +300,7 @@ def test_corrida_de_clv_em_aborto_tambem_e_absorvida():
                                           "odd_venue": 2.20, "p_justa": _p_fech()["1"]}}
     banco = BancoFake(snaps_ref=_snaps_completos(), abortos=[aborto],
                       clv_ja_no_banco={("a", 7)})
-    assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}) == 0
+    assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake()) == 0
     assert banco.clv() == []
 
 
@@ -203,7 +310,7 @@ def test_consulta_de_clv_e_filtrada_pelos_ids_do_evento():
                                           "odd_venue": 2.20, "p_justa": _p_fech()["1"]}}
     banco = BancoFake(snaps_ref=_snaps_completos(),
                       sinais=[_sinal("s1"), _sinal("s2")], abortos=[aborto])
-    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
 
     assert banco.consultas_clv == [(["s1", "s2"], [7])]   # uma consulta, só estes ids
 
@@ -211,7 +318,7 @@ def test_consulta_de_clv_e_filtrada_pelos_ids_do_evento():
 def test_evento_sem_sinais_nem_abortos_nao_consulta_clv():
     # lista vazia não vira consulta (nem ida à rede) — nem para sinais, nem para abortos.
     banco = BancoFake(snaps_ref=_snaps_completos())
-    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+    fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
     assert banco.consultas_clv == [([], [])]
     assert banco.clv() == []
 
@@ -222,7 +329,7 @@ def test_clv_de_outro_evento_nao_suprime_este():
     # era "seguro por acidente" (o conjunto era grande demais); agora é por construção.
     banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s-deste-evento")],
                       com_clv=({"s-de-outro-evento"}, {999}))
-    n = fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+    n = fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
 
     assert n == 1
     assert {r["sinal_id"] for r in banco.clv()} == {"s-deste-evento"}
@@ -292,7 +399,7 @@ def test_erro_que_nao_e_unicidade_sobe():
     banco = BancoFake(snaps_ref=_snaps_completos(), sinais=[_sinal("s1")],
                       erro_no_insert=RuntimeError("connection reset by peer"))
     with pytest.raises(RuntimeError, match="connection reset"):
-        fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO})
+        fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake())
 
 
 def test_reconhece_violacao_de_unicidade():
@@ -311,15 +418,15 @@ def test_reconhece_violacao_de_unicidade():
 
 def test_fechar_evento_sem_book_completo_nao_gera_clv():
     # referência só com "1" → sem de-vig → sem CLV, mas encerra o evento
-    banco = BancoFake(snaps_ref=[_snap_ref("1", 2.0, INICIO)],
+    banco = BancoFake(snaps_ref=[_snap_ref("1", 2.0, TS_FECH)],
                       sinais=[{"id": "s1", "status": "confirmado", "mercado": "1x2",
                                "selecao": "1", "linha": None, "odd_venue": 2.2, "p_justa": 0.5}])
-    assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}) == 0
+    assert fechar_evento(banco, {"id": "ev1", "inicio_utc": INICIO}, GatesFake()) == 0
 
 
 def test_rodar_fechamento_pulsa_l4():
     banco = BancoFake(snaps_ref=_snaps_completos())
-    r = rodar_fechamento(banco, "2026-07-20T23:00:00Z")
+    r = rodar_fechamento(banco, GatesFake(), "2026-07-20T23:00:00Z")
     assert r["eventos"] == 1
     assert banco.pulsos and banco.pulsos[-1][0] == "l4"
 

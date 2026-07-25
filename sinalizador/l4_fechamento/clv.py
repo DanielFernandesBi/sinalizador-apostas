@@ -15,9 +15,12 @@ Mercado com book de referência incompleto no fechamento → sem de-vig → sem 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Optional
 
 from sinalizador.comum.erros import e_violacao_unicidade
+from sinalizador.comum.tempo import para_datetime
 from sinalizador.l1_gatilhos.devig import devig_shin
 from sinalizador.l1_gatilhos.orquestrador import ORDEM_SELECAO
 
@@ -44,34 +47,118 @@ def clv_pct(odd_emissao: float, p_fechamento: float) -> float:
     return (float(odd_emissao) * float(p_fechamento) - 1.0) * 100.0
 
 
-def probs_fechamento_por_mercado(
+@dataclass(frozen=True)
+class RevisaoFechamento:
+    """A linha de fechamento de um (mercado, linha): UMA revisão, indivisível."""
+    casa_id: str
+    mercado: str
+    linha: Optional[float]
+    ts_fonte: datetime          # carimbo REAL da revisão usada (vai para clv_log)
+    idade_s: float              # início − ts_fonte (quão antes do kickoff)
+    probs: dict[str, float]     # seleção → p_justa (Shin sobre ESTA revisão)
+
+
+@dataclass(frozen=True)
+class FechamentoIndisponivel:
+    """Por que um (mercado, linha) ficou sem linha de fechamento. NUNCA silencioso:
+    a ausência tende a se concentrar em mercados voláteis/suspensos perto do início,
+    então some enviesada — e é preciso poder medir quanto se perdeu e onde."""
+    mercado: str
+    linha: Optional[float]
+    motivo: str                 # 'sem_revisao_completa' | 'revisao_completa_defasada'
+    limite_s: float
+    idade_s: Optional[float] = None
+
+
+def _agrupar_por_revisao(
     snaps_ref: list[dict[str, Any]]
 ) -> dict[tuple, dict[str, float]]:
-    """Do conjunto de snapshots da REFERÊNCIA (já filtrado até o início), monta
-    {(mercado, linha): {selecao: p_justa}} de-vigando Shin cada mercado completo.
+    """Agrupa os snapshots pela unidade INDIVISÍVEL da revisão:
+    `(casa_id, mercado, linha canônica, ts_fonte)` → {seleção: odd}.
 
-    Usa o ÚLTIMO snapshot por (mercado, linha, seleção) = a linha de fechamento.
-    Mercado sem TODAS as seleções da ordem canônica é pulado (P6).
+    `casa_id` entra na chave de propósito: se houver mais de uma casa de referência,
+    o book jamais pode ser montado juntando seleções de referências distintas.
     """
-    # último snapshot por (mercado, linha, selecao) — assume ordenado por ts_fonte asc.
-    ultimo: dict[tuple, dict[str, float]] = {}
+    revisoes: dict[tuple, dict[str, float]] = {}
     for s in snaps_ref:
         if s.get("odd") is None:
             continue
-        chave = (s["mercado"], _linha_key(s.get("linha")))
-        ultimo.setdefault(chave, {})[s["selecao"]] = float(s["odd"])
+        ts = para_datetime(s.get("ts_fonte"))
+        if ts is None:
+            continue  # sem carimbo não há revisão a que pertencer (P6)
+        chave = (s.get("casa_id"), s["mercado"], _linha_key(s.get("linha")), ts)
+        revisoes.setdefault(chave, {})[s["selecao"]] = float(s["odd"])
+    return revisoes
 
-    out: dict[tuple, dict[str, float]] = {}
-    for (mercado, linha), odds_por_sel in ultimo.items():
+
+def revisoes_de_fechamento(
+    snaps_ref: list[dict[str, Any]], *, inicio: datetime, limite_idade_s: float
+) -> tuple[dict[tuple, RevisaoFechamento], list[FechamentoIndisponivel]]:
+    """Escolhe a linha de fechamento de cada (mercado, linha) — Doutrina §3 (Sugestão nº 9).
+
+    A linha de fechamento é a **revisão completa mais recente** anterior ou igual ao
+    início, desde que sua defasagem não exceda `fechamento_idade_max_s`.
+
+    NÃO se começa pegando o último preço de cada seleção: isso montaria um book que
+    nunca existiu (preço fresco de duas seleções casado com preço velho da terceira,
+    o que acontece sempre que a revisão mais recente omite uma seleção — suspensão
+    perto do início). A revisão é indivisível: completa ou descartada inteira.
+
+    Devolve (fechamentos, indisponíveis). Mercado fora do escopo (`ORDEM_SELECAO`)
+    não entra em nenhuma das duas listas — não é dado faltando, é fora de escopo.
+    """
+    revisoes = _agrupar_por_revisao(snaps_ref)
+
+    # Candidatas por (mercado, linha): completas e anteriores/iguais ao início.
+    completas: dict[tuple, list[tuple[datetime, str, dict[str, float]]]] = {}
+    vistos: set[tuple] = set()          # (mercado, linha) que existem nos snapshots
+    for (casa_id, mercado, linha, ts), odds_por_sel in revisoes.items():
         ordem = ORDEM_SELECAO.get(mercado)
-        if ordem is None or any(sel not in odds_por_sel for sel in ordem):
-            continue  # mercado fora do escopo ou book incompleto no fechamento (P6)
+        if ordem is None:
+            continue                     # fora do escopo — silencioso, não é falta de dado
+        vistos.add((mercado, linha))
+        if ts > inicio:
+            continue                     # revisão posterior ao início não é fechamento
+        if any(sel not in odds_por_sel for sel in ordem):
+            continue                     # incompleta: descartada INTEIRA (nunca completada)
+        completas.setdefault((mercado, linha), []).append((ts, casa_id, odds_por_sel))
+
+    fechamentos: dict[tuple, RevisaoFechamento] = {}
+    indisponiveis: list[FechamentoIndisponivel] = []
+
+    for chave in sorted(vistos):
+        mercado, linha = chave
+        candidatas = completas.get(chave)
+        if not candidatas:
+            indisponiveis.append(FechamentoIndisponivel(
+                mercado=mercado, linha=linha, motivo="sem_revisao_completa",
+                limite_s=limite_idade_s))
+            continue
+
+        # Mais recente; empate entre casas de referência resolvido por casa_id
+        # (determinismo). Com mais de uma referência, a PRIORIDADE é decisão de
+        # rito — ver PC-REFERENCIA-MULTIPLA; hoje só a Pinnacle é referência.
+        ts, casa_id, odds_por_sel = max(candidatas, key=lambda c: (c[0], c[1]))
+        idade_s = (inicio - ts).total_seconds()
+        if idade_s > limite_idade_s:
+            indisponiveis.append(FechamentoIndisponivel(
+                mercado=mercado, linha=linha, motivo="revisao_completa_defasada",
+                limite_s=limite_idade_s, idade_s=idade_s))
+            continue
+
+        ordem = ORDEM_SELECAO[mercado]
         try:
             probs, _z = devig_shin([odds_por_sel[sel] for sel in ordem])
         except ValueError:
+            indisponiveis.append(FechamentoIndisponivel(
+                mercado=mercado, linha=linha, motivo="sem_revisao_completa",
+                limite_s=limite_idade_s))
             continue
-        out[(mercado, linha)] = dict(zip(ordem, probs))
-    return out
+        fechamentos[chave] = RevisaoFechamento(
+            casa_id=casa_id, mercado=mercado, linha=linha, ts_fonte=ts,
+            idade_s=idade_s, probs=dict(zip(ordem, probs)),
+        )
+    return fechamentos, indisponiveis
 
 
 def _linha_clv(
@@ -114,18 +201,30 @@ def _gravar_clv(banco: Any, linha: dict[str, Any], ref: str) -> bool:
         raise
 
 
-def fechar_evento(banco: Any, evento: dict[str, Any]) -> int:
+def fechar_evento(banco: Any, evento: dict[str, Any], gates: Any) -> int:
     """Fecha o CLV de um evento já iniciado. Devolve quantas linhas de `clv_log`
     gravou. Marca o evento 'encerrado' ao fim (sai da fila do L4)."""
-    inicio = evento.get("inicio_utc")
-    if not inicio:
+    inicio_iso = evento.get("inicio_utc")
+    inicio = para_datetime(inicio_iso)
+    if inicio is None:
         return 0
     ref_ids = [c["id"] for c in banco.casas_ativas() if c.get("tipo") == "referencia"]
     if not ref_ids:
         _log.warning("sem casa de referência ativa — fechamento impossível (P6)")
         return 0
-    snaps_ref = banco.snapshots_do_evento(evento["id"], casa_ids=ref_ids, ate_iso=inicio)
-    fechamentos = probs_fechamento_por_mercado(snaps_ref)
+    limite_idade_s = float(gates.get("fechamento_idade_max_s"))
+    snaps_ref = banco.snapshots_do_evento(evento["id"], casa_ids=ref_ids, ate_iso=inicio_iso)
+    fechamentos, indisponiveis = revisoes_de_fechamento(
+        snaps_ref, inicio=inicio, limite_idade_s=limite_idade_s)
+
+    # Perda de amostra NUNCA é silenciosa (Sugestão nº 9): registra mercado, motivo,
+    # idade e limite — é o que responde depois "quantos CLVs deixaram de ser
+    # calculados, em quais mercados, e se o gate está cortando amostra demais".
+    for ind in indisponiveis:
+        _log.warning("sem linha de fechamento — CLV não calculado", extra={
+            "evento_id": evento["id"], "mercado": ind.mercado, "linha": ind.linha,
+            "motivo": ind.motivo, "idade_s": ind.idade_s, "limite_s": ind.limite_s,
+        })
     if not fechamentos:
         return 0
 
@@ -143,13 +242,17 @@ def fechar_evento(banco: Any, evento: dict[str, Any]) -> int:
     for sinal in sinais:
         if sinal["id"] in sinal_ids_com_clv:
             continue
-        p = (fechamentos.get((sinal["mercado"], _linha_key(sinal.get("linha")))) or {}).get(sinal["selecao"])
+        rev = fechamentos.get((sinal["mercado"], _linha_key(sinal.get("linha"))))
+        p = rev.probs.get(sinal["selecao"]) if rev else None
         if p is None:
             continue
+        # ts_fechamento = carimbo REAL da revisão usada (Sugestão nº 9), não o
+        # kickoff: o início segue em `eventos.inicio_utc` e a defasagem sai do join.
         if _gravar_clv(banco, _linha_clv(
             sinal_id=sinal["id"], aborto_id=None, odd_emissao=float(sinal["odd_venue"]),
             p_emissao=float(sinal["p_justa"]), p_fechamento=p,
-            contrafactual=(sinal["status"] == "vetado"), ts_fechamento=inicio,
+            contrafactual=(sinal["status"] == "vetado"),
+            ts_fechamento=rev.ts_fonte.isoformat(),
         ), ref=f"sinal={sinal['id']}"):
             gravadas += 1
 
@@ -160,13 +263,15 @@ def fechar_evento(banco: Any, evento: dict[str, Any]) -> int:
         sel, odd_venue = dp.get("selecao"), dp.get("odd_venue")
         if sel is None or odd_venue is None:
             continue
-        p = (fechamentos.get((dp.get("mercado"), _linha_key(dp.get("linha")))) or {}).get(sel)
+        rev = fechamentos.get((dp.get("mercado"), _linha_key(dp.get("linha"))))
+        p = rev.probs.get(sel) if rev else None
         if p is None:
             continue
         if _gravar_clv(banco, _linha_clv(
             sinal_id=None, aborto_id=aborto["id"], odd_emissao=float(odd_venue),
             p_emissao=float(dp.get("p_justa") or prob_implicita(odd_venue)),
-            p_fechamento=p, contrafactual=True, ts_fechamento=inicio,
+            p_fechamento=p, contrafactual=True,
+            ts_fechamento=rev.ts_fonte.isoformat(),
         ), ref=f"aborto={aborto['id']}"):
             gravadas += 1
 
@@ -175,13 +280,13 @@ def fechar_evento(banco: Any, evento: dict[str, Any]) -> int:
     return gravadas
 
 
-def rodar_fechamento(banco: Any, agora_iso: str, *, limite: int = 200) -> dict[str, int]:
+def rodar_fechamento(banco: Any, gates: Any, agora_iso: str, *, limite: int = 200) -> dict[str, int]:
     """Fecha todos os eventos já iniciados e ainda abertos. Pulsa heartbeat `l4`."""
     eventos = banco.eventos_iniciados_sem_status_final(agora_iso, limite)
     total_eventos = 0
     total_clv = 0
     for evento in eventos:
-        n = fechar_evento(banco, evento)
+        n = fechar_evento(banco, evento, gates)
         total_eventos += 1
         total_clv += n
     banco.pulsar(DAEMON, {"eventos_fechados": total_eventos, "clv_gravadas": total_clv})

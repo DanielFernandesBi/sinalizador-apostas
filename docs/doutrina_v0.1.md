@@ -60,6 +60,7 @@ Nenhuma conclusão sobre desempenho com menos de **200 apostas/sinais**. ROI esp
 - **Edge líquido:** `p_justa × (odd_venue − 1) × (1 − comissão) − (1 − p_justa)`, deduzido slippage estimado (no venue sombra de odd fixa, `slippage = 0` por definição — ver acima).
 - **Odd mínima aceitável:** menor odd do venue em que o edge líquido ainda atinge o gate `edge_min` — a mesma fronteira que aprova o sinal. Abaixo dela, o sinal está sem valor suficiente e expira na re-checagem de preço do L3.
 - **CLV de um sinal:** diferença entre a odd capturada na emissão e a odd de fechamento da referência sharp para o mesmo mercado/seleção, convertidas a probabilidade.
+- **Linha de fechamento (Sugestão nº 9):** a **revisão completa mais recente** da referência sharp com carimbo de fonte **anterior ou igual ao início** da partida, desde que sua defasagem em relação ao início não exceda o gate `fechamento_idade_max_s`. A unidade é **indivisível**: `(casa_id, mercado, linha canônica, ts_fonte)`. Uma revisão só serve se contiver **todas** as seleções canônicas do mercado; revisão incompleta é descartada inteira, jamais completada com preços de outra revisão. É **proibido** montar o fechamento tomando o último preço individual de cada seleção — isso produz um book que nunca existiu e contamina o KPI soberano. Quando não houver revisão completa admissível (inexistente, ou completa porém defasada além do gate), **não há CLV** para aquele mercado, e o motivo é **registrado explicitamente** — a amostra nunca se perde em silêncio, porque a ausência de fechamento tende a se concentrar em mercados voláteis ou suspensos perto do início, e some enviesada.
 - **Unidade (u):** 1% da banca corrente no momento do sinal.
 - **Janela de validade do dado:** idade máxima do snapshot de odds para que o cálculo seja admissível. Provisório: **10 minutos** (a calibrar).
 - **Mercado homologado:** mercado + liga com CLV positivo comprovado em backtest e mantido em produção (a homologação caduca se o CLV rolante degradar — ver Seção 6).
@@ -80,6 +81,7 @@ Nenhuma conclusão sobre desempenho com menos de **200 apostas/sinais**. ROI esp
 | Janela do `odds_drop` | ≤ 900 s | a calibrar |
 | Movimento do venue para `gatilho_anomalo` (referência parada) | ≥ 3% | a calibrar |
 | Piso de edge para rastrear CLV de near-miss (`rastreio_edge_min`) | ≥ 1,0% | a calibrar |
+| Defasagem máxima da revisão de fechamento em relação ao início (`fechamento_idade_max_s`) | ≤ 600 s | a calibrar |
 | Stake máximo | 2% da banca | **pétreo** |
 | Fração de Kelly | ¼ | **pétreo** (só reduz, nunca sobe) |
 | Drawdown de suspensão | 20% do pico | **pétreo** |
@@ -112,5 +114,7 @@ Mudanças seguem o rito de **sugestões numeradas** (padrão "Evolução do sist
 *v0.1.3 — 20/07/2026. Alteração única (Sugestão nº 4): definição canônica de **odd mínima aceitável** — menor odd em que o edge líquido ainda atinge o gate `edge_min`.*
 
 *v0.1.4 — 20/07/2026. Alteração única (Sugestão nº 5): novo gate `rastreio_edge_min` (≥ 1,0%, a calibrar) na §4 — piso de edge para rastrear o CLV de near-miss (quase-sinais logo abaixo de `edge_min`), estendendo a curva de calibração do modo sombra com dado real.*
+
+*v0.1.6 — 24/07/2026. Alteração única (Sugestão nº 9): definição canônica de **linha de fechamento** na §3 e novo gate `fechamento_idade_max_s` (≤ 600 s, a calibrar) na §4. A linha de fechamento é a **revisão completa mais recente** da referência com carimbo anterior ou igual ao início, cuja unidade indivisível é `(casa_id, mercado, linha canônica, ts_fonte)` — é **proibido** montar o fechamento tomando o último preço individual de cada seleção, o que produziria um book que nunca existiu. Revisão posterior ao início é rejeitada; revisão completa mais recente porém defasada além do gate não gera CLV. Ausência de revisão completa e defasagem excessiva geram **motivo explícito registrado**, nunca perda silenciosa de amostra. `clv_log.ts_fechamento` passa a guardar o `ts_fonte` real da revisão utilizada (o início segue em `eventos.inicio_utc`, permitindo medir a defasagem por join).*
 
 *v0.1.5 — 21/07/2026. Alteração única (Sugestão nº 6): definição de **venue sombra** na §3 — o modo sombra opera sobre o melhor preço de varejo (.bet.br) enquanto não há exchange capturável, com `sombra_varejo`, gate de liquidez inaplicável e `slippage = 0` por definição em odd fixa (a odd mínima aceitável é a trava). Resolve PC-VENUE-SOMBRA e PC-SLIPPAGE para o modo sombra; dinheiro real segue travado pelo gate da Seção 6.*

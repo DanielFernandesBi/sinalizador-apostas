@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 from sinalizador.comum.config import carregar_config
 from sinalizador.comum.db import Banco
+from sinalizador.comum.gates import CarregadorGates
 from sinalizador.comum.log import configurar_logging
 from sinalizador.comum.rede import MSG_REDE, parece_erro_de_rede
 
@@ -29,8 +30,11 @@ _log = logging.getLogger("l4.cli")
 
 
 def _cmd_fechar(banco: Banco, args) -> int:
+    gates = CarregadorGates(banco)
+    gates.validar_integridade()  # falha alto se a integridade dos gates estiver violada
+
     def rodar() -> None:
-        r = rodar_fechamento(banco, datetime.now(timezone.utc).isoformat())
+        r = rodar_fechamento(banco, gates, datetime.now(timezone.utc).isoformat())
         print(f"[l4] eventos_fechados={r['eventos']} clv_gravadas={r['clv']}")
 
     while True:
