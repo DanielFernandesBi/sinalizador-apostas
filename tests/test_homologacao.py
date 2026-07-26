@@ -134,3 +134,67 @@ def test_uma_definicao_de_significancia_para_os_dois_lados():
     import backtest.replay as replay
     from sinalizador.comum import significancia
     assert replay.estatistica_agrupada is significancia.estatistica_agrupada
+
+
+# ---- multiplicidade (Sugestão nº 16 emendada) ----
+
+def _celula_ruido(semente, n=200, media=0.0):
+    """Célula com `n` jogos de 1 observação, ruído gaussiano de desvio 1."""
+    import random
+    r = random.Random(semente)
+    return _est({f"g{i}": [r.gauss(media, 1.0)] for i in range(n)})
+
+
+def _est(d):
+    from sinalizador.comum.significancia import estatistica_agrupada
+    return estatistica_agrupada(d)
+
+
+def test_valor_p_e_a_mesma_decisao_que_o_ic95():
+    """A correção fala em valor-p; o critério da Sugestão nº 16 fala em IC95. Se as
+    duas escalas discordassem, a correção estaria mudando o critério por baixo."""
+    from sinalizador.comum.significancia import ALFA_CELULA
+    for semente in range(40):
+        e = _celula_ruido(semente)
+        assert e.significante == (e.valor_p < ALFA_CELULA)
+
+
+def test_lote_grande_sem_clv_nenhum_nao_promove_nada():
+    """684 células com CLV verdadeiro ZERO — a granularidade fina que escolhi cria
+    esse tamanho de família. Sem correção, ~17 'provam' CLV positivo por ruído."""
+    from sinalizador.comum.significancia import homologaveis
+    celulas = {f"c{j}": _celula_ruido(1000 + j) for j in range(684)}
+    sozinhas = {k for k, e in celulas.items() if e.significante}
+    assert len(sozinhas) > 5, "o cenário precisa ter falsos positivos para valer"
+    assert homologaveis(celulas, amostra_minima=200) == set()
+
+
+def test_correcao_nao_mata_celula_verdadeiramente_boa():
+    """Controle do controle: se a correção matasse tudo, seria só um 'não' caro."""
+    from sinalizador.comum.significancia import homologaveis
+    celulas = {f"c{j}": _celula_ruido(2000 + j) for j in range(100)}
+    celulas["boa"] = _celula_ruido(999, n=400, media=0.6)   # CLV real e forte
+    assert "boa" in homologaveis(celulas, amostra_minima=200)
+
+
+def test_uma_celula_sozinha_mantem_o_criterio_original():
+    """m=1 → limiar volta a ser alfa. A correção é generalização estrita, não um
+    critério diferente: quem tem uma célula só não é punido por ela existir."""
+    from sinalizador.comum.significancia import homologaveis
+    boa = _celula_ruido(999, n=400, media=0.6)
+    assert boa.significante is True
+    assert homologaveis({"unica": boa}, amostra_minima=200) == {"unica"}
+
+
+def test_celula_sem_p12_nao_entra_na_familia():
+    """Incluir quem nem podia concorrer inflaria `m` e endureceria o limiar das
+    demais — a correção puniria as boas por causa das inelegíveis."""
+    from sinalizador.comum.significancia import homologaveis
+    boa = _celula_ruido(999, n=400, media=0.6)
+    curtas = {f"curta{j}": _celula_ruido(3000 + j, n=20) for j in range(300)}
+    assert homologaveis({"boa": boa, **curtas}, amostra_minima=200) == {"boa"}
+
+
+def test_um_cluster_so_nao_tem_valor_p():
+    e = _est({"jogo unico": [1.0, 2.0, 3.0]})
+    assert e.valor_p is None and e.significante is False

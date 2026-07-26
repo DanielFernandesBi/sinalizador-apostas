@@ -25,6 +25,11 @@ from typing import Iterable, Optional
 # t ≈ z. Concluir sobre célula com poucos clusters exigiria t de Student.
 Z95 = 1.959964
 
+# Nível por célula. 0.025 UNILATERAL é exatamente o mesmo teste que "limite inferior
+# do IC95 bilateral acima de zero" — só nos interessa CLV > 0, e essa equivalência é
+# o que permite falar em valor-p sem mudar o critério de célula única.
+ALFA_CELULA = 0.025
+
 
 @dataclass(frozen=True)
 class Estatistica:
@@ -40,8 +45,24 @@ class Estatistica:
     @property
     def significante(self) -> bool:
         """IC95 inteiro acima de zero. Média positiva NÃO basta: média positiva com
-        intervalo cruzando o zero é compatível com CLV verdadeiro negativo."""
+        intervalo cruzando o zero é compatível com CLV verdadeiro negativo.
+
+        Vale para uma célula OLHADA SOZINHA. Ao escolher entre muitas, use
+        `homologaveis` — ver a nota de multiplicidade lá.
+        """
         return self.ic95_baixo is not None and self.ic95_baixo > 0.0
+
+    @property
+    def valor_p(self) -> Optional[float]:
+        """p unilateral de H0: CLV = 0 contra H1: CLV > 0. None sem erro padrão.
+
+        `p < ALFA_CELULA` é IDÊNTICO a `significante` — é a mesma decisão escrita na
+        escala que a correção de multiplicidade sabe comparar.
+        """
+        if self.erro_padrao is None or self.erro_padrao <= 0.0:
+            return None
+        z = self.media_cluster / self.erro_padrao
+        return 0.5 * math.erfc(z / math.sqrt(2.0))
 
 
 def estatistica_agrupada(clvs_por_grupo: dict[str, list[float]]) -> Estatistica:
@@ -90,3 +111,49 @@ def homologavel(est: Estatistica, *, amostra_minima: int) -> bool:
     exige que a evidência venha de lá (ver PC-VENUE-HISTORICO).
     """
     return est.n >= amostra_minima and est.significante
+
+
+def homologaveis(
+    celulas: dict[str, Estatistica], *, amostra_minima: int,
+    alfa: float = ALFA_CELULA,
+) -> set[str]:
+    """Quais células do LOTE podem ser homologadas, corrigindo multiplicidade.
+
+    O PROBLEMA que isto resolve, e que a auditoria não levantou: a granularidade
+    escolhida (liga × mercado × linha × faixa de odd) cria centenas de células —
+    6 ligas × 6 faixas × (1X2 + linhas de OU + linhas de AH) passa de 600. Testar
+    cada uma a 95% e promover as que cruzam o limiar é dragagem de dados: com CLV
+    verdadeiro ZERO em todas, ~17 células por rodada "provam" CLV positivo só por
+    ruído. E cada promoção espúria autoriza dinheiro real (E7).
+
+    Isto é consequência DIRETA da decisão de granularidade fina: quanto mais fina a
+    célula, mais testes, mais falsos positivos. Quem escolhe a granularidade herda a
+    correção — não dá para ficar com a precisão e não pagar por ela.
+
+    Correção por **Benjamini–Hochberg** (FDR), não Bonferroni: a pergunta aqui é de
+    TRIAGEM — entre muitas células, quais merecem operar? —, e o que se quer limitar
+    é a proporção esperada de promoções falsas, não a probabilidade de um único erro
+    em todo o lote. Bonferroni no tamanho desta família seria tão conservador que
+    nenhuma célula real passaria.
+
+    A FAMÍLIA é o lote avaliado na mesma rodada de promoção. Avaliar célula por
+    célula em rodadas separadas para escapar da correção seria burlar o próprio
+    critério — a multiplicidade existe no CONJUNTO de decisões, não no arquivo.
+
+    Para UMA célula (m=1) o limiar volta a ser `alfa` e nada muda: é generalização
+    estrita do critério da Sugestão nº 16, não um critério diferente.
+    """
+    # P12 primeiro: célula sem amostra não entra sequer na família — incluí-la
+    # inflaria `m` e endureceria o limiar das demais por causa de quem nem podia
+    # concorrer.
+    elegiveis = {k: e for k, e in celulas.items()
+                 if e.n >= amostra_minima and e.valor_p is not None}
+    if not elegiveis:
+        return set()
+    ordenadas = sorted(elegiveis.items(), key=lambda kv: kv[1].valor_p)
+    m = len(ordenadas)
+    corte = 0
+    for i, (_, e) in enumerate(ordenadas, start=1):
+        if e.valor_p <= (i / m) * alfa:
+            corte = i
+    return {k for k, _ in ordenadas[:corte]}
