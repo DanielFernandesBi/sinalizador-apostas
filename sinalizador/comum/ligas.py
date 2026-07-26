@@ -41,6 +41,15 @@ LIGAS: tuple[Liga, ...] = (
     Liga("ger_bundesliga", "Bundesliga", "soccer_germany_bundesliga", "D1"),
     Liga("fra_ligue_1", "Ligue 1", "soccer_france_ligue_one", "F1"),
     Liga("por_primeira_liga", "Primeira Liga", "soccer_portugal_primeira_liga", "P1"),
+    # BRASILEIRÃO SÉRIE A — entra com `div=None`: o Football-Data NÃO cobre o
+    # Brasileirão, então esta liga NUNCA terá backtest histórico. Isso é permitido
+    # pela Sugestão nº 16 (c) — ausência de backtest não é veto; backtest só VETA, e
+    # quem homologa é o CLV de sombra, medido no venue real. Foi incluída para o
+    # sistema parar de esperar: as seis europeias só começam em 15/08, e o
+    # Brasileirão está em temporada AGORA. Cada dia sem captura é amostra que não
+    # se recupera. Série B fica de fora de propósito — não se amplia liga e mercado
+    # ao mesmo tempo (D6).
+    Liga("bra_serie_a", "Brasileirão Série A", "soccer_brazil_campeonato", None),
 )
 
 # Derivações — cada lado consome a SUA vista da mesma tabela, e nenhum lado

@@ -191,15 +191,33 @@ def test_saidas_geradas_com_cabecalho_de_limitacoes(tmp_path):
 
 # ---- contrato backtest ↔ produção (auditoria "5. Backtest e homologação") ----
 
-def test_ligas_do_backtest_e_da_producao_sao_o_MESMO_conjunto():
+def test_toda_liga_do_backtest_existe_na_producao():
     """O tripwire que faltava. Eram duas tabelas de tradução independentes para o
     mesmo conceito, e o backtest rotulava "Inglaterra — Premier League" enquanto a
     produção grava "Premier League": nenhuma célula do backtest casava com liga
     nenhuma de produção. Como o gate de homologação é fail-closed, isso não abria
-    risco — produzia MUDEZ, que é o modo de falha mais difícil de perceber."""
+    risco — produzia MUDEZ, que é o modo de falha mais difícil de perceber.
+
+    O invariante é de INCLUSÃO, não de igualdade: o backtest não pode inventar liga
+    que a produção não conhece (aí a evidência não alcançaria a autorização), mas a
+    produção PODE capturar liga sem histórico — é o caso do Brasileirão, que entrou
+    justamente para o sistema não ficar esperando agosto."""
     from backtest.football_data import LIGAS
     from sinalizador.l0_captura.mapeamento import SPORTS_ALVO
-    assert set(LIGAS.values()) == set(SPORTS_ALVO.values())
+    assert set(LIGAS.values()) <= set(SPORTS_ALVO.values())
+
+
+def test_liga_sem_historico_e_declarada_e_nao_silenciosa():
+    """Liga que o backtest não alcança tem que estar NOMEADA em `SEM_HISTORICO`.
+
+    Sem isso, alguém leria "o backtest cobre nossas ligas" e estaria errado sem
+    aviso — e a Sugestão nº 16 (c) depende dessa distinção: para célula sem
+    histórico não há veto possível, só CLV de sombra."""
+    from backtest.football_data import LIGAS
+    from sinalizador.comum.ligas import SEM_HISTORICO
+    from sinalizador.l0_captura.mapeamento import SPORTS_ALVO
+    sem_backtest = set(SPORTS_ALVO.values()) - set(LIGAS.values())
+    assert sem_backtest == set(SEM_HISTORICO)
 
 
 def test_mercados_do_backtest_existem_no_vocabulario_da_producao():

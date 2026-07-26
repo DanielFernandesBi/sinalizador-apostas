@@ -430,10 +430,22 @@ def avaliar_grupo(
         exposto_efetivo = reservas.sobre(exposto, grupo.evento_id, liga, dia_partida)
         tetos = tetos_exposicao(gates, banca)
         vexp = avaliar_exposicao(stake_valor, exposto_efetivo, tetos)
-        if not vexp.aprovado:
-            _abortar_dedup(banco, grupo, sel, vexp.gate_reprovado, dossie_parcial,
-                           edge, gates, resumo, chave=chave, chaves_abortos=chaves_abortos)
-            continue
+        # PC-SOMBRA-EXPOSICAO (rito, 26/07/2026). A exposição responde "cabe MAIS
+        # dinheiro nisto agora?"; a calibração pergunta "esta oportunidade tinha
+        # valor?". São perguntas diferentes, e deixar a primeira matar a segunda
+        # tira da amostra justamente as oportunidades de dia cheio — enviesando o
+        # CLV pelo que já foi comprometido, que nada tem a ver com a qualidade da
+        # oportunidade. Por isso a exposição NÃO aborta candidato de calibração.
+        #
+        # Mas também não se ISENTA: a Sugestão nº 13 nasceu porque os três tetos
+        # nunca eram exercitados no modo sombra, e pular a avaliação recriaria esse
+        # buraco. O veredito é sempre calculado e vai ao dossiê — amostra íntegra E
+        # teto medido. Quando a célula virar `homologado`, a exposição volta a ser
+        # gate de EMISSÃO, logo abaixo.
+        dossie_parcial["exposicao_veredito"] = {
+            "aprovado": vexp.aprovado, "gate": vexp.gate_reprovado,
+            "detalhe": vexp.detalhe,
+        }
 
         # Passou TODOS os gates mecânicos. Homologação da CÉLULA (Doutrina P2 /
         # achado 8), agora com a odd na mão: a célula mais específica que cobre
@@ -452,8 +464,16 @@ def avaliar_grupo(
                            chave=chave, chaves_abortos=chaves_abortos)
             continue
         if status_celula != "homologado":
+            # Calibração: entra na amostra mesmo com a exposição estourada (acima).
             _registrar_candidato_sombra(banco, grupo, sel, dossie_parcial, resumo,
                                         chave=chave, chaves_abortos=chaves_abortos)
+            continue
+
+        # Homologado → a exposição volta a ser gate: aqui há EMISSÃO, e emitir sem
+        # caber no teto é o que quebra banca (o CLV é indiferente a concentração).
+        if not vexp.aprovado:
+            _abortar_dedup(banco, grupo, sel, vexp.gate_reprovado, dossie_parcial,
+                           edge, gates, resumo, chave=chave, chaves_abortos=chaves_abortos)
             continue
 
         # Homologado → dossiê completo + fila do L2.

@@ -113,6 +113,38 @@ def homologavel(est: Estatistica, *, amostra_minima: int) -> bool:
     return est.n >= amostra_minima and est.significante
 
 
+def veta_por_backtest(est: Estatistica, *, alfa: float = ALFA_CELULA) -> bool:
+    """A célula é VETADA pelo histórico? (PC-VETO-BACKTEST, pré-registrado.)
+
+    A regra é escrita ANTES de o backtest rodar sobre a base real — de propósito.
+    Escolher o critério depois de ver os números é escolher o resultado, e o custo
+    de um veto errado (perder uma célula boa para sempre) é grande demais para
+    admitir essa liberdade.
+
+    A ASSIMETRIA é o ponto (Sugestão nº 16 (c)):
+
+      - **significativamente NEGATIVO → veta.** Há evidência histórica razoável de
+        que a célula é ruim; não vale gastar temporada medindo o que já se sabe.
+      - **inconclusivo → NÃO veta.** Segue em calibração. Ausência de prova não é
+        prova de ausência (P6), e o backtest tem cobertura fina em OU/AH.
+      - **positivo → não homologa**, só mantém a célula elegível para a sombra. O
+        venue histórico não é o venue real (PC-VENUE-HISTORICO): o histórico pode
+        MATAR uma hipótese, nunca aprová-la.
+
+    Célula sem histórico algum — o Brasileirão, por exemplo — nunca é vetada: não
+    há de onde tirar veto, e `veta_por_backtest` sequer é chamada para ela.
+
+    Sem correção de multiplicidade aqui, e por escolha: no veto o erro custoso é o
+    FALSO VETO (matar célula boa), e corrigir para múltiplos testes tornaria o veto
+    ainda mais difícil de acionar — o que é o lado seguro. Manter o teste por célula
+    é o mais RIGOROSO dos dois para quem veta, e é assim que fica.
+    """
+    if est.valor_p is None:
+        return False
+    # p unilateral acima; o lado negativo é o complementar.
+    return (1.0 - est.valor_p) < alfa and est.media_cluster < 0.0
+
+
 def homologaveis(
     celulas: dict[str, Estatistica], *, amostra_minima: int,
     alfa: float = ALFA_CELULA,

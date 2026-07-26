@@ -198,3 +198,36 @@ def test_celula_sem_p12_nao_entra_na_familia():
 def test_um_cluster_so_nao_tem_valor_p():
     e = _est({"jogo unico": [1.0, 2.0, 3.0]})
     assert e.valor_p is None and e.significante is False
+
+
+# ---- PC-VETO-BACKTEST (regra pré-registrada) ----
+
+def test_backtest_significativamente_negativo_veta():
+    from sinalizador.comum.significancia import veta_por_backtest
+    ruim = _celula_ruido(11, n=300, media=-0.5)
+    assert ruim.media_cluster < 0
+    assert veta_por_backtest(ruim) is True
+
+
+def test_backtest_inconclusivo_nao_veta():
+    """Ausência de prova não é prova de ausência — e o backtest tem cobertura fina
+    em OU/AH. Inconclusivo segue em calibração."""
+    from sinalizador.comum.significancia import veta_por_backtest
+    assert veta_por_backtest(_celula_ruido(12, n=300, media=0.0)) is False
+
+
+def test_backtest_positivo_nao_veta_e_tambem_nao_homologa():
+    """A assimetria da Sugestão nº 16 (c): o histórico pode MATAR uma hipótese,
+    nunca aprová-la — o venue histórico não é o venue real."""
+    from sinalizador.comum.significancia import homologavel, veta_por_backtest
+    bom = _celula_ruido(13, n=300, media=0.5)
+    assert veta_por_backtest(bom) is False
+    # e `homologavel` só é aplicado ao CLV de SOMBRA; sobre o histórico não decide nada
+    assert bom.significante is True   # o número é bom...
+    # ...mas quem autoriza é a sombra, não este objeto (ver Sugestão nº 16 (c)).
+
+
+def test_celula_sem_dispersao_nao_veta():
+    """Um cluster só não tem erro padrão: não dá para afirmar nada, muito menos veto."""
+    from sinalizador.comum.significancia import veta_por_backtest
+    assert veta_por_backtest(_est({"jogo": [-99.0]})) is False

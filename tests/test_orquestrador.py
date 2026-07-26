@@ -840,3 +840,45 @@ def test_com_allowlist_o_mesmo_cenario_coleta():
     oportunidade' de 'não posso apostar em lugar nenhum'."""
     banco, r = _cenario_sombra(["bet365_br"])
     assert r.candidatos_sombra == 1 and r.sem_venue_executavel == 0
+
+
+# ---- PC-SOMBRA-EXPOSICAO: exposição registra, não isenta, não mata calibração ----
+
+def _cenario_exposicao_estourada(homologados):
+    """Exposição já no teto: em homologado seria aborto; em calibração, não."""
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-b365", liquidez=100000)]
+    banco = BancoFake(snaps, homologados=homologados, venues_exec=["bet365_br"],
+                      exposicao=[{"evento_id": "ev1", "liga": "Premier League",
+                                  "dia": None, "exposto": 999999.0}])
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+    return banco, r
+
+
+def test_exposicao_estourada_nao_tira_candidato_da_calibracao():
+    """A exposição pergunta 'cabe mais dinheiro agora?'; a calibração pergunta 'esta
+    oportunidade tinha valor?'. Deixar a primeira matar a segunda tiraria da amostra
+    justamente os dias cheios — viés que nada tem a ver com qualidade de oportunidade."""
+    banco, r = _cenario_exposicao_estourada({("Premier League", "1x2"): "backtest"})
+    assert r.candidatos_sombra == 1
+    aborto = banco.por_tabela("abortos_l1")[0]
+    assert aborto["gate_reprovado"] == "mercado_nao_homologado"
+
+
+def test_mas_o_veredito_de_exposicao_fica_registrado_no_dossie():
+    """Não se ISENTA: a Sugestão nº 13 nasceu porque os tetos nunca eram exercitados
+    no modo sombra. Pular a avaliação recriaria o buraco — então ela é calculada e
+    gravada, mesmo quando não aborta."""
+    banco, _ = _cenario_exposicao_estourada({("Premier League", "1x2"): "backtest"})
+    dossie = banco.por_tabela("abortos_l1")[0]["dossie_parcial"]
+    v = dossie["exposicao_veredito"]
+    assert v["aprovado"] is False and v["gate"] == "exposicao_jogo"
+
+
+def test_em_mercado_homologado_a_exposicao_volta_a_abortar():
+    """Aqui há EMISSÃO — e emitir sem caber no teto é o que quebra banca. O CLV é
+    indiferente a concentração; o teto não."""
+    banco, r = _cenario_exposicao_estourada({("Premier League", "1x2"): "homologado"})
+    assert r.sinais == 0 and r.candidatos_sombra == 0
+    assert banco.por_tabela("abortos_l1")[0]["gate_reprovado"] == "exposicao_jogo"
