@@ -81,7 +81,12 @@ class BancoFake:
         return set(self._abortos)
 
     def homologacao_mercados(self):
-        return dict(self._homologados)
+        # Devolve o que foi injetado: mapa antigo (liga,mercado)→status OU a lista de
+        # células da 0020. O núcleo lê as duas formas — o mapa É o caso "todos os
+        # limites nulos", não um formato paralelo.
+        if isinstance(self._homologados, dict):
+            return dict(self._homologados)
+        return [dict(c) for c in self._homologados]
 
     def config_vigente(self, chave):
         if chave == "banca_papel" and self._banca_papel is not None:
@@ -729,3 +734,68 @@ def test_classificar_elegibilidade_nomeia_cada_motivo():
     assert por_casa["dessinc"]["motivo_inelegivel"] == "dessincronizado_da_referencia"
     assert por_casa["odd_ruim"]["motivo_inelegivel"] == "odd_invalida"
     assert por_casa["sem_ts"]["motivo_inelegivel"] == "sem_carimbo_de_fonte"
+
+
+# ---- homologação por CÉLULA (auditoria "5. Backtest e homologação", migration 0020) ----
+
+def _celula(status, **over):
+    base = {"liga": "Premier League", "mercado": "1x2", "linha": None,
+            "odd_min": None, "odd_max": None, "status": status, "suspenso_em": None}
+    base.update(over)
+    return base
+
+
+def _cenario_com_odd(celulas):
+    """Um candidato de 1x2 que passa em todos os gates, com a odd conhecida."""
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.065, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-bf", liquidez=100000)]
+    banco = BancoFake(snaps, homologados=celulas)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.EXCHANGE)
+    return odd_venue, banco, r
+
+
+def test_faixa_homologada_dentro_de_mercado_em_calibracao_vira_sinal():
+    """O caso que a tabela antiga não sabia representar: o mercado inteiro segue em
+    calibração, MAS a faixa onde este preço caiu já tem evidência. Antes, homologar
+    exigia autorizar o mercado todo — inclusive faixas com CLV negativo."""
+    odd, banco, r = _cenario_com_odd([
+        _celula("backtest"),
+        _celula("homologado", odd_min=1.01, odd_max=99.0),
+    ])
+    assert r.sinais == 1 and r.candidatos_sombra == 0
+    assert len(banco.por_tabela("sinais")) == 1
+
+
+def test_faixa_fora_do_intervalo_cai_no_geral_e_vira_sombra():
+    """Especificidade não é herança: a odd que não pertence à faixa homologada é
+    julgada pela regra geral, não pela faixa."""
+    odd, banco, r = _cenario_com_odd([
+        _celula("backtest"),
+        _celula("homologado", odd_min=1.01, odd_max=1.10),   # não cobre a odd do caso
+    ])
+    assert r.sinais == 0 and r.candidatos_sombra == 1
+    assert banco.por_tabela("abortos_l1")[0]["gate_reprovado"] == "mercado_nao_homologado"
+
+
+def test_faixa_suspensa_nao_vira_nem_sombra():
+    """Sombra é calibração AUTORIZADA. Faixa retirada não autoriza nem medir."""
+    odd, banco, r = _cenario_com_odd([
+        _celula("homologado"),
+        _celula("homologado", odd_min=1.01, odd_max=99.0, suspenso_em="2026-07-01T00:00:00Z"),
+    ])
+    assert r.sinais == 0 and r.candidatos_sombra == 0
+    assert banco.por_tabela("abortos_l1")[0]["gate_reprovado"] == "faixa_suspenso"
+
+
+def test_mercado_com_tudo_suspenso_pula_o_grupo_antes_de_gastar_gate():
+    odd, banco, r = _cenario_com_odd([_celula("homologado", suspenso_em="2026-07-01T00:00:00Z")])
+    assert r.sinais == 0 and r.candidatos_sombra == 0 and r.nao_autorizados == 1
+    assert banco.por_tabela("abortos_l1")[0]["gate_reprovado"] == "mercado_suspenso"
+
+
+def test_mapa_antigo_continua_significando_qualquer_linha_e_qualquer_odd():
+    """Compatibilidade: `{(liga, mercado): status}` É o caso de todos os limites
+    nulos. Ler assim mantém o significado — não é tradução."""
+    odd, banco, r = _cenario_com_odd({("Premier League", "1x2"): "homologado"})
+    assert r.sinais == 1

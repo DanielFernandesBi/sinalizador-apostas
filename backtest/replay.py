@@ -6,15 +6,19 @@ Para cada partida e cada mercado:
   3. edge_liquido (Doutrina §3; no backtest o venue é varejo → comissão 0 e
      slippage 0, pois não há dado de exchange/liquidez — declarado no relatório);
   4. candidato de value_bet quando edge > 0;
-  5. MEDIÇÃO: CLV = odd_venue · p_fechamento − 1, com
-     p_fechamento = Shin(referência Pinnacle no FECHAMENTO).
+  5. MEDIÇÃO: CLV pela MESMA função da produção (`l4_fechamento.clv.clv_pct`,
+     em PONTOS PERCENTUAIS), com p_fechamento = Shin(Pinnacle no FECHAMENTO).
 
 ZERO LOOK-AHEAD: o passo de decisão (1–4) usa apenas colunas de abertura. O
 fechamento entra somente na medição (5); o resultado do jogo não entra em lugar
 nenhum da decisão nem do CLV.
 
-Célula = liga × mercado × faixa de odd. Célula com n < amostra mínima (200, P12)
-é reportada como "amostra insuficiente", sem conclusão.
+Célula = liga × mercado × LINHA × faixa de odd — a mesma unidade que
+`mercados_homologados` representa desde a migration 0020, para que a evidência
+consiga alcançar a autorização. Célula com n < amostra mínima (200, P12) é
+reportada como "amostra insuficiente", sem conclusão; `significante` (limite
+inferior do IC95 acima de zero) é uma leitura ADICIONAL, com o erro padrão
+agrupado por partida.
 """
 from __future__ import annotations
 
@@ -25,6 +29,7 @@ from collections import defaultdict
 
 from sinalizador.l1_gatilhos.devig import devig_shin
 from sinalizador.l1_gatilhos.edge import edge_liquido
+from sinalizador.l4_fechamento.clv import clv_pct as clv_pct_producao
 
 from .ah import liquidar_ah
 from .football_data import MERCADOS, num
@@ -62,6 +67,10 @@ def candidatos_da_partida(
     """Gera as linhas de candidato (edge > 0) de uma partida. Ver módulo p/ regras."""
     liga = row.get("_liga", "?")
     data = (row.get("Date") or "").strip()
+    # Identificação da PARTIDA: é a unidade de agrupamento da significância. As
+    # seleções de um mesmo jogo (H/D/A, over/under, os dois lados do AH) não são
+    # observações independentes — saem do mesmo book, contra o mesmo fechamento.
+    partida = f"{(row.get('HomeTeam') or '?').strip()} x {(row.get('AwayTeam') or '?').strip()}"
     linhas: list[dict] = []
 
     for mercado in MERCADOS:
@@ -89,13 +98,18 @@ def candidatos_da_partida(
             edge = edge_liquido(p_justa, venue, 0.0, 0.0)
             if edge <= 0.0:
                 continue  # candidato só quando o venue oferece valor vs. referência
-            # MEDIÇÃO (não participa da decisão):
-            clv = venue * p_fechamento[i] - 1.0
+            # MEDIÇÃO (não participa da decisão). A unidade é a MESMA da produção
+            # (`l4_fechamento.clv.clv_pct`, em pontos percentuais) porque é a mesma
+            # função: antes o backtest calculava `venue·p − 1` num campo também
+            # chamado `clv_pct`, ou seja, o mesmo nome com unidades diferentes por
+            # um fator 100 — a forma mais silenciosa possível de errar uma importação.
+            clv = clv_pct_producao(venue, p_fechamento[i])
             linhas.append({
                 "liga": liga,
                 "mercado": mercado.nome,
                 "selecao": sel.codigo,
-                "linha": None,
+                "linha": mercado.linha,
+                "partida": partida,
                 "data": data,
                 "faixa_odd": faixa_odd(venue),
                 "p_justa_abertura": p_justa,
@@ -107,7 +121,8 @@ def candidatos_da_partida(
                 "resultado_ah": None,
             })
 
-    linhas.extend(_candidatos_ah(row, liga, data, edge_min=edge_min, odd_teto=odd_teto))
+    linhas.extend(_candidatos_ah(row, liga, data, partida,
+                                 edge_min=edge_min, odd_teto=odd_teto))
     return linhas
 
 
@@ -117,7 +132,7 @@ _AH_LADOS = (("mandante", "PAHH", "PAHCH", "B365AHH"),
 
 
 def _candidatos_ah(
-    row: dict, liga: str, data: str, *, edge_min: float, odd_teto: float
+    row: dict, liga: str, data: str, partida: str, *, edge_min: float, odd_teto: float
 ) -> list[dict]:
     """AH via Pinnacle (abertura PAH* / fechamento PAHC*), venue = B365 (única casa
     de varejo consistente). CLV só é medido quando a LINHA de abertura == fechamento
@@ -156,13 +171,14 @@ def _candidatos_ah(
             "mercado": "ah",
             "selecao": cod,
             "linha": linha_ab,
+            "partida": partida,
             "data": data,
             "faixa_odd": faixa_odd(venue),
             "p_justa_abertura": p_ab[i],
             "odd_venue": venue,
             "edge_liquido": edge,
             "p_ref_fechamento": p_fe[i],
-            "clv_pct": venue * p_fe[i] - 1.0,
+            "clv_pct": clv_pct_producao(venue, p_fe[i]),
             "value_bet_provisional": bool(edge >= edge_min and venue <= odd_teto),
             "resultado_ah": resultado,
         })
@@ -179,28 +195,87 @@ def replay(
     return todos
 
 
+# z de 95% bilateral. Normal, não t: a amostra mínima da P12 é 200 e o número de
+# CLUSTERS numa célula viável passa de 30 com folga, faixa em que t ≈ z. Se algum dia
+# se concluir sobre célula pequena, isto tem que virar t de Student.
+_Z95 = 1.959964
+
+
+def _estatistica(clvs_por_partida: dict[str, list[float]]) -> dict:
+    """Média, desvio e ERRO PADRÃO da célula — o erro padrão agrupado por partida.
+
+    Por que agrupado: as observações de uma célula NÃO são independentes. As três
+    seleções de um 1X2 saem do mesmo book, contra o mesmo fechamento; over e under
+    são o mesmo book visto dos dois lados; os dois lados do AH idem. Tratar cada
+    seleção como uma observação livre infla o `n` efetivo e ENCOLHE o erro padrão —
+    o intervalo de confiança sai estreito demais e a célula parece significante
+    antes de ser. Como o viés é sempre na direção de concluir cedo demais, esta é
+    exatamente a conta que P6 manda fazer pelo lado conservador.
+
+    A unidade de agrupamento é a PARTIDA: média dentro do jogo, depois desvio ENTRE
+    jogos. `n_clusters` é o tamanho de amostra que sustenta a conclusão; `n` (o
+    total de observações) segue reportado, mas não é ele que dita a incerteza.
+    """
+    todos = [x for xs in clvs_por_partida.values() for x in xs]
+    n = len(todos)
+    media = sum(todos) / n
+    desvio = math.sqrt(sum((x - media) ** 2 for x in todos) / n) if n > 1 else 0.0
+
+    medias_partida = [sum(xs) / len(xs) for xs in clvs_por_partida.values()]
+    k = len(medias_partida)
+    media_cluster = sum(medias_partida) / k
+    if k > 1:
+        var = sum((m - media_cluster) ** 2 for m in medias_partida) / (k - 1)
+        erro_padrao = math.sqrt(var / k)
+    else:
+        # Um cluster só: não há de onde tirar dispersão. `None`, nunca 0.0 — erro
+        # padrão zero afirmaria certeza absoluta a partir de nada (P6).
+        erro_padrao = None
+
+    ic_baixo = ic_alto = None
+    if erro_padrao is not None:
+        ic_baixo = media_cluster - _Z95 * erro_padrao
+        ic_alto = media_cluster + _Z95 * erro_padrao
+    return {
+        "n": n, "n_clusters": k,
+        "clv_medio": media, "clv_desvio": desvio,
+        "clv_medio_cluster": media_cluster,
+        "erro_padrao": erro_padrao, "ic95_baixo": ic_baixo, "ic95_alto": ic_alto,
+    }
+
+
 def agregar_celulas(
     candidatos: list[dict], *, amostra_minima: int = AMOSTRA_MINIMA
 ) -> list[dict]:
-    """Agrega os value_bets provisórios em células liga × mercado × faixa de odd."""
-    grupos: dict[tuple[str, str, str], list[float]] = defaultdict(list)
+    """Agrega os value_bets em células liga × mercado × LINHA × faixa de odd.
+
+    A linha entra na chave porque é parte da identidade do mercado na produção
+    (`odds_snapshots` guarda mercado e linha separados) e porque OU 2.5 e OU 3.5 são
+    mercados diferentes — agregá-los sob "ou" misturaria evidências de coisas que
+    não são a mesma coisa. Para o 1X2 a linha é `None` e a chave degenera na antiga.
+
+    A célula devolvida é a MESMA unidade que `mercados_homologados` sabe representar
+    (migration 0020): é isso que permite a evidência autorizar a operação.
+    """
+    grupos: dict[tuple, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for c in candidatos:
         if c["value_bet_provisional"]:
-            grupos[(c["liga"], c["mercado"], c["faixa_odd"])].append(c["clv_pct"])
+            chave = (c["liga"], c["mercado"], c.get("linha"), c["faixa_odd"])
+            grupos[chave][c.get("partida") or f"?{id(c)}"].append(c["clv_pct"])
 
     celulas: list[dict] = []
-    for (liga, merc, faixa), clvs in sorted(grupos.items()):
-        n = len(clvs)
-        media = sum(clvs) / n
-        desvio = math.sqrt(sum((x - media) ** 2 for x in clvs) / n) if n > 1 else 0.0
+    for (liga, merc, linha, faixa) in sorted(grupos, key=lambda k: tuple(str(x) for x in k)):
+        est = _estatistica(grupos[(liga, merc, linha, faixa)])
+        # `suficiente` continua sendo a P12 (pétrea): sem 200 observações não se
+        # conclui NADA. `significante` é uma leitura ADICIONAL e mais exigente — o
+        # limite inferior do IC95 acima de zero. Qual das duas autoriza homologar é
+        # decisão de rito (PC-SIGNIFICANCIA), não deste código.
+        significante = est["ic95_baixo"] is not None and est["ic95_baixo"] > 0.0
         celulas.append({
-            "liga": liga,
-            "mercado": merc,
-            "faixa_odd": faixa,
-            "n": n,
-            "clv_medio": media,
-            "clv_desvio": desvio,
-            "suficiente": n >= amostra_minima,
+            "liga": liga, "mercado": merc, "linha": linha, "faixa_odd": faixa,
+            **est,
+            "suficiente": est["n"] >= amostra_minima,
+            "significante": significante,
         })
     return celulas
 
@@ -208,11 +283,13 @@ def agregar_celulas(
 # ---------------- saídas (relatório legível + estruturado) ----------------
 
 _CAMPOS_CANDIDATO = [
-    "liga", "mercado", "selecao", "linha", "data", "faixa_odd",
+    "liga", "mercado", "selecao", "linha", "partida", "data", "faixa_odd",
     "p_justa_abertura", "odd_venue", "edge_liquido",
     "p_ref_fechamento", "clv_pct", "value_bet_provisional", "resultado_ah",
 ]
-_CAMPOS_CELULA = ["liga", "mercado", "faixa_odd", "n", "clv_medio", "clv_desvio", "suficiente"]
+_CAMPOS_CELULA = ["liga", "mercado", "linha", "faixa_odd", "n", "n_clusters",
+                  "clv_medio", "clv_desvio", "clv_medio_cluster", "erro_padrao",
+                  "ic95_baixo", "ic95_alto", "suficiente", "significante"]
 
 
 def _escrever_csv(caminho: str, campos: list[str], linhas: list[dict]) -> None:
@@ -252,21 +329,45 @@ Parâmetros (provisórios, Doutrina §4 — a calibrar): edge_min={meta.get('edg
   abertura == fechamento (comparar handicaps diferentes seria falso). A coluna
   `resultado_ah` (liquidação por decomposição em meias-apostas) é INFORMATIVA —
   não entra na decisão nem no CLV (o KPI é o CLV, P8).
-- **Amostra (P12).** Célula (liga × mercado × faixa de odd) com n < {meta.get('amostra_minima', AMOSTRA_MINIMA)}
-  aparece como **amostra insuficiente**, sem conclusão.
+- **Amostra (P12).** Célula (liga × mercado × linha × faixa de odd) com
+  n < {meta.get('amostra_minima', AMOSTRA_MINIMA)} aparece como **amostra insuficiente**, sem conclusão.
+- **Significância.** O IC95 usa erro padrão AGRUPADO POR PARTIDA: as seleções de um
+  mesmo jogo (H/D/A, over/under, os dois lados do AH) saem do mesmo book contra o
+  mesmo fechamento e não são observações independentes. Tratá-las como livres
+  encolheria o erro padrão e faria a célula parecer significante antes de ser.
+  A coluna `jogos` é o tamanho de amostra que sustenta a conclusão; `n` é informativo.
+- **O VENUE HISTÓRICO NÃO É O VENUE REAL — e nenhum código conserta isso.** O melhor
+  preço aqui sai de casas europeias do Football-Data (e, em OU/AH, essencialmente do
+  Bet365). Isso NÃO prova que o mesmo preço estava disponível na operação brasileira,
+  na conta do Daniel, no mesmo produto, no mesmo instante e com os mesmos limites.
+  O backtest calibra a HIPÓTESE (existe CLV nesta célula?); quem prova a execução é o
+  MODO SOMBRA (E7), com preço real capturado do venue real. Homologar um mercado com
+  base só neste relatório é afirmar sobre um mercado que não foi medido.
 - **Brasileirão ausente.** O Football-Data não cobre o Brasileirão — lacuna
   registrada como pendência do D6 no PLANO_MVP.
 """
 
 
 def _tabela_celulas(celulas: list[dict]) -> str:
-    linhas = ["| liga | mercado | faixa odd | n | CLV médio | desvio | conclusão |",
-              "|---|---|---|---:|---:|---:|---|"]
+    linhas = ["| liga | mercado | linha | faixa odd | n | jogos | CLV médio | IC95 | conclusão |",
+              "|---|---|---:|---|---:|---:|---:|---|---|"]
     for c in celulas:
-        conclusao = "OK" if c["suficiente"] else "amostra insuficiente"
+        if not c["suficiente"]:
+            conclusao = "amostra insuficiente"
+        elif c["significante"]:
+            conclusao = "CLV > 0 com IC95"
+        else:
+            conclusao = "sem significância"
+        if c["ic95_baixo"] is None:
+            ic = "—"
+        else:
+            ic = f"[{c['ic95_baixo']:+.2f}%, {c['ic95_alto']:+.2f}%]"
+        # `clv_*` JÁ estão em pontos percentuais (mesma unidade da produção): o
+        # ×100 daqui era o par do campo que guardava fração — os dois sumiram juntos.
         linhas.append(
-            f"| {c['liga']} | {c['mercado']} | {c['faixa_odd']} | {c['n']} | "
-            f"{c['clv_medio']*100:.2f}% | {c['clv_desvio']*100:.2f}% | {conclusao} |"
+            f"| {c['liga']} | {c['mercado']} | {c['linha'] if c['linha'] is not None else '—'} | "
+            f"{c['faixa_odd']} | {c['n']} | {c['n_clusters']} | "
+            f"{c['clv_medio']:.2f}% | {ic} | {conclusao} |"
         )
     return "\n".join(linhas)
 

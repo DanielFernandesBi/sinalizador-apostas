@@ -14,18 +14,16 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterator, Optional
 
+from sinalizador.comum.ligas import POR_SPORT_KEY
+
 _log = logging.getLogger(__name__)
 
-# sport_key da The Odds API → rótulo de liga (as 6 europeias do backtest E6.1;
-# alinhado a football_data.LIGAS). Ampliar aqui é decisão de escopo (D6).
-SPORTS_ALVO: dict[str, str] = {
-    "soccer_epl": "Premier League",
-    "soccer_spain_la_liga": "La Liga",
-    "soccer_italy_serie_a": "Serie A",
-    "soccer_germany_bundesliga": "Bundesliga",
-    "soccer_france_ligue_one": "Ligue 1",
-    "soccer_portugal_primeira_liga": "Primeira Liga",
-}
+# sport_key da The Odds API → rótulo de liga. NÃO se declara aqui: vem do contrato
+# único (`comum/ligas.py`), o mesmo que o backtest consome. O comentário anterior
+# afirmava estar "alinhado a football_data.LIGAS" e NÃO estava — os rótulos diferiam,
+# e a afirmação falsa tornava o desalinhamento invisível na leitura.
+# Ampliar o escopo de ligas é decisão de rito (D6): mexe-se no contrato, não aqui.
+SPORTS_ALVO: dict[str, str] = dict(POR_SPORT_KEY)
 
 # market key da The Odds API → mercado do sistema (Doutrina P2: 1x2, AH, OU gols).
 MERCADOS: dict[str, str] = {

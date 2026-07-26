@@ -52,6 +52,7 @@ from sinalizador.comum.modelos import Dossie
 from .abortos import deve_rastrear_clv, registrar_aborto
 from .dossie import construir_dossie, enfileirar_sinal
 from .edge import comissao_fracao, edge_liquido, odd_minima_aceitavel
+from .homologacao import TabelaHomologacao
 from .gatilhos import (
     classificar_elegibilidade,
     detectar_anomalia,
@@ -257,13 +258,16 @@ def avaliar_grupo(
     # explícita) ou SEM linha em `mercados_homologados` (FALHA DE CONFIGURAÇÃO — a
     # ausência não é licença implícita para calibrar) não roda gate nem gera candidato:
     # pula o grupo com um marcador fail-loud no log de abortos (P7).
+    # A FAIXA DE ODD só é decidível DEPOIS do line shopping (a faixa é propriedade do
+    # preço, e o preço é por seleção). Aqui responde-se apenas o que existe sem preço:
+    # há alguma célula para (liga, mercado, linha)? Alguma ainda opera? A decisão fina
+    # — inclusive homologado vs. candidato_sombra — desceu para o candidato.
     liga = grupo.evento.get("liga", "")
-    status_homolog = homolog.get((liga, grupo.mercado))
-    if status_homolog not in ("homologado", "backtest", "calibracao"):
-        _marcar_grupo_nao_autorizado(banco, grupo, status_homolog, resumo,
+    status_grupo = homolog.status_do_grupo(liga, grupo.mercado, grupo.linha)
+    if status_grupo != "operavel":
+        _marcar_grupo_nao_autorizado(banco, grupo, status_grupo, resumo,
                                      chaves_abortos=chaves_abortos)
         return
-    modo_sombra_homolog = status_homolog != "homologado"  # backtest/calibração → candidato_sombra
 
     # Referência: a última REVISÃO COMPLETA (P0.3). Antes pegava-se o último preço de
     # CADA seleção independentemente, o que monta um book que nunca existiu sempre que
@@ -423,11 +427,23 @@ def avaliar_grupo(
                            edge, gates, resumo, chave=chave, chaves_abortos=chaves_abortos)
             continue
 
-        # Passou TODOS os gates mecânicos. Homologação (Doutrina P2 / achado 8):
-        # mercado em 'backtest' (calibração) → candidato_sombra — rastreado até o
-        # fechamento SÓ para medir CLV (alimenta E6.4), nunca sinal nem cartão. Só
-        # mercado 'homologado' é enfileirado como sinal (segue para L2/L3).
-        if modo_sombra_homolog:
+        # Passou TODOS os gates mecânicos. Homologação da CÉLULA (Doutrina P2 /
+        # achado 8), agora com a odd na mão: a célula mais específica que cobre
+        # (liga, mercado, linha, odd) decide. 'homologado' → sinal; 'backtest'/
+        # 'calibracao' → candidato_sombra (rastreado até o fechamento SÓ para medir
+        # CLV, nunca sinal nem cartão); retirada ou lacuna nesta faixa → nem isso.
+        status_celula = homolog.status(liga, grupo.mercado,
+                                       linha=grupo.linha, odd=melhor["odd"])
+        if status_celula not in ("homologado", "backtest", "calibracao"):
+            # A faixa DESTE preço está retirada (ou descoberta), embora o mercado
+            # tenha caminho. Não é candidato_sombra: sombra é calibração autorizada,
+            # e aqui não há autorização nenhuma para esta faixa.
+            _abortar_dedup(banco, grupo, sel,
+                           f"faixa_{status_celula or 'nao_configurada'}",
+                           dossie_parcial, edge, gates, resumo,
+                           chave=chave, chaves_abortos=chaves_abortos)
+            continue
+        if status_celula != "homologado":
             _registrar_candidato_sombra(banco, grupo, sel, dossie_parcial, resumo,
                                         chave=chave, chaves_abortos=chaves_abortos)
             continue
@@ -805,7 +821,7 @@ def rodar_l1(
     # método) → {} → TODO mercado cai em "falha de configuração" (fail-closed: P2 não
     # autoriza calibração implícita — nenhum sinal sem homologação declarada).
     _homolog = getattr(banco, "homologacao_mercados", None)
-    homolog: dict[tuple[str, str], str] = _homolog() if _homolog else {}
+    homolog = TabelaHomologacao.de(_homolog() if _homolog else None)
 
     exposicao_aberta = banco.exposicao_aberta()
     # P0.8: uma leitura por ciclo; o que o ciclo emite entra aqui, não no banco.

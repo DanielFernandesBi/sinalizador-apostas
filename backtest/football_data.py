@@ -19,17 +19,17 @@ import io
 import urllib.request
 from dataclasses import dataclass
 
+from sinalizador.comum.ligas import POR_DIV
+
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
 
-# Ligas bem cobertas pelo Football-Data (divisão principal de cada país).
-LIGAS: dict[str, str] = {
-    "E0": "Inglaterra — Premier League",
-    "SP1": "Espanha — La Liga",
-    "I1": "Itália — Serie A",
-    "D1": "Alemanha — Bundesliga",
-    "F1": "França — Ligue 1",
-    "P1": "Portugal — Primeira Liga",
-}
+# Divisão do Football-Data → rótulo de liga. NÃO se declara aqui: vem do contrato
+# único (`comum/ligas.py`). Antes eram duas tabelas independentes para o mesmo
+# conceito, e o backtest rotulava "Inglaterra — Premier League" enquanto a produção
+# gravava "Premier League" — nenhuma célula do backtest casava com liga nenhuma de
+# produção, e a homologação (que é chaveada por `eventos.liga`) nunca poderia ser
+# alimentada pela evidência que a autoriza.
+LIGAS: dict[str, str] = dict(POR_DIV)
 
 
 @dataclass(frozen=True)
@@ -42,8 +42,18 @@ class SelecaoMercado:
 
 @dataclass(frozen=True)
 class Mercado:
+    """`nome` + `linha` seguem EXATAMENTE o vocabulário da produção.
+
+    O backtest chamava este mercado de `"ou_2.5"` — um nome que não existe em lugar
+    nenhum do sistema. A produção grava `mercado='ou'` e `linha=2.5` em
+    `odds_snapshots` (ver `l0_captura/mapeamento.MERCADOS`), e a homologação é
+    chaveada pelo mesmo par. Com o nome fundido, a célula do backtest não casava
+    com nada — pelo mesmo motivo dos rótulos de liga, e com o mesmo efeito: a prova
+    não alcança a autorização.
+    """
     nome: str
     selecoes: tuple[SelecaoMercado, ...]
+    linha: float | None = None
 
 
 # Mercados candidatos à homologação (Doutrina P2). 1X2 e OU 2.5 seguem a estrutura
@@ -58,10 +68,10 @@ MERCADOS: tuple[Mercado, ...] = (
     # OU 2.5: no Football-Data a única casa de varejo consistente é o Bet365,
     # então o "melhor preço entre as demais casas" degenera para o B365 (limitação
     # de cobertura declarada no relatório).
-    Mercado("ou_2.5", (
+    Mercado("ou", (
         SelecaoMercado("over", "P>2.5", "PC>2.5", ("B365>2.5",)),
         SelecaoMercado("under", "P<2.5", "PC<2.5", ("B365<2.5",)),
-    )),
+    ), linha=2.5),
 )
 
 

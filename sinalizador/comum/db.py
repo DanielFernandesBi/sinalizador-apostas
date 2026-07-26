@@ -210,29 +210,26 @@ class Banco:
         )
         return {r["chave_candidato"] for r in (resp.data or []) if r.get("chave_candidato")}
 
-    def homologacao_mercados(self) -> dict[tuple[str, str], str]:
-        """Status de homologação por (liga, mercado) — Doutrina P2 / achado 8.
+    def homologacao_mercados(self) -> list[dict[str, Any]]:
+        """Células de `mercados_homologados` — Doutrina P2 / achado 8 / migration 0020.
 
-        Chave canônica: (`eventos.liga`, mercado em {'1x2','ah','ou'} — o mesmo string
-        que o L0 grava em `odds_snapshots.mercado`; o comentário do schema 0001
-        ('ou_gols') é ilustrativo, não há CHECK em `mercado`). Valor = `status`
-        ('backtest'|'homologado'|'suspenso'|'caducado'); `suspenso_em` preenchido força
-        'suspenso'. Só 'homologado' autoriza o caminho normal (L2/L3); 'backtest' →
-        candidato_sombra (só CLV). A AUSÊNCIA de linha NÃO aparece aqui — o L1 a trata
-        como falha de configuração (P2 não autoriza calibração implícita)."""
+        Devolve as LINHAS, não um mapa (liga, mercado)→status: desde a 0020 a unidade
+        é a CÉLULA (liga, mercado, linha, faixa de odd), a mesma que o backtest avalia.
+        Um mapa não conseguiria representar "1x2 em calibração, mas a faixa 2.00-2.60
+        homologada" — e é justamente essa distinção que impede a autorização de
+        afirmar mais do que a evidência sustenta.
+
+        A resolução (célula mais específica que cobre o candidato) é do núcleo, em
+        `l1_gatilhos/homologacao.TabelaHomologacao` — espelho de `fn_status_homologacao`.
+        `suspenso_em` preenchido continua forçando 'suspenso'. A AUSÊNCIA de célula não
+        aparece aqui: o L1 a trata como falha de configuração (P2 não autoriza
+        calibração implícita)."""
         resp = (
             self._c.table("mercados_homologados")
-            .select("liga,mercado,status,suspenso_em")
+            .select("liga,mercado,linha,odd_min,odd_max,status,suspenso_em")
             .execute()
         )
-        out: dict[tuple[str, str], str] = {}
-        for r in (resp.data or []):
-            liga, mercado = r.get("liga"), r.get("mercado")
-            if not liga or not mercado:
-                continue
-            status = "suspenso" if r.get("suspenso_em") else (r.get("status") or "")
-            out[(str(liga), str(mercado))] = status
-        return out
+        return resp.data or []
 
     def sinais_aguardando_crivo(self, limite: int = 50,
                                 agora_iso: Optional[str] = None) -> list[dict[str, Any]]:
