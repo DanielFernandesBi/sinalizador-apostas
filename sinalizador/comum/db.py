@@ -681,6 +681,27 @@ class Banco:
             "p_motivo": motivo, "p_agora": agora_iso or _agora_utc_iso(),
         })
 
+    # ---------------- EPISÓDIO DE SILÊNCIO DE DAEMON (P1.5) ----------------
+
+    def abrir_episodio_silencio(self, daemon: str, silencio_s=None, limiar_s=None,
+                                agora_iso: Optional[str] = None) -> dict[str, Any]:
+        """Abre o episódio de queda do daemon. `abriu=False` = a MESMA queda já está
+        registrada, e alertar de novo seria um aviso por ciclo do vigia."""
+        return self._rpc("fn_abrir_episodio_silencio", {
+            "p_daemon": daemon,
+            "p_silencio_s": None if silencio_s is None else float(silencio_s),
+            "p_limiar_s": 0 if limiar_s is None else float(limiar_s),
+            "p_agora": agora_iso or _agora_utc_iso(),
+        })
+
+    def encerrar_episodio_silencio(self, daemon: str,
+                                   agora_iso: Optional[str] = None) -> dict[str, Any]:
+        """Fecha o episódio do daemon que voltou. `encerrou=False` é o caso NORMAL
+        (ele nunca caiu) — é o que impede um alerta de 'voltou' a cada ciclo."""
+        return self._rpc("fn_encerrar_episodio_silencio", {
+            "p_daemon": daemon, "p_agora": agora_iso or _agora_utc_iso(),
+        })
+
     # ---------------- EXPOSIÇÃO DE PAPEL (Sugestão nº 13 / P0.8) ----------------
 
     def reservar_exposicao_papel(self, sinal_id: str,

@@ -130,12 +130,46 @@ def _cmd_sonda(args) -> int:
     return 0
 
 
+def _parse_daemon(spec: str) -> vigia.DaemonEsperado:
+    """`nome:cadencia_s[:tolerancia_ciclos]` — o roster tem que espelhar as units."""
+    partes = spec.split(":")
+    if len(partes) < 2:
+        raise argparse.ArgumentTypeError(
+            f"--daemon espera nome:cadencia_s[:tolerancia_ciclos], recebi {spec!r}")
+    nome, cadencia = partes[0], float(partes[1])
+    tol = float(partes[2]) if len(partes) > 2 else vigia.TOLERANCIA_CICLOS_PADRAO
+    return vigia.DaemonEsperado(nome, cadencia, tolerancia_ciclos=tol)
+
+
+def _bot_do_vigia():
+    """Bot para o envio direto quando o daemon mudo é o PRÓPRIO L3.
+
+    Sem token configurado o vigia segue funcionando pela outbox — só perde a saída
+    de emergência. Por isso é `carregar_config()` opcional, não `exigir`: não faz
+    sentido derrubar toda a vigilância por falta do canal de exceção.
+    """
+    cfg = carregar_config()
+    if not (cfg.telegram_bot_token and cfg.telegram_chat_id):
+        _log.warning("vigia sem bot: alerta sobre o L3 dependerá da outbox que o "
+                     "próprio L3 esvazia (configure telegram_* para a saída direta)")
+        return None
+    from sinalizador.l3_notifica.bot import BotTelegram
+    return BotTelegram(cfg.telegram_bot_token, cfg.telegram_chat_id)
+
+
 def _cmd_vigia(args) -> int:
     banco = Banco()
+    if args.daemon:
+        esperados = tuple(args.daemon)
+    elif args.esperados:
+        esperados = tuple(args.esperados)
+    else:
+        esperados = vigia.ROSTER_PADRAO
+    bot = None if args.sem_bot else _bot_do_vigia()
 
     def rodar() -> None:
         mudos = vigia.rodar_vigia(banco, limiar_s=args.limiar_s,
-                                  esperados=tuple(args.esperados) if args.esperados else vigia.DAEMONS_ESPERADOS_PADRAO)
+                                  esperados=esperados, bot=bot)
         print(f"[vigia] mudos={[m['daemon'] for m in mudos] or 'nenhum'}")
 
     _loop(rodar, intervalo_s=args.intervalo_s if not args.once else 0)
@@ -168,11 +202,19 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--caminho", required=True, help="rota da OddsPapi (ver doc); ex.: v1/odds")
     ps.add_argument("--param", nargs="*", default=None, help="k=v repetível (ex.: sport=soccer)")
 
-    pv = sub.add_parser("vigia", help="E1.5 — alerta daemon mudo")
+    pv = sub.add_parser("vigia", help="E1.5 — alerta daemon mudo (pipeline inteiro)")
     pv.add_argument("--once", action="store_true")
     pv.add_argument("--intervalo-s", type=float, default=1800.0)
-    pv.add_argument("--limiar-s", type=float, default=vigia.LIMIAR_SILENCIO_S_PADRAO)
-    pv.add_argument("--esperados", nargs="+", default=None)
+    pv.add_argument("--limiar-s", type=float, default=None,
+                    help="sobrepõe o limiar de TODOS; sem isto, cada daemon é medido "
+                         "contra a própria cadência (roster)")
+    pv.add_argument("--daemon", nargs="+", type=_parse_daemon, default=None,
+                    help="roster explícito: nome:cadencia_s[:tolerancia_ciclos] "
+                         "(ex.: l2:30:4). Tem que espelhar as units do systemd")
+    pv.add_argument("--esperados", nargs="+", default=None,
+                    help="só os NOMES (usa a cadência conhecida de cada um)")
+    pv.add_argument("--sem-bot", action="store_true",
+                    help="não usa a saída direta do Telegram nem quando o L3 é o mudo")
 
     args = ap.parse_args(argv)
     if args.cmd == "referencia":
