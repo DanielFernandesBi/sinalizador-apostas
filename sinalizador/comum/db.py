@@ -16,7 +16,6 @@ Operações expostas:
   - registrar_aposta(...) / liquidar_e_lancar(...)   E5.3/E5.4: TRANSACIONAIS (RPC, migration 0004)
   - fechar_tip(...)                        único preenchimento de fechamento em `tips`
   - marcar_notificacao_entregue(id)        `notificacoes` aceita UPDATE (não é append-only)
-  - marcar_evento_encerrado(id)            `eventos.status` (L4: sai da fila de fechamento)
   - publicar_config(chave, valor)          publica nova versão vigente de governança (rito)
   - reservar_exposicao_papel(sinal_id) / baixar_exposicao_papel(...)  posição de papel (P0.8)
   - gates_vigentes() / config_vigente() / casa_por_nome() / exposicao_aberta()    leituras
@@ -27,8 +26,18 @@ Operações expostas:
   - sinais_aguardando_crivo()                                                        leitura (L2)
   - sinais_por_status() / crivo_do_sinal() / ultimo_snapshot_venue() /
     notificacoes_do_sinal() / notificacoes_pendentes()                              leituras (L3)
-  - eventos_iniciados_sem_status_final() / snapshots_do_evento() /
-    sinais_do_evento() / abortos_rastreados_do_evento() / clv_ids_registrados()     leituras (L4)
+  - fila_fechamento() / itens_com_desfecho() / snapshots_do_evento() /
+    sinais_do_evento() / abortos_rastreados_do_evento()                             leituras (L4)
+
+Três métodos do fechamento ANTIGO foram removidos (auditoria item 7), e não por
+higiene: `marcar_evento_encerrado` escrevia `eventos.status='encerrado'` e
+`eventos_iniciados_sem_status_final` LIA esse estado. A migration 0007 trocou o
+marcador do L4 por `clv_eventos_finalizados`, então ninguém mais escrevia — e o
+leitor sobrevivente, se voltasse a ser chamado, devolveria TODO evento iniciado,
+para sempre. Método vivo que lê estado que ninguém escreve não é código morto: é
+armadilha carregada. `clv_ids_registrados` (varria `clv_log`) foi substituído por
+`itens_com_desfecho`, que lê `clv_resultados` — a fonte terminal desde a Sugestão
+nº 10.
 """
 from __future__ import annotations
 
@@ -358,20 +367,6 @@ class Banco:
 
     # ---------------- LEITURA do L4 (fechamento / CLV) ----------------
 
-    def eventos_iniciados_sem_status_final(self, ate_iso: str, limite: int = 200) -> list[dict[str, Any]]:
-        """Eventos cujo início já passou (`inicio_utc <= ate_iso`) e ainda não estão
-        'encerrado' — candidatos ao fechamento de CLV (L4)."""
-        resp = (
-            self._c.table("eventos")
-            .select("*")
-            .lte("inicio_utc", ate_iso)
-            .neq("status", "encerrado")
-            .order("inicio_utc")
-            .limit(limite)
-            .execute()
-        )
-        return resp.data or []
-
     def snapshots_do_evento(
         self, evento_id: str, casa_ids: Optional[list[str]] = None, ate_iso: Optional[str] = None
     ) -> list[dict[str, Any]]:
@@ -402,40 +397,6 @@ class Banco:
             .execute()
         )
         return resp.data or []
-
-    def clv_ids_registrados(
-        self, *, sinal_ids: Sequence[str] = (), aborto_ids: Sequence[int] = ()
-    ) -> tuple[set, set]:
-        """Quais destes ids JÁ têm CLV — caminho rápido do fechamento (achado #2.1).
-
-        Recebe os ids do EVENTO em fechamento e pergunta só por eles (`in_`), em vez
-        de varrer `clv_log` inteira: a versão anterior recebia `evento_id` e o
-        IGNORAVA, lendo a tabela toda a cada evento, a cada ciclo — e `clv_log` só
-        cresce (a meta é ≥200 amostras por célula liga×mercado).
-
-        Lista vazia não vira consulta (nem ida à rede). Isto é OTIMIZAÇÃO, não a
-        garantia: a unicidade real é dos índices `ux_clv_sinal`/`ux_clv_aborto`
-        (migration 0005), que barram a corrida entre esta leitura e o INSERT.
-        """
-        com_sinal: set = set()
-        com_aborto: set = set()
-        if sinal_ids:
-            resp = (
-                self._c.table("clv_log")
-                .select("sinal_id")
-                .in_("sinal_id", list(sinal_ids))
-                .execute()
-            )
-            com_sinal = {r["sinal_id"] for r in (resp.data or []) if r.get("sinal_id")}
-        if aborto_ids:
-            resp = (
-                self._c.table("clv_log")
-                .select("aborto_l1_id")
-                .in_("aborto_l1_id", list(aborto_ids))
-                .execute()
-            )
-            com_aborto = {r["aborto_l1_id"] for r in (resp.data or []) if r.get("aborto_l1_id")}
-        return com_sinal, com_aborto
 
     # ---------------- L4: desfecho terminal por item (Sugestão nº 10) ----------------
 
@@ -489,11 +450,6 @@ class Banco:
         return self._rpc("fn_finalizar_evento_clv", {
             "p_evento_id": evento_id, "p_detalhe": detalhe or {},
         })
-
-    def marcar_evento_encerrado(self, evento_id: str) -> None:
-        """`eventos.status` não é imutável no schema — o fechamento marca 'encerrado'
-        para o evento sair da fila do L4."""
-        self._c.table("eventos").update({"status": "encerrado"}).eq("id", evento_id).execute()
 
     def registrar_aposta(
         self, *, sinal_id: str, casa_id: str, odd_executada: Any, stake_valor: Any

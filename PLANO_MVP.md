@@ -10,12 +10,63 @@
 
 ---
 
-## ESTADO ATUAL (21/07/2026)
+<!-- ESTADO:INICIO — gerado por `python -m scripts.estado --escrever`; não editar à mão -->
 
-- [x] Doutrina redigida e confirmada (repo/banco: **v0.1.5**, Sugestões nº 1, nº 3, nº 4, nº 5 e nº 6 — §-sombra)
-- [x] Manual do Crivo L2 redigido e confirmado (repo/banco: **v0.1.1**, Sugestão nº 2)
-- [x] Schema v0.1 pronto (16 tabelas, 6 views, triggers de imutabilidade)
-- [x] **Projeto Supabase criado (jxveebxywadyxuhixcxt); migration 0001 aplicada.** Governança sincronizada repo→banco em `config_sistema` (**doutrina v6** = v0.1.5 e manual v2 verbatim, conferidos por md5). **16 gates vigentes** na tabela `gates`.
+## ESTADO ATUAL
+
+**Este bloco é gerado.** Os números saem do repositório, não da memória de quem escreveu — e `tests/test_estado.py` falha se o documento divergir da fonte. Antes disso o estado era prosa escrita à mão em vários pontos, e o cabeçalho ficou dez versões de Doutrina atrasado sem que nada reclamasse.
+
+### Governança
+
+- Doutrina (repo): **v0.1.14**
+- Manual do Crivo L2 (repo): **v0.1.2**
+- Gates declarados em `gates.py`: **18**
+- A versão VIGENTE no banco é a do último `python -m scripts.sync_governanca`; divergir do repo é o normal entre o commit e o sync.
+
+### Schema
+
+- Migrations no repo: **21** (`0001_schema_v0.1.sql` … `0021_seed_calibracao.sql`)
+- Tabelas: **23** · Views: **10** · Funções SQL: **33**
+
+### Código
+
+- `comum/`: `config`, `db`, `dinheiro`, `erros`, `gates`, `ligas`, `log`, `modelos`, `rede`, `significancia`, `tempo`
+- `l0_captura/`: `cadencia`, `captura`, `cli`, `cobertura`, `mapeamento`, `persistencia`, `referencia`, `sonda_oddspapi`, `the_odds_api`, `varejo`, `vigia`
+- `l1_gatilhos/`: `abortos`, `cli`, `devig`, `dossie`, `edge`, `gatilhos`, `homologacao`, `motor_gates`, `orquestrador`, `parser_tips`, `revisao`
+- `l2_crivo/`: `cli`, `crivo`, `modelo`, `smoke`
+- `l3_notifica/`: `bot`, `cartao`, `cli`, `notifica`
+- `l4_fechamento/`: `cli`, `clv`, `relatorio`
+
+- Funções de teste: **390** (o total do pytest é maior — parametrização multiplica casos)
+
+### Maturidade
+
+Quatro degraus, porque neste projeto a diferença é gritante: quase tudo está provado contra dublê, e **nada** alcançou aceite operacional — o primeiro kickoff é 15/08/2026, então não existe dado real para o pipeline processar. Subir de degrau exige evidência datada; descer não precisa de cerimônia.
+
+| componente | degrau | evidência |
+|---|---|---|
+| L0 captura (referência/varejo) | **validado em integração** | capturou 61 eventos reais da The Odds API; nenhum dentro do horizonte D+2 |
+| L1 gatilhos e gates | **testado com fake** | suíte contra dublês; nunca processou um ciclo com evento dentro do horizonte |
+| L2 crivo | **validado em integração** | `cli smoke` faz uma chamada real ao modelo contra o Manual vigente |
+| L3 notificação | **testado com fake** | outbox e cartão provados contra bot dublê |
+| L4 fechamento e CLV | **testado com fake** | nenhuma linha de fechamento real — sem jogo encerrado |
+| Schema e funções SQL | **validado em integração** | cada migration verificada no banco real em transação com rollback + controle negativo |
+| Vigia de daemons | **testado com fake** | episódios provados contra dublê; nunca rodou como daemon |
+| Backtest (E6.1–E6.3) | **testado com fake** | replay provado contra CSV sintético; não rodou sobre a base Football-Data real |
+| Homologação de mercados (E6.4) | **implementado** | critério e resolvedor prontos; NADA promove — sem dado, e o seed está todo em calibração |
+| Modo sombra ponta a ponta (E7) | **implementado** | nunca exercido: primeiro kickoff em 15/08/2026 |
+
+**Em aceite operacional: 0 de 10.** Enquanto esse número for zero, nenhuma conclusão sobre o comportamento do sistema em produção está disponível — nem boa nem ruim.
+
+<!-- ESTADO:FIM -->
+
+---
+
+## HISTÓRICO DE CICLOS
+
+Registro do que foi feito, em ordem. O ESTADO acima é derivado do repo; isto
+aqui é memória, e memória não se regenera — só cresce.
+
 - [x] **E3 (crivo L2) implementado** — `l2_crivo/` (modelo Anthropic injetável, crivo com validação estrita + passthrough + fila). 13 testes de crivo.
 - [x] **Sugestão nº 6 (executável) + Sugestão nº 7 + higiene de saída** — (a) perfil de captura da `eu` grava TODAS as casas classificadas (Pinnacle referência, `betfair_ex_*` exchange-proxy 6,5%, demais varejo) na mesma resposta (crédito zero adicional); (b) `banca_papel` (config_sistema, R$ 1.000) dimensiona o modo sombra quando o ledger real está vazio, com o dossiê marcando `banca_origem=papel` (ledger real intocado até o E7); (c) logger `httpx`→WARNING + snapshots em lote (1 POST por ciclo).
 - [x] **Cadência adaptativa do L0** (`l0_captura/cadencia.py` + `cli.py --adaptativo`): 5/10/60 min por proximidade do jogo, só ligas com jogo em D+2; calendário via `/events` (custo 0). Corta o consumo de créditos em ordem de grandeza — dimensiona o tier pago com consumo real.
@@ -199,6 +250,7 @@
 - [x] **PC-GRANULARIDADE — resolvida pela Sugestão nº 16 (rito, 26/07/2026): coleta larga, homologação estreita.** A auditoria tratou como uma decisão só o que são **duas, com perfis de risco opostos** — escopo de COLETA e escopo de HOMOLOGAÇÃO. Em `backtest`, o candidato que passa em todos os gates vira `candidato_sombra`: medido até o fechamento, **nunca** sinal, status confirmado ou cartão. O risco de coletar demais é exatamente zero, e mais dado é estritamente melhor: cada célula não semeada é amostra que não começa a acumular hoje e não estará pronta quando a temporada avançar — e com o primeiro jogo em 15/08 e P12 exigindo 200, tempo é o recurso escasso. `homologado` é que tem consequência. **Decisão: coleta LARGA (6 ligas × 3 mercados, sem limite de linha nem faixa — migration 0021, tudo em `backtest`), homologação por CÉLULA.** A recomendação da auditoria de adiar OU/AH foi adotada **só para a promoção**, e por um motivo melhor que o dado: no backtest o 1X2 tem sete casas disputando o melhor preço, enquanto OU e AH degeneram para o Bet365 sozinho — a evidência de 1X2 é a menos contaminada pelo PC-VENUE-HISTORICO, logo é a primeira a merecer confiança. OU e AH coletam desde já; só demoram mais para promover. **O que torna a célula segura** (e não fragmentação geradora de mudez): como a célula específica prevalece sobre a geral, homologar é **estritamente aditivo** — recorta-se a faixa provada de dentro de um mercado que continua em `backtest`, e o candidato fora dela segue sendo medido em vez de morrer calado. Verificado no banco: com a faixa 2.00-2.60 promovida, odd 3.00 continua devolvendo `backtest`, não `null`.
 - [x] **PC-SIGNIFICANCIA — resolvida pela Sugestão nº 16 (rito, 26/07/2026): P12 E IC95 > 0, nunca um só.** `n ≥ 200` mede TAMANHO, não evidência: uma célula com n=5000 e média +0,1% ruidosa a satisfaz. O IC95 mede evidência, mas sozinho concluiria sobre amostra pequena de baixa variância, que a P12 (pétrea) proíbe. **Exigem-se os dois**, com o limite inferior do IC95 acima de zero e **erro padrão agrupado por partida**. Na prática o IC95 é o vínculo que morde; a P12 é o piso que não se negocia. **Não reinterpretei a P12:** contá-la em clusters em vez de observações a tornaria mais rígida, e endurecer regra pétrea por conta própria seria atravessar o rito — a P12 segue contando observações, como escrita, e todo o rigor novo entra pelo critério novo. Se o rito quiser mudar a unidade de contagem da P12, é decisão sua. **Uma definição só:** a conta vive em `comum/significancia.py` e é a MESMA que o backtest usa hoje e o E6.4 usará sobre o CLV de sombra — duas cópias divergem, e foi assim que `clv_pct` passou a significar fração de um lado e ponto percentual do outro. **Continuam ausentes de propósito:** estabilidade por temporada e validação fora da amostra — seriam escolhas metodológicas disfarçadas de código, e o backtest histórico não é a fonte que homologa (item (c) da Sugestão nº 16).
 - [x] **PC-MULTIPLICIDADE — resolvida na emenda à Sugestão nº 16 (rito, 26/07/2026; Doutrina v0.1.14).** Defeito **meu**, não da auditoria: fixei o critério por célula e, no mesmo ato, escolhi uma granularidade que cria ~684 células (6 ligas × 6 faixas × [1X2 + linhas de OU + linhas de AH]) — e as duas decisões interagem. Testar centenas de hipóteses a 95% e promover as aprovadas é dragagem de dados. Simulei o tamanho de família que a própria granularidade produz, com CLV verdadeiro ZERO em todas: **~17 células "provam" CLV positivo por rodada, só por ruído** — e cada uma autorizaria dinheiro real (E7). Correção por **Benjamini–Hochberg** (FDR), não Bonferroni: a pergunta é de TRIAGEM (entre muitas células, quais merecem operar?), e o que se quer limitar é a proporção esperada de promoções falsas; Bonferroni nesse tamanho de família não deixaria passar nem célula real. Família = o lote da rodada; célula sem P12 fica de fora para não inflar `m` e endurecer o limiar de quem podia concorrer; com m=1 o limiar volta a ser o original, então é generalização estrita. Controle negativo: removida a correção, o teste do lote de 684 falha promovendo 18 células falsas. Suíte **431 verdes**.
+- [x] **PC-ESTADO-GERADO — o PLANO deixa de apodrecer (auditoria item 7).** As seis divergências apontadas eram reais: cabeçalho parado em 21/07/2026, Doutrina **v0.1.5** (contra v0.1.14), "16 tabelas, 6 views" (contra 23 e 10), "16 gates" (contra 18), contagens de teste incompatíveis, e métodos do L4 antigo ainda documentados na fachada. **Mas a recomendação principal — "atualizar o Plano em um único commit" — não conserta a classe do problema**, e a própria auditoria prova: ela pediu para registrar **11 migrations** quando já eram vinte e uma. Número escrito à mão tem meia-vida de dias. A correção é `scripts/estado.py`, que DERIVA o bloco do repositório (migrations, gates, inventário de schema, versões de governança, módulos, funções de teste), mais `tests/test_estado.py`, que **falha a suíte** quando o documento discorda da fonte. Passar a limpo virou consequência, não causa — e o tripwire pegou drift no primeiro segundo de vida, quando os próprios testes novos mudaram a contagem. **Métodos removidos, e não por higiene:** `marcar_evento_encerrado` ESCREVIA `eventos.status='encerrado'` e `eventos_iniciados_sem_status_final` LIA esse estado; desde a migration 0007 o marcador do L4 é `clv_eventos_finalizados`, então ninguém mais escrevia — e o leitor sobrevivente, se voltasse a ser chamado, devolveria TODO evento iniciado, para sempre. Método vivo lendo estado que ninguém escreve não é código morto, é **armadilha carregada**, e por isso ganhou tripwire próprio. `clv_ids_registrados` (varria `clv_log`) já fora substituído por `itens_com_desfecho` (lê `clv_resultados`). `clv_global` FICOU: está documentada como retenção deliberada para auditoria histórica — obsoleto e deliberado não são a mesma coisa. **Escada de maturidade adotada** (implementado / testado com fake / validado em integração / aceite operacional), com evidência obrigatória por linha e uma trava que falha se algo for declarado `aceite operacional` — hoje **zero de dez**, e enquanto for zero nenhuma conclusão sobre o comportamento em produção está disponível, nem boa nem ruim. Controle negativo em dois eixos (versão adulterada à mão no documento; método-armadilha de volta à fachada): os dois foram pegos. Suíte **440 verdes**.
 - [ ] **PC-VETO-BACKTEST — falta definir o que é "backtest reprovando" (registrado, 26/07/2026).** A Sugestão nº 16 (c) diz que *backtest reprovando VETA e backtest aprovando apenas habilita a medição em sombra* — mas não define reprovar. Hoje isso não morde: o seed da 0021 pôs as 18 células em `backtest` sem consultar relatório nenhum (o backtest ainda não rodou sobre a base real). É aqui que entra a **estabilidade por temporada** que a auditoria pediu: ela não é critério de homologação (a homologação usa CLV de sombra, que terá uma temporada só), é critério de VETO — célula com CLV histórico positivo no agregado mas com sinal invertendo entre temporadas é candidata a não merecer sequer ser medida. **Decidir pelo rito** quando o relatório de backtest existir sobre a base real; até lá, a ausência de veto é conservadora no sentido certo (mede-se mais, autoriza-se nada).
 - [ ] **PC-ROSTER-VIGIA — o roster precisa espelhar as units do systemd (registrado, 26/07/2026).** As cadências do `ROSTER_PADRAO` são os defaults das CLIs. Um daemon subido com outro `--intervalo-s` sem ajuste do roster produz **alerta falso** (limiar curto demais) ou **mudez** (longo demais) — e mudez aqui é pior, porque a vigilância passa a mentir que está vigiando. Hoje o remédio é o `--daemon nome:cadencia[:tolerancia]` da CLI. A cura de verdade é uma fonte única: quando as units da E0.5 existirem, ou o roster sai delas, ou as duas saem de `config_sistema`. **Decidir pelo rito** junto com a E0.5.
 - [ ] **PC-CUSTO-FERRAMENTA — cobrança por uso da busca web (registrado, 25/07/2026).** `custo_usd` cobre tokens (incluindo cache), mas ferramentas server-side têm cobrança por USO, separada. Não cravei número: não consegui confirmar o preço na documentação disponível, e inventar constante de custo é pior que deixar o campo honesto. `crivos.buscas_web` já grava a contagem — falta confirmar o preço e somar. O `cli smoke` mede o consumo real de uma chamada.
