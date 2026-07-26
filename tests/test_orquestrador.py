@@ -799,3 +799,44 @@ def test_mapa_antigo_continua_significando_qualquer_linha_e_qualquer_odd():
     nulos. Ler assim mantém o significado — não é tradução."""
     odd, banco, r = _cenario_com_odd({("Premier League", "1x2"): "homologado"})
     assert r.sinais == 1
+
+
+# ---- itens 8 e 9: semear mercado NÃO liga a coleta sem venue executável ----
+
+def _cenario_sombra(venues_exec):
+    """Candidato de varejo que passa em TODOS os gates, com o mercado em calibração."""
+    p1 = _p1()
+    odd_venue = round(odd_minima_aceitavel(p1, 0.0, 0.02) + 0.15, 3)
+    snaps = _ref_snaps() + [_snap("1", odd_venue, "c-b365", liquidez=100000)]
+    banco = BancoFake(snaps, homologados={("Premier League", "1x2"): "backtest"},
+                      venues_exec=venues_exec)
+    r = rodar_l1(banco, GatesFake(), agora=AGORA, politica=PoliticaVenue.RETAIL_SOMBRA)
+    return banco, r
+
+
+def test_sem_allowlist_o_seed_de_calibracao_nao_coleta_nada():
+    """O acoplamento que derrubou o que EU afirmei na sessão anterior.
+
+    Semear `mercados_homologados` em `backtest` é NECESSÁRIO para o pipeline de
+    evidência, e não é SUFICIENTE. O venue do cartão só pode ser casa da allowlist
+    (achado 6); sem allowlist, `melhor_preco` não tem de onde escolher e o candidato
+    morre ANTES de virar candidato_sombra. Resultado: mercado semeado, gates
+    perfeitos, e zero CLV de calibração — silenciosamente.
+
+    Isto NÃO é defeito a consertar: medir CLV de sombra num preço que o Daniel não
+    pode apostar repetiria, com dado fresco, exatamente o vício do venue histórico
+    (PC-VENUE-HISTORICO). O que estava errado era a mudez ser invisível.
+    """
+    banco, r = _cenario_sombra(None)
+    assert r.sinais == 0
+    assert r.candidatos_sombra == 0, "sem venue executável não há nem calibração"
+    assert r.rastreados_clv == 0
+    assert r.sem_venue_executavel > 0, "a mudez tem que ser CONTADA, não só logada"
+    assert banco.pulsos[-1][1]["sem_venue_executavel"] == r.sem_venue_executavel
+
+
+def test_com_allowlist_o_mesmo_cenario_coleta():
+    """Controle: a única diferença é a allowlist — e ela separa 'não houve
+    oportunidade' de 'não posso apostar em lugar nenhum'."""
+    banco, r = _cenario_sombra(["bet365_br"])
+    assert r.candidatos_sombra == 1 and r.sem_venue_executavel == 0

@@ -97,6 +97,7 @@ class ResumoL1:
     pos_kickoff: int = 0         # P0.1: grupos recusados por partida já iniciada
     nao_autorizados: int = 0     # achado 8: grupo pulado (suspenso/caducado ou sem config)
     venues_inelegiveis: int = 0  # P1.1: havia casa executável, nenhum preço ainda válido
+    sem_venue_executavel: int = 0  # itens 8/9: capturou preço, allowlist não cobre NENHUMA casa
     pulados: list[str] = field(default_factory=list)  # motivos de skip (P6)
 
 
@@ -332,7 +333,14 @@ def avaliar_grupo(
             if not candidatos_venue:
                 motivo = "sem venue capturado"
             elif not executaveis:
+                # MUDEZ ESTRUTURAL, não ausência de oportunidade. Sem allowlist o L1
+                # roda perfeito e não emite NADA — nem sinal, nem candidato_sombra,
+                # logo nem CLV de calibração. O irmão deste caso já tinha contador
+                # (P1.1) e este não tinha: caía só numa lista de texto, invisível no
+                # pulso. Daemon vivo produzindo zero é indistinguível de mercado sem
+                # oportunidade, e essa é a falha que este sistema menos percebe.
                 motivo = "venues capturados, nenhum executável (allowlist)"
+                resumo.sem_venue_executavel += 1
             else:
                 # Havia casa executável — o preço é que não valia mais. Isso é falha
                 # de CAPTURA, não juízo de mercado: não vira aborto (inflaria o log a
@@ -842,6 +850,7 @@ def rodar_l1(
                           "candidatos_sombra": resumo.candidatos_sombra,
                           "nao_autorizados": resumo.nao_autorizados,
                           "venues_inelegiveis": resumo.venues_inelegiveis,
+                          "sem_venue_executavel": resumo.sem_venue_executavel,
                           "politica_venue": politica.value, "banca_origem": banca_origem})
     _log.info("ciclo L1 concluído", extra={"grupos": resumo.grupos, "sinais": resumo.sinais,
                                            "abortos": resumo.abortos})
