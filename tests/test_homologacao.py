@@ -103,3 +103,34 @@ def test_faixas_adjacentes_nao_se_sobrepoem_nem_deixam_buraco(odd, esperado):
         Celula(LIGA, "1x2", "faixa_media", odd_min=1.50, odd_max=2.00),
     )
     assert t.status(LIGA, "1x2", odd=odd) == esperado
+
+
+# ---- critério de homologação (Sugestão nº 16) ----
+
+def test_homologavel_exige_p12_E_significancia():
+    """Nem um critério nem o outro sozinho. P12 mede TAMANHO; o IC95 mede EVIDÊNCIA."""
+    from sinalizador.comum.significancia import estatistica_agrupada, homologavel
+
+    # n grande, média positiva, mas ruidosa → passa na P12 e reprova no IC95
+    ruidosa = estatistica_agrupada({f"j{i}": [v] for i, v in
+                                    enumerate([-30.0, 32.0] * 150)})
+    assert ruidosa.n >= 200 and ruidosa.media > 0
+    assert homologavel(ruidosa, amostra_minima=200) is False
+
+    # IC95 impecável, mas amostra pequena → reprova na P12 (que é pétrea)
+    pequena = estatistica_agrupada({f"j{i}": [1.0] for i in range(10)})
+    assert pequena.significante is True
+    assert homologavel(pequena, amostra_minima=200) is False
+
+    # os dois → homologável
+    boa = estatistica_agrupada({f"j{i}": [1.0 + (i % 3) * 0.1] for i in range(300)})
+    assert homologavel(boa, amostra_minima=200) is True
+
+
+def test_uma_definicao_de_significancia_para_os_dois_lados():
+    """O backtest e o E6.4 precisam usar a MESMA conta — duas cópias divergem, e foi
+    assim que `clv_pct` passou a significar fração de um lado e ponto percentual do
+    outro."""
+    import backtest.replay as replay
+    from sinalizador.comum import significancia
+    assert replay.estatistica_agrupada is significancia.estatistica_agrupada

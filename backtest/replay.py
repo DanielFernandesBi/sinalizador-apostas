@@ -29,6 +29,7 @@ from collections import defaultdict
 
 from sinalizador.l1_gatilhos.devig import devig_shin
 from sinalizador.l1_gatilhos.edge import edge_liquido
+from sinalizador.comum.significancia import estatistica_agrupada
 from sinalizador.l4_fechamento.clv import clv_pct as clv_pct_producao
 
 from .ah import liquidar_ah
@@ -195,55 +196,6 @@ def replay(
     return todos
 
 
-# z de 95% bilateral. Normal, não t: a amostra mínima da P12 é 200 e o número de
-# CLUSTERS numa célula viável passa de 30 com folga, faixa em que t ≈ z. Se algum dia
-# se concluir sobre célula pequena, isto tem que virar t de Student.
-_Z95 = 1.959964
-
-
-def _estatistica(clvs_por_partida: dict[str, list[float]]) -> dict:
-    """Média, desvio e ERRO PADRÃO da célula — o erro padrão agrupado por partida.
-
-    Por que agrupado: as observações de uma célula NÃO são independentes. As três
-    seleções de um 1X2 saem do mesmo book, contra o mesmo fechamento; over e under
-    são o mesmo book visto dos dois lados; os dois lados do AH idem. Tratar cada
-    seleção como uma observação livre infla o `n` efetivo e ENCOLHE o erro padrão —
-    o intervalo de confiança sai estreito demais e a célula parece significante
-    antes de ser. Como o viés é sempre na direção de concluir cedo demais, esta é
-    exatamente a conta que P6 manda fazer pelo lado conservador.
-
-    A unidade de agrupamento é a PARTIDA: média dentro do jogo, depois desvio ENTRE
-    jogos. `n_clusters` é o tamanho de amostra que sustenta a conclusão; `n` (o
-    total de observações) segue reportado, mas não é ele que dita a incerteza.
-    """
-    todos = [x for xs in clvs_por_partida.values() for x in xs]
-    n = len(todos)
-    media = sum(todos) / n
-    desvio = math.sqrt(sum((x - media) ** 2 for x in todos) / n) if n > 1 else 0.0
-
-    medias_partida = [sum(xs) / len(xs) for xs in clvs_por_partida.values()]
-    k = len(medias_partida)
-    media_cluster = sum(medias_partida) / k
-    if k > 1:
-        var = sum((m - media_cluster) ** 2 for m in medias_partida) / (k - 1)
-        erro_padrao = math.sqrt(var / k)
-    else:
-        # Um cluster só: não há de onde tirar dispersão. `None`, nunca 0.0 — erro
-        # padrão zero afirmaria certeza absoluta a partir de nada (P6).
-        erro_padrao = None
-
-    ic_baixo = ic_alto = None
-    if erro_padrao is not None:
-        ic_baixo = media_cluster - _Z95 * erro_padrao
-        ic_alto = media_cluster + _Z95 * erro_padrao
-    return {
-        "n": n, "n_clusters": k,
-        "clv_medio": media, "clv_desvio": desvio,
-        "clv_medio_cluster": media_cluster,
-        "erro_padrao": erro_padrao, "ic95_baixo": ic_baixo, "ic95_alto": ic_alto,
-    }
-
-
 def agregar_celulas(
     candidatos: list[dict], *, amostra_minima: int = AMOSTRA_MINIMA
 ) -> list[dict]:
@@ -265,17 +217,22 @@ def agregar_celulas(
 
     celulas: list[dict] = []
     for (liga, merc, linha, faixa) in sorted(grupos, key=lambda k: tuple(str(x) for x in k)):
-        est = _estatistica(grupos[(liga, merc, linha, faixa)])
+        # Mesma função que o E6.4 usará sobre o CLV de sombra (`comum/significancia`):
+        # duas cópias da mesma conta divergem, e foi assim que `clv_pct` passou a
+        # significar coisas diferentes nos dois lados.
+        e = estatistica_agrupada(grupos[(liga, merc, linha, faixa)])
         # `suficiente` continua sendo a P12 (pétrea): sem 200 observações não se
         # conclui NADA. `significante` é uma leitura ADICIONAL e mais exigente — o
         # limite inferior do IC95 acima de zero. Qual das duas autoriza homologar é
         # decisão de rito (PC-SIGNIFICANCIA), não deste código.
-        significante = est["ic95_baixo"] is not None and est["ic95_baixo"] > 0.0
         celulas.append({
             "liga": liga, "mercado": merc, "linha": linha, "faixa_odd": faixa,
-            **est,
-            "suficiente": est["n"] >= amostra_minima,
-            "significante": significante,
+            "n": e.n, "n_clusters": e.n_clusters,
+            "clv_medio": e.media, "clv_desvio": e.desvio,
+            "clv_medio_cluster": e.media_cluster, "erro_padrao": e.erro_padrao,
+            "ic95_baixo": e.ic95_baixo, "ic95_alto": e.ic95_alto,
+            "suficiente": e.n >= amostra_minima,
+            "significante": e.significante,
         })
     return celulas
 
