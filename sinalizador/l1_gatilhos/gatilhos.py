@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, Protocol
 
+from sinalizador.comum.tempo import idade_s
+
 
 class ProvedorGates(Protocol):
     def get(self, nome: str): ...  # retorna Decimal (ver comum/gates.py)
@@ -142,11 +144,15 @@ def classificar_elegibilidade(
         odd = v.get("odd") or 0
         ts = v.get("ts_fonte")
         motivo: Optional[str] = None
+        idade = idade_s(agora, ts)
         if odd <= 1.0:
             motivo = "odd_invalida"
         elif ts is None:
             motivo = "sem_carimbo_de_fonte"
-        elif (agora - ts).total_seconds() > idade_max_s:
+        elif idade is None:
+            # Carimbo no futuro: não é preço fresco, é preço inconsistente (P1.8).
+            motivo = "carimbo_no_futuro"
+        elif idade > idade_max_s:
             motivo = "snapshot_velho"
         elif abs((ts - ts_referencia).total_seconds()) > janela_sincronia_s:
             motivo = "dessincronizado_da_referencia"

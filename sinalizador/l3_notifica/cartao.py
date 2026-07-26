@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from sinalizador.comum.tempo import para_datetime
+from sinalizador.comum.tempo import idade_s, para_datetime
 
 
 def odd_atual(
@@ -29,8 +29,10 @@ def odd_atual(
     if not snap or snap.get("odd") is None:
         return None
     if agora is not None and idade_max_s is not None:
-        ts = para_datetime(snap.get("ts_fonte"))
-        if ts is None or (agora - ts).total_seconds() > float(idade_max_s):
+        # `idade_s` devolve None também para carimbo no FUTURO (P1.8): idade negativa
+        # passaria em qualquer teto, e o preço mais suspeito seria o que menos apanha.
+        idade = idade_s(agora, para_datetime(snap.get("ts_fonte")))
+        if idade is None or idade > float(idade_max_s):
             return None
     try:
         return float(snap["odd"])

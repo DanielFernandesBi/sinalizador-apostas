@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Protocol
 
+from sinalizador.comum.tempo import idade_s
+
 
 class ProvedorGates(Protocol):
     def get(self, nome: str): ...  # retorna Decimal (ver comum/gates.py)
@@ -75,9 +77,16 @@ def avaliar(
         return ResultadoGate(False, "referencia_estavel",
                              "referência em movimento no momento da captura")
 
-    # 3) Idade do snapshot mais velho.
+    # 3) Idade do snapshot mais velho. `idade_s` devolve None para carimbo no FUTURO
+    #    (P1.8): a subtração daria negativa e passaria em qualquer teto — o dado mais
+    #    suspeito do lote seria o que menos apanha.
     idade_max = float(gates.get("snapshot_idade_max_s"))
-    idade = max(_seg(ctx.agora, ctx.ts_fonte_referencia), _seg(ctx.agora, ctx.ts_fonte_venue))
+    idade_ref = idade_s(ctx.agora, ctx.ts_fonte_referencia)
+    idade_venue = idade_s(ctx.agora, ctx.ts_fonte_venue)
+    if idade_ref is None or idade_venue is None:
+        return ResultadoGate(False, "carimbo_no_futuro",
+                             "carimbo de fonte adiante do relógio — dado inconsistente")
+    idade = max(idade_ref, idade_venue)
     if idade > idade_max:
         return ResultadoGate(False, "snapshot_idade_max_s",
                              f"idade {idade:.1f}s > {idade_max:.0f}s")

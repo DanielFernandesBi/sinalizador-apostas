@@ -278,7 +278,7 @@ class Banco:
     def ultimo_snapshot_venue(
         self, evento_id: str, casa_id: str, mercado: str, selecao: str, linha: Optional[float]
     ) -> Optional[dict[str, Any]]:
-        """Último snapshot da casa/venue para a seleção (re-checagem de preço, E4.2)."""
+        """Snapshot de FONTE mais recente da casa/venue (re-checagem de preço, E4.2)."""
         q = (
             self._c.table("odds_snapshots")
             .select("*")
@@ -288,7 +288,11 @@ class Banco:
             .eq("selecao", selecao)
         )
         q = q.is_("linha", "null") if linha is None else q.eq("linha", linha)
-        resp = q.order("ts_captura", desc=True).limit(1).execute()
+        # P1.8 — ordena pela FONTE, não pelo relógio de captura. Uma resposta atrasada
+        # da API é persistida DEPOIS mas carimbada ANTES: por `ts_captura` ela virava
+        # "o último snapshot" e um preço mais velho passava por corrente.
+        resp = (q.order("ts_fonte", desc=True).order("ts_captura", desc=True)
+                 .limit(1).execute())
         dados = resp.data or []
         return dados[0] if dados else None
 
