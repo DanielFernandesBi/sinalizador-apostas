@@ -78,7 +78,14 @@ def _vivos(*nomes, segundos=10.0):
 def test_roster_padrao_cobre_o_pipeline_inteiro():
     """O buraco do P1.5: L1, L2, L3 e L4 pulsavam e ninguém lia."""
     assert set(DAEMONS_ESPERADOS_PADRAO) == {
-        "l0_referencia", "l0_varejo", "l1", "l2", "l3", "l4", "vigia"}
+        "l0_referencia", "l1", "l2", "l3", "l4", "vigia"}
+
+
+def test_l0_varejo_fica_fora_do_roster_enquanto_for_no_op():
+    """Ele roda em degradação segura (não há região `br` na The Odds API) e o varejo
+    da `eu` já vem pelo l0_referencia. Esperar pulso dele abriria um episódio de
+    silêncio que nunca fecha — e alerta que nunca fecha ensina a ignorar alerta."""
+    assert "l0_varejo" not in DAEMONS_ESPERADOS_PADRAO
 
 
 def test_limiar_sai_da_cadencia_de_cada_daemon():

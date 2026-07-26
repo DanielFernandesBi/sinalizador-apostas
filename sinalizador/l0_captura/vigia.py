@@ -74,7 +74,12 @@ class DaemonEsperado:
 #   vigia 1800.
 ROSTER_PADRAO: tuple[DaemonEsperado, ...] = (
     DaemonEsperado("l0_referencia", 3600.0),
-    DaemonEsperado("l0_varejo", 3600.0),
+    # `l0_varejo` NÃO está no roster de propósito. A The Odds API não tem região
+    # `br`, então ele roda em degradação segura (422, sem snapshot, sem crédito) e o
+    # varejo da `eu` já vem na resposta do `l0_referencia` (Sugestão nº 6). Esperar
+    # pulso de um daemon que hoje é no-op abriria um episódio de silêncio PERMANENTE:
+    # um alerta que nunca fecha não informa nada e ensina a ignorar os que informam.
+    # Volta ao roster junto com a fonte .bet.br (PC-VENUE / PC-VENUE-BR).
     DaemonEsperado("l1", 60.0),
     DaemonEsperado("l2", 30.0),
     DaemonEsperado("l3", 30.0),
